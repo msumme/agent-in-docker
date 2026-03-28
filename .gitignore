@@ -1,4 +1,20 @@
+# Rust
+target/
 
-# Dolt database files (added by bd init)
+# Node
+node_modules/
+dist/
+
+# Logs
+*.log
+
+# Dolt / Beads
 .dolt/
 *.db
+.beads/
+
+# OS
+.DS_Store
+
+# Env
+.env

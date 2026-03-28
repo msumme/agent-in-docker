@@ -11,6 +11,8 @@ NETWORK_NAME="agent-net"
 # Defaults
 ROLE="code-agent"
 AGENT_NAME="agent-$(date +%s)"
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+CLAUDE_CREDENTIALS="${CLAUDE_CREDENTIALS:-}"
 
 usage() {
     echo "Usage: $0 <project-path> \"<prompt>\" [options]"
@@ -53,10 +55,17 @@ echo "==> Project: ${PROJECT_PATH}"
 echo "==> Prompt: ${PROMPT}"
 echo "==> Agent: ${AGENT_NAME} (role: ${ROLE})"
 
-# Check for ANTHROPIC_API_KEY
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "Error: ANTHROPIC_API_KEY environment variable is not set"
-    exit 1
+# Resolve credentials: ANTHROPIC_API_KEY > Keychain OAuth > error
+if [ -n "${ANTHROPIC_API_KEY}" ]; then
+    echo "==> Using ANTHROPIC_API_KEY from environment"
+elif [ -z "${CLAUDE_CREDENTIALS}" ] && command -v security &>/dev/null; then
+    echo "==> Extracting Claude Code OAuth credentials from macOS Keychain..."
+    CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
+        echo "Error: No ANTHROPIC_API_KEY and could not read 'Claude Code-credentials' from Keychain."
+        echo "Set ANTHROPIC_API_KEY or run 'claude login' first."
+        exit 1
+    }
+    echo "==> Got OAuth credentials from Keychain"
 fi
 
 # Step 1: Build orchestrator if needed
@@ -119,7 +128,9 @@ if ! orchestrator_running; then
                 -e "AGENT_NAME=${AGENT_NAME}" \
                 -e "AGENT_ROLE=${ROLE}" \
                 -e "AGENT_PROMPT=${PROMPT}" \
-                -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
+                -v "${SCRIPT_DIR}/.claude-container:/root/.claude:Z" \
+                ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
+                ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
                 "${IMAGE_NAME}")
             echo "==> Container started: ${CONTAINER_ID:0:12}"
             echo "    Logs: podman logs -f ${AGENT_NAME}"
@@ -138,9 +149,11 @@ podman run --rm \
     --name "${AGENT_NAME}" \
     --network "${NETWORK_NAME}" \
     -v "${PROJECT_PATH}:/workspace:Z" \
+    -v "${SCRIPT_DIR}/.claude-container:/root/.claude:Z" \
     -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
     -e "AGENT_NAME=${AGENT_NAME}" \
     -e "AGENT_ROLE=${ROLE}" \
     -e "AGENT_PROMPT=${PROMPT}" \
-    -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" \
+    ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
+    ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
     "${IMAGE_NAME}"

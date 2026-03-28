@@ -19,3 +19,4 @@ dist/
 # Env
 .env
 .claude-container/
+.claude-agents/

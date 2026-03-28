@@ -10,9 +10,12 @@ NETWORK_NAME="agent-net"
 
 # Defaults
 ROLE="code-agent"
-AGENT_NAME="agent-$(date +%s)"
+AGENT_NAME=""
+NAMED_AGENT=false
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 CLAUDE_CREDENTIALS="${CLAUDE_CREDENTIALS:-}"
+SEED_DIR="${SCRIPT_DIR}/.claude-container"
+AGENTS_DIR="${SCRIPT_DIR}/.claude-agents"
 
 usage() {
     echo "Usage: $0 <project-path> \"<prompt>\" [options]"
@@ -44,16 +47,80 @@ NO_TUI=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --role) ROLE="$2"; shift 2 ;;
-        --name) AGENT_NAME="$2"; shift 2 ;;
+        --name) AGENT_NAME="$2"; NAMED_AGENT=true; shift 2 ;;
         --build) FORCE_BUILD=true; shift ;;
         --no-tui) NO_TUI=true; shift ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
 
+# Assign ephemeral name if none given
+if [ -z "${AGENT_NAME}" ]; then
+    AGENT_NAME="agent-$(date +%s)"
+fi
+
 echo "==> Project: ${PROJECT_PATH}"
 echo "==> Prompt: ${PROMPT}"
-echo "==> Agent: ${AGENT_NAME} (role: ${ROLE})"
+echo "==> Agent: ${AGENT_NAME} (role: ${ROLE}, $([ "${NAMED_AGENT}" = true ] && echo "persistent" || echo "ephemeral"))"
+
+# Set up per-agent claude config directory.
+# .claude-container/ is the seed (shared credentials from 'claude login').
+# Named agents get persistent dirs under .claude-agents/<name>/.
+# Ephemeral agents get fresh dirs that are cleaned up on exit.
+AGENT_CLAUDE_DIR=""
+CLEANUP_AGENT_DIR=false
+
+mkdir -p "${AGENTS_DIR}"
+
+if [ ! -f "${SEED_DIR}/.credentials.json" ]; then
+    echo "Error: No credentials found in ${SEED_DIR}/"
+    echo "Run: podman run -it --rm -v \"${SEED_DIR}:/root/.claude:Z\" agent-in-docker bash"
+    echo "Then: claude login"
+    exit 1
+fi
+
+if [ "${NAMED_AGENT}" = true ]; then
+    AGENT_CLAUDE_DIR="${AGENTS_DIR}/${AGENT_NAME}"
+    if [ ! -d "${AGENT_CLAUDE_DIR}" ]; then
+        echo "==> Creating persistent config for agent '${AGENT_NAME}'"
+        mkdir -p "${AGENT_CLAUDE_DIR}"
+        # Copy seed config (not credentials -- those are symlinked)
+        for f in "${SEED_DIR}"/*; do
+            [ -e "$f" ] && [ "$(basename "$f")" != ".credentials.json" ] && cp -a "$f" "${AGENT_CLAUDE_DIR}/"
+        done
+        for f in "${SEED_DIR}"/.*; do
+            case "$(basename "$f")" in
+                .|..) continue ;;
+                .credentials.json) continue ;;
+                *) cp -a "$f" "${AGENT_CLAUDE_DIR}/" ;;
+            esac
+        done
+    fi
+else
+    AGENT_CLAUDE_DIR=$(mktemp -d "${AGENTS_DIR}/ephemeral-${AGENT_NAME}-XXXXXX")
+    CLEANUP_AGENT_DIR=true
+    # Copy seed config
+    for f in "${SEED_DIR}"/*; do
+        [ -e "$f" ] && [ "$(basename "$f")" != ".credentials.json" ] && cp -a "$f" "${AGENT_CLAUDE_DIR}/"
+    done
+    for f in "${SEED_DIR}"/.*; do
+        case "$(basename "$f")" in
+            .|..) continue ;;
+            .credentials.json) continue ;;
+            *) cp -a "$f" "${AGENT_CLAUDE_DIR}/" ;;
+        esac
+    done
+fi
+
+# Always symlink shared credentials into agent dir
+ln -sf "${SEED_DIR}/.credentials.json" "${AGENT_CLAUDE_DIR}/.credentials.json"
+
+cleanup_agent_dir() {
+    if [ "${CLEANUP_AGENT_DIR}" = true ] && [ -n "${AGENT_CLAUDE_DIR}" ]; then
+        rm -rf "${AGENT_CLAUDE_DIR}"
+    fi
+}
+trap cleanup_agent_dir EXIT
 
 # Resolve credentials: ANTHROPIC_API_KEY > Keychain OAuth > error
 if [ -n "${ANTHROPIC_API_KEY}" ]; then
@@ -128,7 +195,7 @@ if ! orchestrator_running; then
                 -e "AGENT_NAME=${AGENT_NAME}" \
                 -e "AGENT_ROLE=${ROLE}" \
                 -e "AGENT_PROMPT=${PROMPT}" \
-                -v "${SCRIPT_DIR}/.claude-container:/root/.claude:Z" \
+                -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
                 ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
                 ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
                 "${IMAGE_NAME}")

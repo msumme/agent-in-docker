@@ -1,0 +1,23 @@
+name: review-agent
+capabilities:
+  file_read: true
+  git_push: false
+  user_prompt: true
+  discover_agents: true
+  message_agents: false
+
+file_read_paths:
+  - "${HOME}/.gitconfig"
+  - "${HOME}/.ssh/config"
+  - "/etc/hosts"
+
+file_read_deny_paths:
+  - "**/*.pem"
+  - "**/*_rsa"
+  - "**/*.key"
+  - "**/credentials*"
+  - "**/.env*"
+
+git_push_remotes: []
+
+message_agents_roles: []

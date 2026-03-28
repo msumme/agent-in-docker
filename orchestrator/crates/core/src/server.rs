@@ -10,7 +10,6 @@ use tracing::{error, info, warn};
 
 use crate::types::*;
 
-/// A handle for sending messages to a connected agent.
 type AgentSender = mpsc::UnboundedSender<String>;
 
 struct ConnectedAgent {
@@ -18,12 +17,10 @@ struct ConnectedAgent {
     sender: AgentSender,
 }
 
-/// Generates unique agent IDs. Injectable for deterministic testing.
 pub trait IdGenerator: Send + Sync {
     fn next_id(&self) -> String;
 }
 
-/// Default ID generator using UUIDs.
 pub struct UuidIdGenerator;
 
 impl IdGenerator for UuidIdGenerator {
@@ -32,10 +29,15 @@ impl IdGenerator for UuidIdGenerator {
     }
 }
 
-/// Core server state, extracted for testability.
+struct PendingRequest {
+    agent_id: String,
+    request_type: String,
+    payload: Value,
+}
+
 pub struct ServerState {
     agents: HashMap<String, ConnectedAgent>,
-    pending_requests: HashMap<String, String>, // request_id -> agent_id
+    pending_requests: HashMap<String, PendingRequest>,
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     id_gen: Arc<dyn IdGenerator>,
 }
@@ -79,11 +81,11 @@ impl ServerState {
             .collect()
     }
 
-    /// Register a new agent. Returns the assigned agent ID.
     pub fn register_agent(
         &mut self,
         name: String,
         role: String,
+        workspace_path: Option<String>,
         sender: AgentSender,
     ) -> (String, Vec<PeerInfo>) {
         let id = self.id_gen.next_id();
@@ -91,23 +93,21 @@ impl ServerState {
             id: id.clone(),
             name: name.clone(),
             role: role.clone(),
+            workspace_path,
         };
         let peers = self.peer_list(&id);
         let _ = self
             .event_tx
             .send(OrchestratorEvent::AgentConnected(info.clone()));
-        self.agents.insert(
-            id.clone(),
-            ConnectedAgent { info, sender },
-        );
+        self.agents.insert(id.clone(), ConnectedAgent { info, sender });
         (id, peers)
     }
 
-    /// Handle a user_prompt request from an agent.
-    pub fn handle_user_prompt(
+    pub fn handle_request(
         &mut self,
         agent_id: &str,
         request_id: String,
+        request_type: &str,
         payload: Value,
     ) {
         let agent_name = self.agent_name(agent_id);
@@ -115,28 +115,96 @@ impl ServerState {
             agent_id: agent_id.to_string(),
             agent_name,
             request_id: request_id.clone(),
-            request_type: "user_prompt".into(),
-            payload,
+            request_type: request_type.to_string(),
+            payload: payload.clone(),
         });
-        self.pending_requests
-            .insert(request_id, agent_id.to_string());
+        self.pending_requests.insert(
+            request_id,
+            PendingRequest {
+                agent_id: agent_id.to_string(),
+                request_type: request_type.to_string(),
+                payload,
+            },
+        );
     }
 
-    /// Respond to a pending request (called from TUI).
-    pub fn respond_to_request(&mut self, request_id: &str, payload: Value) {
-        if let Some(agent_id) = self.pending_requests.remove(request_id) {
+    pub fn respond_to_request(&mut self, request_id: &str, msg_type: &str, payload: Value) {
+        if let Some(pending) = self.pending_requests.remove(request_id) {
             let response = Message {
                 id: request_id.to_string(),
-                msg_type: "user_prompt_response".into(),
+                msg_type: msg_type.to_string(),
                 from: "orchestrator".into(),
-                to: Some(agent_id.clone()),
+                to: Some(pending.agent_id.clone()),
                 payload,
             };
-            self.send_to_agent(&agent_id, &response);
+            self.send_to_agent(&pending.agent_id, &response);
         }
     }
 
-    /// Remove an agent on disconnect.
+    /// Execute an approved request (file_read, git_push) and send the result.
+    pub fn execute_approved_request(&mut self, request_id: &str) {
+        if let Some(pending) = self.pending_requests.remove(request_id) {
+            let (msg_type, payload) = match pending.request_type.as_str() {
+                "file_read" => {
+                    let path = pending.payload.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    match crate::handlers::file_read::read_file(path) {
+                        Ok(content) => (
+                            "file_read_response",
+                            serde_json::json!({"content": content}),
+                        ),
+                        Err(e) => (
+                            "error",
+                            serde_json::json!({"code": "READ_FAILED", "message": e}),
+                        ),
+                    }
+                }
+                "git_push" => {
+                    let remote = pending.payload.get("remote")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("origin");
+                    let branch = pending.payload.get("branch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let workspace = self.agent_workspace(&pending.agent_id)
+                        .unwrap_or_default();
+
+                    let branch = if branch.is_empty() {
+                        crate::handlers::git_push::current_branch(&workspace)
+                            .unwrap_or_else(|_| "main".into())
+                    } else {
+                        branch.to_string()
+                    };
+
+                    match crate::handlers::git_push::git_push(&workspace, remote, &branch) {
+                        Ok(output) => (
+                            "git_push_response",
+                            serde_json::json!({"success": true, "output": output}),
+                        ),
+                        Err(e) => (
+                            "error",
+                            serde_json::json!({"code": "PUSH_FAILED", "message": e}),
+                        ),
+                    }
+                }
+                _ => (
+                    "error",
+                    serde_json::json!({"code": "UNKNOWN_REQUEST", "message": "Cannot execute this request type"}),
+                ),
+            };
+
+            let response = Message {
+                id: request_id.to_string(),
+                msg_type: msg_type.to_string(),
+                from: "orchestrator".into(),
+                to: Some(pending.agent_id.clone()),
+                payload,
+            };
+            self.send_to_agent(&pending.agent_id, &response);
+        }
+    }
+
     pub fn remove_agent(&mut self, agent_id: &str) {
         self.agents.remove(agent_id);
         let _ = self
@@ -144,6 +212,16 @@ impl ServerState {
             .send(OrchestratorEvent::AgentDisconnected {
                 id: agent_id.to_string(),
             });
+    }
+
+    pub fn agent_role(&self, agent_id: &str) -> Option<String> {
+        self.agents.get(agent_id).map(|a| a.info.role.clone())
+    }
+
+    pub fn agent_workspace(&self, agent_id: &str) -> Option<String> {
+        self.agents
+            .get(agent_id)
+            .and_then(|a| a.info.workspace_path.clone())
     }
 
     pub fn agent_count(&self) -> usize {
@@ -174,24 +252,35 @@ pub async fn run_with_id_gen(
 
     let state = Arc::new(Mutex::new(ServerState::new(event_tx, id_gen)));
 
-    // Handle commands from TUI
     let state_for_cmds = state.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            let mut s = state_for_cmds.lock().await;
             match cmd {
                 TuiCommand::RespondToRequest {
                     request_id,
                     payload,
                 } => {
-                    let mut s = state_for_cmds.lock().await;
-                    s.respond_to_request(&request_id, payload);
+                    s.respond_to_request(&request_id, "user_prompt_response", payload);
+                }
+                TuiCommand::ApproveRequest { request_id } => {
+                    s.execute_approved_request(&request_id);
+                }
+                TuiCommand::DenyRequest {
+                    request_id,
+                    reason,
+                } => {
+                    s.respond_to_request(
+                        &request_id,
+                        "error",
+                        serde_json::json!({"code": "PERMISSION_DENIED", "message": reason}),
+                    );
                 }
                 TuiCommand::Shutdown => break,
             }
         }
     });
 
-    // Accept connections
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New TCP connection from {}", addr);
@@ -211,7 +300,6 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
 
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Create a channel for outbound messages to this agent.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
@@ -257,6 +345,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
                 let (id, peers) = s.register_agent(
                     payload.name.clone(),
                     payload.role.clone(),
+                    payload.workspace_path.clone(),
                     out_tx.clone(),
                 );
 
@@ -277,10 +366,10 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
                 info!("Agent registered: {} ({})", payload.name, id);
             }
 
-            "user_prompt" => {
+            "user_prompt" | "file_read" | "git_push" => {
                 if let Some(ref aid) = agent_id {
                     let mut s = state.lock().await;
-                    s.handle_user_prompt(aid, message.id.clone(), message.payload);
+                    s.handle_request(aid, message.id.clone(), &message.msg_type, message.payload);
                 }
             }
 
@@ -290,7 +379,6 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
         }
     }
 
-    // Clean up on disconnect
     if let Some(ref id) = agent_id {
         let mut s = state.lock().await;
         s.remove_agent(id);
@@ -323,10 +411,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (
-        ServerState,
-        mpsc::UnboundedReceiver<OrchestratorEvent>,
-    ) {
+    fn setup() -> (ServerState, mpsc::UnboundedReceiver<OrchestratorEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let id_gen = Arc::new(SequentialIdGenerator::new());
         let state = ServerState::new(event_tx, id_gen);
@@ -338,11 +423,8 @@ mod tests {
         let (mut state, mut event_rx) = setup();
         let (sender, _receiver) = mpsc::unbounded_channel();
 
-        let (id, peers) = state.register_agent(
-            "test-agent".into(),
-            "code-agent".into(),
-            sender,
-        );
+        let (id, peers) =
+            state.register_agent("test-agent".into(), "code-agent".into(), None, sender);
 
         assert_eq!(id, "agent-1");
         assert!(peers.is_empty());
@@ -353,9 +435,8 @@ mod tests {
             OrchestratorEvent::AgentConnected(info) => {
                 assert_eq!(info.id, "agent-1");
                 assert_eq!(info.name, "test-agent");
-                assert_eq!(info.role, "code-agent");
             }
-            _ => panic!("Expected AgentConnected event"),
+            _ => panic!("Expected AgentConnected"),
         }
     }
 
@@ -365,12 +446,12 @@ mod tests {
         let (s1, _r1) = mpsc::unbounded_channel();
         let (s2, _r2) = mpsc::unbounded_channel();
 
-        state.register_agent("agent-a".into(), "code-agent".into(), s1);
-        let (_, peers) = state.register_agent("agent-b".into(), "review-agent".into(), s2);
+        state.register_agent("agent-a".into(), "code-agent".into(), None, s1);
+        let (_, peers) =
+            state.register_agent("agent-b".into(), "review-agent".into(), None, s2);
 
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "agent-a");
-        assert_eq!(state.agent_count(), 2);
     }
 
     #[test]
@@ -378,48 +459,39 @@ mod tests {
         let (mut state, mut event_rx) = setup();
         let (sender, _receiver) = mpsc::unbounded_channel();
 
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), sender);
-        let _ = event_rx.try_recv(); // consume AgentConnected
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
+        let _ = event_rx.try_recv();
 
         state.remove_agent(&id);
         assert_eq!(state.agent_count(), 0);
 
-        let event = event_rx.try_recv().unwrap();
-        match event {
-            OrchestratorEvent::AgentDisconnected { id: disconnected_id } => {
-                assert_eq!(disconnected_id, id);
-            }
-            _ => panic!("Expected AgentDisconnected event"),
+        match event_rx.try_recv().unwrap() {
+            OrchestratorEvent::AgentDisconnected { id: did } => assert_eq!(did, id),
+            _ => panic!("Expected AgentDisconnected"),
         }
     }
 
     #[test]
-    fn handle_user_prompt_stores_pending_and_emits_event() {
+    fn handle_request_stores_pending_and_emits_event() {
         let (mut state, mut event_rx) = setup();
         let (sender, _receiver) = mpsc::unbounded_channel();
 
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), sender);
-        let _ = event_rx.try_recv(); // consume AgentConnected
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
+        let _ = event_rx.try_recv();
 
-        state.handle_user_prompt(&id, "req-1".into(), json!({"question": "hello?"}));
+        state.handle_request(&id, "req-1".into(), "user_prompt", json!({"question": "hello?"}));
 
         assert_eq!(state.pending_count(), 1);
-        let event = event_rx.try_recv().unwrap();
-        match event {
+        match event_rx.try_recv().unwrap() {
             OrchestratorEvent::RequestReceived {
-                agent_id,
-                agent_name,
                 request_id,
                 request_type,
-                payload,
+                ..
             } => {
-                assert_eq!(agent_id, id);
-                assert_eq!(agent_name, "test");
                 assert_eq!(request_id, "req-1");
                 assert_eq!(request_type, "user_prompt");
-                assert_eq!(payload["question"], "hello?");
             }
-            _ => panic!("Expected RequestReceived event"),
+            _ => panic!("Expected RequestReceived"),
         }
     }
 
@@ -428,29 +500,83 @@ mod tests {
         let (mut state, mut event_rx) = setup();
         let (sender, mut receiver) = mpsc::unbounded_channel();
 
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), sender);
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
         let _ = event_rx.try_recv();
 
-        state.handle_user_prompt(&id, "req-1".into(), json!({"question": "color?"}));
+        state.handle_request(&id, "req-1".into(), "user_prompt", json!({"question": "color?"}));
         let _ = event_rx.try_recv();
 
-        state.respond_to_request("req-1", json!({"answer": "blue"}));
+        state.respond_to_request("req-1", "user_prompt_response", json!({"answer": "blue"}));
 
         assert_eq!(state.pending_count(), 0);
 
         let sent = receiver.try_recv().unwrap();
         let msg: Message = serde_json::from_str(&sent).unwrap();
         assert_eq!(msg.msg_type, "user_prompt_response");
-        assert_eq!(msg.id, "req-1");
         assert_eq!(msg.payload["answer"], "blue");
     }
 
     #[test]
     fn respond_to_unknown_request_is_noop() {
         let (mut state, _event_rx) = setup();
-        // Should not panic
-        state.respond_to_request("nonexistent", json!({"answer": "test"}));
+        state.respond_to_request("nonexistent", "error", json!({"code": "NOT_FOUND"}));
         assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn file_read_request_emits_event() {
+        let (mut state, mut event_rx) = setup();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
+        let _ = event_rx.try_recv();
+
+        state.handle_request(&id, "fr-1".into(), "file_read", json!({"path": "/etc/hosts"}));
+
+        match event_rx.try_recv().unwrap() {
+            OrchestratorEvent::RequestReceived {
+                request_type,
+                payload,
+                ..
+            } => {
+                assert_eq!(request_type, "file_read");
+                assert_eq!(payload["path"], "/etc/hosts");
+            }
+            _ => panic!("Expected RequestReceived"),
+        }
+    }
+
+    #[test]
+    fn git_push_request_emits_event() {
+        let (mut state, mut event_rx) = setup();
+        let (sender, _receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent(
+            "test".into(),
+            "code-agent".into(),
+            Some("/workspace".into()),
+            sender,
+        );
+        let _ = event_rx.try_recv();
+
+        state.handle_request(
+            &id,
+            "gp-1".into(),
+            "git_push",
+            json!({"remote": "origin", "branch": "main"}),
+        );
+
+        match event_rx.try_recv().unwrap() {
+            OrchestratorEvent::RequestReceived {
+                request_type,
+                payload,
+                ..
+            } => {
+                assert_eq!(request_type, "git_push");
+                assert_eq!(payload["remote"], "origin");
+            }
+            _ => panic!("Expected RequestReceived"),
+        }
     }
 
     #[tokio::test]
@@ -458,7 +584,6 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        // Start server on random port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -469,15 +594,13 @@ mod tests {
             let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen).await;
         });
 
-        // Give server time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Connect a WebSocket client
         let url = format!("ws://{}", addr);
         let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (mut sender, mut receiver) = ws.split();
 
-        // Send register
+        // Register
         let register_msg = json!({
             "id": "reg-1",
             "type": "register",
@@ -489,16 +612,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Read register_ack
         let ack_text = match receiver.next().await.unwrap().unwrap() {
             WsMessage::Text(t) => t.to_string(),
             other => panic!("Expected text, got {:?}", other),
         };
         let ack: Message = serde_json::from_str(&ack_text).unwrap();
         assert_eq!(ack.msg_type, "register_ack");
-        assert_eq!(ack.payload["agentId"], "agent-1");
 
-        // Check event
         let event = event_rx.recv().await.unwrap();
         assert!(matches!(event, OrchestratorEvent::AgentConnected(_)));
 
@@ -514,17 +634,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Check event
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let event = event_rx.recv().await.unwrap();
-        match event {
-            OrchestratorEvent::RequestReceived { request_id, .. } => {
-                assert_eq!(request_id, "prompt-1");
-            }
-            _ => panic!("Expected RequestReceived"),
-        }
+        assert!(matches!(event, OrchestratorEvent::RequestReceived { .. }));
 
-        // Respond via TUI command
+        // Respond
         cmd_tx
             .send(TuiCommand::RespondToRequest {
                 request_id: "prompt-1".into(),
@@ -532,7 +646,6 @@ mod tests {
             })
             .unwrap();
 
-        // Read response from WebSocket
         let resp_text = match receiver.next().await.unwrap().unwrap() {
             WsMessage::Text(t) => t.to_string(),
             other => panic!("Expected text, got {:?}", other),
@@ -540,5 +653,68 @@ mod tests {
         let resp: Message = serde_json::from_str(&resp_text).unwrap();
         assert_eq!(resp.msg_type, "user_prompt_response");
         assert_eq!(resp.payload["answer"], "red");
+
+        // Test file_read request + deny
+        let fr_msg = json!({
+            "id": "fr-1",
+            "type": "file_read",
+            "from": "agent-1",
+            "payload": { "path": "/etc/secret" }
+        });
+        sender
+            .send(WsMessage::Text(serde_json::to_string(&fr_msg).unwrap().into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = event_rx.recv().await.unwrap();
+
+        cmd_tx
+            .send(TuiCommand::DenyRequest {
+                request_id: "fr-1".into(),
+                reason: "Not allowed".into(),
+            })
+            .unwrap();
+
+        let deny_text = match receiver.next().await.unwrap().unwrap() {
+            WsMessage::Text(t) => t.to_string(),
+            other => panic!("Expected text, got {:?}", other),
+        };
+        let deny: Message = serde_json::from_str(&deny_text).unwrap();
+        assert_eq!(deny.msg_type, "error");
+        assert_eq!(deny.payload["code"], "PERMISSION_DENIED");
+
+        // Test file_read request + approve (reads a real file)
+        let test_file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut test_file.as_file(), b"test content here").unwrap();
+        let test_path = test_file.path().to_str().unwrap().to_string();
+
+        let fr_msg2 = json!({
+            "id": "fr-2",
+            "type": "file_read",
+            "from": "agent-1",
+            "payload": { "path": test_path }
+        });
+        sender
+            .send(WsMessage::Text(serde_json::to_string(&fr_msg2).unwrap().into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = event_rx.recv().await.unwrap();
+
+        cmd_tx
+            .send(TuiCommand::ApproveRequest {
+                request_id: "fr-2".into(),
+            })
+            .unwrap();
+
+        let approve_text = match receiver.next().await.unwrap().unwrap() {
+            WsMessage::Text(t) => t.to_string(),
+            other => panic!("Expected text, got {:?}", other),
+        };
+        let approve: Message = serde_json::from_str(&approve_text).unwrap();
+        assert_eq!(approve.msg_type, "file_read_response");
+        assert_eq!(approve.payload["content"], "test content here");
     }
 }

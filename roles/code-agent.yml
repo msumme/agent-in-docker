@@ -1,0 +1,26 @@
+name: code-agent
+capabilities:
+  file_read: true
+  git_push: true
+  user_prompt: true
+  discover_agents: true
+  message_agents: true
+
+file_read_paths:
+  - "${HOME}/.gitconfig"
+  - "${HOME}/.ssh/config"
+  - "/etc/hosts"
+
+file_read_deny_paths:
+  - "**/*.pem"
+  - "**/*_rsa"
+  - "**/*.key"
+  - "**/credentials*"
+  - "**/.env*"
+
+git_push_remotes:
+  - "origin"
+
+message_agents_roles:
+  - "review-agent"
+  - "code-agent"

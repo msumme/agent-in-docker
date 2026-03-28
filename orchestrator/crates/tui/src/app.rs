@@ -88,24 +88,77 @@ impl App {
     }
 
     pub fn submit_answer(&mut self) {
-        if self.pending_requests.is_empty() || self.input_text.is_empty() {
+        if self.pending_requests.is_empty() {
             return;
         }
 
         let idx = self.selected_request.min(self.pending_requests.len() - 1);
+        let req = &self.pending_requests[idx];
+
+        match req.request_type.as_str() {
+            "user_prompt" => {
+                if self.input_text.is_empty() {
+                    return;
+                }
+                let req = self.pending_requests.remove(idx);
+                self.completed_log.push(format!(
+                    "[{}] Q: {} -> A: {}",
+                    req.agent_name, req.question, self.input_text
+                ));
+                let _ = self.cmd_tx.send(TuiCommand::RespondToRequest {
+                    request_id: req.request_id,
+                    payload: json!({ "answer": self.input_text }),
+                });
+                self.input_text.clear();
+            }
+            _ => {
+                // For file_read, git_push etc: Enter approves
+                self.approve_request();
+                return;
+            }
+        }
+
+        if self.selected_request >= self.pending_requests.len() && self.selected_request > 0 {
+            self.selected_request -= 1;
+        }
+    }
+
+    pub fn approve_request(&mut self) {
+        if self.pending_requests.is_empty() {
+            return;
+        }
+        let idx = self.selected_request.min(self.pending_requests.len() - 1);
         let req = self.pending_requests.remove(idx);
 
         self.completed_log.push(format!(
-            "[{}] Q: {} -> A: {}",
-            req.agent_name, req.question, self.input_text
+            "[{}] {} {} -> APPROVED",
+            req.agent_name, req.request_type, req.question
         ));
-
-        let _ = self.cmd_tx.send(TuiCommand::RespondToRequest {
+        let _ = self.cmd_tx.send(TuiCommand::ApproveRequest {
             request_id: req.request_id,
-            payload: json!({ "answer": self.input_text }),
         });
 
-        self.input_text.clear();
+        if self.selected_request >= self.pending_requests.len() && self.selected_request > 0 {
+            self.selected_request -= 1;
+        }
+    }
+
+    pub fn deny_request(&mut self) {
+        if self.pending_requests.is_empty() {
+            return;
+        }
+        let idx = self.selected_request.min(self.pending_requests.len() - 1);
+        let req = self.pending_requests.remove(idx);
+
+        self.completed_log.push(format!(
+            "[{}] {} {} -> DENIED",
+            req.agent_name, req.request_type, req.question
+        ));
+        let _ = self.cmd_tx.send(TuiCommand::DenyRequest {
+            request_id: req.request_id,
+            reason: "Denied by user".into(),
+        });
+
         if self.selected_request >= self.pending_requests.len() && self.selected_request > 0 {
             self.selected_request -= 1;
         }
@@ -166,6 +219,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             role: role.into(),
+            workspace_path: None,
         })
     }
 

@@ -16,6 +16,8 @@ pub struct Message {
 pub struct RegisterPayload {
     pub name: String,
     pub role: String,
+    #[serde(default, rename = "workspacePath")]
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,11 +50,29 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReadPayload {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitPushPayload {
+    #[serde(default = "default_remote")]
+    pub remote: String,
+    #[serde(default)]
+    pub branch: String,
+}
+
+fn default_remote() -> String {
+    "origin".into()
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
     pub role: String,
+    pub workspace_path: Option<String>,
 }
 
 /// Events emitted by the core server to the frontend (TUI).
@@ -79,6 +99,13 @@ pub enum TuiCommand {
     RespondToRequest {
         request_id: String,
         payload: Value,
+    },
+    ApproveRequest {
+        request_id: String,
+    },
+    DenyRequest {
+        request_id: String,
+        reason: String,
     },
     Shutdown,
 }

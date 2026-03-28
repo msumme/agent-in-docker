@@ -1,1 +1,2 @@
-// Handlers will be added in Phase 2 (file_read, git_push, etc.)
+pub mod file_read;
+pub mod git_push;

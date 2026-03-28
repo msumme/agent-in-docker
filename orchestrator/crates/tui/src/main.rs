@@ -57,10 +57,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Check if selected request needs y/n approval (not text input)
+                let approval_mode = app.focus == app::FocusPanel::Requests
+                    && !app.pending_requests.is_empty()
+                    && app.pending_requests
+                        [app.selected_request.min(app.pending_requests.len() - 1)]
+                        .request_type != "user_prompt";
+
                 match key.code {
                     KeyCode::Char('q') if app.pending_requests.is_empty() => {
                         app.should_quit = true;
                     }
+                    KeyCode::Char('y') if approval_mode => app.approve_request(),
+                    KeyCode::Char('n') if approval_mode => app.deny_request(),
                     KeyCode::Tab => app.toggle_focus(),
                     KeyCode::Up => app.move_selection_up(),
                     KeyCode::Down => app.move_selection_down(),

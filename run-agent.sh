@@ -19,6 +19,10 @@ AGENTS_DIR="${SCRIPT_DIR}/.claude-agents"
 
 usage() {
     echo "Usage: $0 <project-path> \"<prompt>\" [options]"
+    echo "       $0 login"
+    echo ""
+    echo "Commands:"
+    echo "  login               Authenticate Claude Code (opens browser)"
     echo ""
     echo "Options:"
     echo "  --role <role>       Agent role (default: code-agent)"
@@ -27,10 +31,85 @@ usage() {
     echo "  --build             Force rebuild of container image"
     echo ""
     echo "Examples:"
+    echo "  $0 login"
     echo "  $0 ./my-project \"Fix the failing tests\""
     echo "  $0 ./my-project \"Review this code\" --role review-agent --name reviewer"
     exit 1
 }
+
+# Handle 'login' subcommand
+if [ "${1:-}" = "login" ]; then
+    echo "==> Starting Claude Code login flow..."
+
+    # Ensure container image exists
+    if ! podman image exists "${IMAGE_NAME}" 2>/dev/null; then
+        echo "==> Building container image first..."
+        podman build -f "${SCRIPT_DIR}/Containerfile" -t "${IMAGE_NAME}" "${SCRIPT_DIR}"
+    fi
+
+    mkdir -p "${SEED_DIR}"
+
+    # Restore .claude.json from backup if it exists
+    BACKUP=$(ls -t "${SEED_DIR}"/backups/.claude.json.backup.* 2>/dev/null | head -1)
+    if [ -n "${BACKUP}" ] && [ ! -f "${SEED_DIR}/.claude.json" ]; then
+        cp "${BACKUP}" "${SEED_DIR}/.claude.json"
+        echo "==> Restored .claude.json from backup"
+    fi
+
+    # Run claude login in a container with a TTY and script to capture output
+    LOGIN_LOG=$(mktemp)
+
+    # Use 'script' to capture PTY output while keeping TTY for claude login
+    podman run -t --rm \
+        --entrypoint bash \
+        -v "${SEED_DIR}:/root/.claude:Z" \
+        "${IMAGE_NAME}" \
+        -c '
+            # Symlink .claude.json if present in mount
+            if [ -f ~/.claude/.claude.json ] && [ ! -f ~/.claude.json ]; then
+                ln -s ~/.claude/.claude.json ~/.claude.json
+            fi
+            claude login
+        ' 2>&1 | tee "${LOGIN_LOG}" &
+    LOGIN_PID=$!
+
+    # Watch for the OAuth URL to appear, then open browser
+    echo "==> Waiting for OAuth URL..."
+    for i in $(seq 1 30); do
+        sleep 1
+        if grep -q "claude.com" "${LOGIN_LOG}" 2>/dev/null; then
+            sleep 1  # Wait for full URL to be written
+            # Extract URL: join all lines, find the https://claude.com URL
+            URL=$(cat "${LOGIN_LOG}" | tr -d '\n\r' | sed 's/.*\(https:\/\/claude\.com[^ ]*\).*/\1/' | tr -d ' ')
+            if [ -n "${URL}" ] && echo "${URL}" | grep -q "^https://claude.com"; then
+                echo ""
+                echo "==> Opening browser for authentication..."
+                if command -v open &>/dev/null; then
+                    open "${URL}"
+                elif command -v xdg-open &>/dev/null; then
+                    xdg-open "${URL}"
+                else
+                    echo "==> Open this URL in your browser:"
+                    echo "${URL}"
+                fi
+                echo "==> Complete the login in your browser..."
+            fi
+            break
+        fi
+    done
+
+    # Wait for login to complete
+    wait "${LOGIN_PID}" 2>/dev/null
+    LOGIN_EXIT=$?
+    rm -f "${LOGIN_LOG}"
+
+    if [ -f "${SEED_DIR}/.credentials.json" ]; then
+        echo "==> Login successful! Credentials saved to ${SEED_DIR}/"
+    else
+        echo "==> Login may have failed. Check ${SEED_DIR}/ for credentials."
+    fi
+    exit 0
+fi
 
 # Parse arguments
 if [ $# -lt 2 ]; then

@@ -109,10 +109,22 @@ Roles defined in `roles/*.yml` with:
 
 All host actions require TUI approval (human-in-the-loop).
 
+## Claude Code Runs as Root with IS_SANDBOX=1
+
+Claude Code runs with `--dangerously-skip-permissions` inside containers. This is the core design -- the container IS the security boundary, not Claude Code's permission system. Do not replace this with `--permission-mode dontAsk` or other alternatives.
+
+Claude Code runs as **root** inside the container with `IS_SANDBOX=1` environment variable. This bypasses Claude Code's refusal to run `--dangerously-skip-permissions` as root. Running as root eliminates all file permission issues:
+- No uid mismatch between host and container
+- No adduser/su/privilege dropping
+- No SETUID/CHOWN/DAC_OVERRIDE capabilities needed
+- All bind-mounted files (workspace, .beads, .claude) accessible without permission errors
+
+Do not add user creation, uid detection, or privilege dropping code.
+
 ## Security
 
-- `--dangerously-skip-permissions` -- always. Container is the boundary, not Claude Code's permission system.
-- `--cap-drop=ALL` + selective capabilities (NET_RAW, CHOWN, SETUID, SETGID, DAC_OVERRIDE)
+- `--dangerously-skip-permissions` with `IS_SANDBOX=1` -- always
+- `--cap-drop=ALL --cap-add=NET_RAW` -- minimal capabilities
 - Rootless Podman (no daemon, no root on host)
 - Workspace is the only writable bind mount from the project
 
@@ -125,7 +137,7 @@ Containers connect via MCP HTTP (port 9801) but never register as WebSocket agen
 Claude Code has a ~60s timeout on MCP tool calls. If the user takes longer than 60s to answer `ask_user` in the TUI, the response is lost. The MCP HTTP request times out on Claude Code's side before the TUI resolves the oneshot channel. Tracked in `agent-in-docker-1gd`.
 
 ### Entrypoint fragility
-The bash entrypoint handles: JSON editing via `node -e`, uid detection via `stat`, user creation via `adduser`, privilege dropping via `su`. Each of these has platform-specific edge cases (Alpine `stat` flags, `adduser` syntax, `su` with caps). The Rust CLI handles the host-side complexity well but the container-side is still bash.
+The bash entrypoint handles: JSON editing via `node -e`, uid detection via `stat`, user creation via `adduser`, privilege dropping via `su`. Being replaced by a Rust entrypoint binary (agent-in-docker-lnq.3). Most of the complexity goes away once Claude Code runs as root with IS_SANDBOX=1 (agent-in-docker-clp).
 
 ### No agent output streaming
 The TUI has an "Activity Log" panel but no live streaming of agent output. You can only see what agents are doing by attaching to their tmux window. The orchestrator has an `AgentOutput` event type but nothing populates it.

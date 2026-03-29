@@ -1,17 +1,14 @@
+import http from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { WsClient } from "./ws-client.js";
 import { handleAskUser } from "./tools/ask-user.js";
 import { handleReadHostFile } from "./tools/read-host-file.js";
 import { handleGitPush } from "./tools/git-push.js";
 
-export async function startMcpServer(client: WsClient): Promise<void> {
-  const server = new McpServer({
-    name: "agent-bridge",
-    version: "0.1.0",
-  });
-
+function registerTools(server: McpServer, client: WsClient): void {
   server.tool(
     "ask_user",
     "Ask the user a question and get their answer. Use this when you need clarification or approval from the human operator.",
@@ -74,7 +71,49 @@ export async function startMcpServer(client: WsClient): Promise<void> {
       }
     },
   );
+}
 
+/** Start MCP server on stdio (for in-container subprocess mode). */
+export async function startMcpServer(client: WsClient): Promise<void> {
+  const server = new McpServer({ name: "agent-bridge", version: "0.1.0" });
+  registerTools(server, client);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+/** Start MCP server on HTTP (for host-side shared mode). */
+export async function startHttpMcpServer(
+  client: WsClient,
+  port: number,
+): Promise<number> {
+  const mcpServer = new McpServer({ name: "agent-bridge", version: "0.1.0" });
+  registerTools(mcpServer, client);
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+  await mcpServer.connect(transport);
+
+  const httpServer = http.createServer(async (req, res) => {
+    try {
+      await transport.handleRequest(req, res);
+    } catch (err) {
+      console.error("[bridge] HTTP MCP error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end("Internal server error");
+      }
+    }
+  });
+
+  return new Promise((resolve) => {
+    httpServer.listen(port, "0.0.0.0", () => {
+      const addr = httpServer.address();
+      const actualPort = typeof addr === "object" && addr ? addr.port : port;
+      console.error(
+        `[bridge] MCP HTTP server listening on 0.0.0.0:${actualPort}`,
+      );
+      resolve(actualPort);
+    });
+  });
 }

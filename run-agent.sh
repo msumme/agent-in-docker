@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ORCHESTRATOR_PORT="${ORCHESTRATOR_PORT:-9800}"
 ORCHESTRATOR_PID_FILE="/tmp/agent-in-docker-orchestrator.pid"
+BRIDGE_PID_FILE="/tmp/agent-in-docker-bridge.pid"
 ORCHESTRATOR_BIN="${SCRIPT_DIR}/orchestrator/target/debug/orchestrator"
+BRIDGE_PORT="${BRIDGE_PORT:-9801}"
 IMAGE_NAME="agent-in-docker"
 NETWORK_NAME="agent-net"
 
@@ -282,12 +284,13 @@ if ! orchestrator_running; then
                 --name "${AGENT_NAME}" \
                 --network "${NETWORK_NAME}" \
                 -v "${PROJECT_PATH}:/workspace:Z" \
+                -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
                 -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
+                -e "BRIDGE_PORT=${BRIDGE_PORT}" \
                 -e "AGENT_NAME=${AGENT_NAME}" \
                 -e "AGENT_ROLE=${ROLE}" \
                 -e "AGENT_MODE=${AGENT_MODE}" \
                 -e "AGENT_PROMPT=${PROMPT}" \
-                -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
                 ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
                 "${IMAGE_NAME}")
             echo "==> Container started: ${CONTAINER_ID:0:12}"
@@ -301,6 +304,32 @@ else
     echo "==> Orchestrator already running"
 fi
 
+# Step 4b: Start bridge on host if not running
+bridge_running() {
+    if [ -f "${BRIDGE_PID_FILE}" ]; then
+        local pid
+        pid=$(cat "${BRIDGE_PID_FILE}")
+        kill -0 "${pid}" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+if ! bridge_running; then
+    echo "==> Starting bridge on port ${BRIDGE_PORT}..."
+    ORCHESTRATOR_URL="ws://localhost:${ORCHESTRATOR_PORT}" \
+    AGENT_NAME="host-bridge" \
+    AGENT_ROLE="bridge" \
+    AGENT_MODE="host" \
+    MCP_PORT="${BRIDGE_PORT}" \
+    node "${SCRIPT_DIR}/bridge/dist/index.js" &
+    BRIDGE_PID=$!
+    echo "${BRIDGE_PID}" > "${BRIDGE_PID_FILE}"
+    sleep 2
+    echo "==> Bridge started (PID: ${BRIDGE_PID}, port: ${BRIDGE_PORT})"
+else
+    echo "==> Bridge already running"
+fi
+
 # Step 5: Launch container
 # Write podman command to a script to avoid quoting issues with tmux
 AGENT_SCRIPT="${AGENTS_DIR}/run-${AGENT_NAME}.sh"
@@ -312,6 +341,7 @@ podman run -it --rm \\
     -v "${PROJECT_PATH}:/workspace:Z" \\
     -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \\
     -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \\
+    -e "BRIDGE_PORT=${BRIDGE_PORT}" \\
     -e "AGENT_NAME=${AGENT_NAME}" \\
     -e "AGENT_ROLE=${ROLE}" \\
     -e "AGENT_MODE=${AGENT_MODE}" \\
@@ -373,6 +403,7 @@ else
         -v "${PROJECT_PATH}:/workspace:Z" \
         -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
         -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
+        -e "BRIDGE_PORT=${BRIDGE_PORT}" \
         -e "AGENT_NAME=${AGENT_NAME}" \
         -e "AGENT_ROLE=${ROLE}" \
         -e "AGENT_MODE=${AGENT_MODE}" \

@@ -1,25 +1,19 @@
-# Stage 1: Build the TypeScript bridge
-FROM node:22-slim AS builder
-WORKDIR /build
-COPY bridge/package.json bridge/package-lock.json ./
-RUN npm ci
-COPY bridge/ ./
-RUN npm run build
+# Single-stage: no bridge build needed (bridge runs on host)
+FROM node:22-alpine
 
-# Stage 2: Runtime
-FROM node:22-slim
+# Install packages
+RUN apk add --no-cache bash curl python3 git
 
-# Install curl (for task queue polling in long-running mode)
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Non-root user (node:22-slim already has uid 1000 as 'node', reuse it)
-RUN mkdir -p /workspace && chown node:node /workspace
+# Install beads (bd)
+RUN apk add --no-cache --virtual .bd-deps go && \
+    GOBIN=/usr/local/bin go install github.com/steveyegge/beads/cmd/bd@latest && \
+    apk del .bd-deps
 
-# Copy built bridge
-COPY --from=builder /build/dist /opt/bridge/dist
-COPY --from=builder /build/node_modules /opt/bridge/node_modules
-COPY --from=builder /build/package.json /opt/bridge/package.json
+# Workspace
+RUN mkdir -p /workspace && chown node:node /workspace
 
 # Copy entrypoint
 COPY scripts/entrypoint.sh /opt/entrypoint.sh

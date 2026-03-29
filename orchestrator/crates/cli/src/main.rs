@@ -89,11 +89,8 @@ fn main() -> Result<()> {
             // Ensure network exists
             container::ensure_network(&cfg.network_name)?;
 
-            // Ensure orchestrator is running
+            // Ensure orchestrator is running (includes built-in MCP server)
             services::ensure_orchestrator(&cfg)?;
-
-            // Ensure bridge is running
-            services::ensure_bridge(&cfg)?;
 
             // Launch agent
             let run_cfg = container::RunConfig {
@@ -104,7 +101,7 @@ fn main() -> Result<()> {
                 mode: mode.to_string(),
                 prompt,
                 orchestrator_port: cfg.orchestrator_port,
-                bridge_port: cfg.bridge_port,
+                mcp_port: cfg.mcp_port,
                 image_name: cfg.image_name.clone(),
                 network_name: cfg.network_name.clone(),
             };

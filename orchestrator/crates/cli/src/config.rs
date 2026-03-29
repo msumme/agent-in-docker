@@ -7,15 +7,15 @@ pub struct Config {
     pub seed_dir: PathBuf,
     pub agents_dir: PathBuf,
     pub orchestrator_bin: PathBuf,
+    #[allow(dead_code)]
     pub bridge_dir: PathBuf,
     pub containerfile: PathBuf,
     pub entrypoint: PathBuf,
     pub orchestrator_port: u16,
-    pub bridge_port: u16,
+    pub mcp_port: u16,
     pub image_name: String,
     pub network_name: String,
     pub orchestrator_pid_file: PathBuf,
-    pub bridge_pid_file: PathBuf,
 }
 
 impl Config {
@@ -47,11 +47,10 @@ impl Config {
             containerfile: dir.join("Containerfile"),
             entrypoint: dir.join("scripts/entrypoint.sh"),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: "agent-in-docker".to_string(),
             network_name: "agent-net".to_string(),
             orchestrator_pid_file: PathBuf::from("/tmp/agent-in-docker-orchestrator.pid"),
-            bridge_pid_file: PathBuf::from("/tmp/agent-in-docker-bridge.pid"),
             project_root: dir,
         })
     }
@@ -161,11 +160,10 @@ mod tests {
             containerfile: PathBuf::new(),
             entrypoint: PathBuf::new(),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: String::new(),
             network_name: String::new(),
             orchestrator_pid_file: PathBuf::new(),
-            bridge_pid_file: PathBuf::new(),
         };
 
         let dir = setup_agent_dir(&cfg, "coder", true).unwrap();
@@ -195,11 +193,10 @@ mod tests {
             containerfile: PathBuf::new(),
             entrypoint: PathBuf::new(),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: String::new(),
             network_name: String::new(),
             orchestrator_pid_file: PathBuf::new(),
-            bridge_pid_file: PathBuf::new(),
         };
 
         let dir = setup_agent_dir(&cfg, "temp-1", false).unwrap();
@@ -225,11 +222,10 @@ mod tests {
             containerfile: PathBuf::new(),
             entrypoint: PathBuf::new(),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: String::new(),
             network_name: String::new(),
             orchestrator_pid_file: PathBuf::new(),
-            bridge_pid_file: PathBuf::new(),
         };
         assert!(ensure_credentials(&cfg).is_err());
     }

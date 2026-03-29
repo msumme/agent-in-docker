@@ -54,9 +54,9 @@ run_as_node() {
 
 setup_node_user
 
-# MCP config: connect to the bridge on the host via HTTP
-BRIDGE_PORT="${BRIDGE_PORT:-9801}"
-BRIDGE_URL="http://host.containers.internal:${BRIDGE_PORT}/mcp"
+# MCP config: connect to the orchestrator's built-in MCP server on the host
+MCP_PORT="${MCP_PORT:-9801}"
+BRIDGE_URL="http://host.containers.internal:${MCP_PORT}/mcp"
 
 cat > /tmp/mcp-config.json <<MCPEOF
 {

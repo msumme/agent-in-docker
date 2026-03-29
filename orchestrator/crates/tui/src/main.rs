@@ -2,6 +2,7 @@ mod app;
 mod ui;
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -12,11 +13,11 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
+use orchestrator_core::mcp::{mcp_router, McpState};
 use orchestrator_core::types::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Set up logging to file (can't log to terminal since TUI owns it)
     let log_file = std::fs::File::create("/tmp/orchestrator.log")?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
@@ -31,12 +32,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
-    // Start the WebSocket server
+    // MCP HTTP state (shared with TUI for resolving pending requests)
+    let mcp_state = Arc::new(McpState::new(event_tx.clone()));
+
+    // Start WebSocket server
     let server_addr = addr.clone();
     tokio::spawn(async move {
         if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx).await {
             tracing::error!("Server error: {}", e);
         }
+    });
+
+    // Start HTTP MCP server on port 9801 (separate from WS on 9800)
+    let mcp_app = mcp_router(mcp_state.clone());
+    let http_addr = addr.replace(":9800", ":9801").replace(":0", ":0");
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
+        tracing::info!("MCP HTTP server listening on {}", http_addr);
+        axum::serve(listener, mcp_app).await.unwrap();
     });
 
     // Set up terminal
@@ -45,19 +58,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cmd_tx.clone());
+    let mut app = App::new(cmd_tx.clone(), mcp_state.clone());
 
     // Main loop
     loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        // Poll for crossterm events with a short timeout so we can also check orchestrator events
         if crossterm::event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                // Check if selected request needs y/n approval (not text input)
                 let approval_mode = app.focus == app::FocusPanel::Requests
                     && !app.pending_requests.is_empty()
                     && app.pending_requests
@@ -88,7 +99,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Drain orchestrator events
         while let Ok(event) = event_rx.try_recv() {
             app.handle_event(event);
         }
@@ -99,7 +109,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 

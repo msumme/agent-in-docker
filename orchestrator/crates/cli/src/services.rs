@@ -38,21 +38,16 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
 
     let addr = format!("0.0.0.0:{}", cfg.orchestrator_port);
 
-    // Try tmux first
     if Command::new("tmux").arg("--version").output().is_ok() {
         let status = Command::new("tmux")
             .args([
-                "new-session",
-                "-d",
-                "-s",
-                "orchestrator",
+                "new-session", "-d", "-s", "orchestrator",
                 &format!("{} {}", cfg.orchestrator_bin.display(), addr),
             ])
             .status()?;
 
         if status.success() {
             std::thread::sleep(std::time::Duration::from_secs(1));
-            // Get the PID from tmux
             if let Ok(output) = Command::new("tmux")
                 .args(["list-panes", "-t", "orchestrator", "-F", "#{pane_pid}"])
                 .output()
@@ -66,7 +61,6 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
         }
     }
 
-    // Fallback: background process
     let child = Command::new(&cfg.orchestrator_bin)
         .arg(&addr)
         .spawn()
@@ -75,47 +69,6 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
     std::fs::write(&cfg.orchestrator_pid_file, child.id().to_string())?;
     std::thread::sleep(std::time::Duration::from_secs(1));
     println!("==> Orchestrator started (PID: {})", child.id());
-
-    Ok(())
-}
-
-pub fn ensure_bridge(cfg: &Config) -> Result<()> {
-    if pid_is_running(&cfg.bridge_pid_file) {
-        // Double-check the port is actually reachable
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", cfg.bridge_port).parse().unwrap(),
-            std::time::Duration::from_secs(1),
-        )
-        .is_ok()
-        {
-            println!("==> Bridge already running");
-            return Ok(());
-        }
-        // PID exists but port not reachable -- stale
-        eprintln!("==> Stale bridge PID file, restarting...");
-    }
-
-    // Kill anything on the port
-    let _ = Command::new("sh")
-        .args(["-c", &format!("lsof -ti:{} | xargs kill 2>/dev/null", cfg.bridge_port)])
-        .output();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-
-    println!("==> Starting bridge on port {}...", cfg.bridge_port);
-
-    let child = Command::new("node")
-        .arg(cfg.bridge_dir.join("dist/index.js"))
-        .env("ORCHESTRATOR_URL", format!("ws://localhost:{}", cfg.orchestrator_port))
-        .env("AGENT_NAME", "host-bridge")
-        .env("AGENT_ROLE", "bridge")
-        .env("AGENT_MODE", "host")
-        .env("MCP_PORT", cfg.bridge_port.to_string())
-        .spawn()
-        .context("Failed to start bridge")?;
-
-    std::fs::write(&cfg.bridge_pid_file, child.id().to_string())?;
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    println!("==> Bridge started (PID: {}, port: {})", child.id(), cfg.bridge_port);
 
     Ok(())
 }

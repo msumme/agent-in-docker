@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use orchestrator_core::mcp::McpState;
 use orchestrator_core::types::*;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -25,10 +28,11 @@ pub struct App {
     pub input_text: String,
     pub should_quit: bool,
     pub cmd_tx: mpsc::UnboundedSender<TuiCommand>,
+    mcp_state: Arc<McpState>,
 }
 
 impl App {
-    pub fn new(cmd_tx: mpsc::UnboundedSender<TuiCommand>) -> Self {
+    pub fn new(cmd_tx: mpsc::UnboundedSender<TuiCommand>, mcp_state: Arc<McpState>) -> Self {
         Self {
             agents: Vec::new(),
             pending_requests: Vec::new(),
@@ -39,6 +43,7 @@ impl App {
             input_text: String::new(),
             should_quit: false,
             cmd_tx,
+            mcp_state,
         }
     }
 
@@ -87,6 +92,15 @@ impl App {
         }
     }
 
+    /// Try to resolve an MCP pending request. Non-blocking.
+    fn resolve_mcp(&self, request_id: &str, payload: serde_json::Value) {
+        if let Ok(mut pending) = self.mcp_state.pending.try_lock() {
+            if let Some(sender) = pending.remove(request_id) {
+                let _ = sender.send(payload);
+            }
+        }
+    }
+
     pub fn submit_answer(&mut self) {
         // If no pending requests, send the input as a task to the selected agent
         if self.pending_requests.is_empty() {
@@ -119,9 +133,11 @@ impl App {
                     "[{}] Q: {} -> A: {}",
                     req.agent_name, req.question, self.input_text
                 ));
+                let payload = json!({ "answer": self.input_text });
+                self.resolve_mcp(&req.request_id, payload.clone());
                 let _ = self.cmd_tx.send(TuiCommand::RespondToRequest {
                     request_id: req.request_id,
-                    payload: json!({ "answer": self.input_text }),
+                    payload,
                 });
                 self.input_text.clear();
             }
@@ -148,6 +164,16 @@ impl App {
             "[{}] {} {} -> APPROVED",
             req.agent_name, req.request_type, req.question
         ));
+
+        // For MCP requests, execute the action and resolve directly
+        if req.request_type == "file_read" {
+            let payload = match orchestrator_core::handlers::file_read::read_file(&req.question) {
+                Ok(content) => json!({"content": content}),
+                Err(e) => json!({"code": "READ_FAILED", "message": e}),
+            };
+            self.resolve_mcp(&req.request_id, payload);
+        }
+
         let _ = self.cmd_tx.send(TuiCommand::ApproveRequest {
             request_id: req.request_id,
         });
@@ -168,6 +194,7 @@ impl App {
             "[{}] {} {} -> DENIED",
             req.agent_name, req.request_type, req.question
         ));
+        self.resolve_mcp(&req.request_id, json!({"code": "PERMISSION_DENIED", "message": "Denied by user"}));
         let _ = self.cmd_tx.send(TuiCommand::DenyRequest {
             request_id: req.request_id,
             reason: "Denied by user".into(),
@@ -225,7 +252,9 @@ mod tests {
 
     fn make_app() -> (App, mpsc::UnboundedReceiver<TuiCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        (App::new(cmd_tx), cmd_rx)
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let mcp_state = Arc::new(McpState::new(event_tx));
+        (App::new(cmd_tx, mcp_state), cmd_rx)
     }
 
     fn agent_connected(id: &str, name: &str, role: &str) -> OrchestratorEvent {

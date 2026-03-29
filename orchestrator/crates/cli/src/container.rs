@@ -11,7 +11,7 @@ pub struct RunConfig {
     pub mode: String,
     pub prompt: String,
     pub orchestrator_port: u16,
-    pub bridge_port: u16,
+    pub mcp_port: u16,
     pub image_name: String,
     pub network_name: String,
 }
@@ -66,7 +66,7 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
             cfg.orchestrator_port
         ),
         "-e".to_string(),
-        format!("BRIDGE_PORT={}", cfg.bridge_port),
+        format!("MCP_PORT={}", cfg.mcp_port),
         "-e".to_string(),
         format!("AGENT_NAME={}", cfg.agent_name),
         "-e".to_string(),
@@ -239,7 +239,7 @@ mod tests {
             mode: "oneshot".into(),
             prompt: "hello".into(),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };
@@ -247,7 +247,7 @@ mod tests {
         let args = podman_run_args(&cfg);
         assert!(args.contains(&"AGENT_NAME=test".to_string()));
         assert!(args.contains(&"AGENT_MODE=oneshot".to_string()));
-        assert!(args.contains(&"BRIDGE_PORT=9801".to_string()));
+        assert!(args.contains(&"MCP_PORT=9801".to_string()));
         assert!(args.contains(&"agent-in-docker".to_string()));
     }
 
@@ -263,7 +263,7 @@ mod tests {
             mode: "long-running".into(),
             prompt: "hi there".into(),
             orchestrator_port: 9800,
-            bridge_port: 9801,
+            mcp_port: 9801,
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };

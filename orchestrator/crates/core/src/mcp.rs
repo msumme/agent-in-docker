@@ -329,6 +329,8 @@ async fn handle_tools_call(
                 }
             }
 
+            info!("MCP tool response: {} payload={}", tool_name, response_payload);
+
             // Map response to MCP tool result
             let text = match tool_name {
                 "ask_user" => response_payload

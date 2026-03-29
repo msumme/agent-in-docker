@@ -37,7 +37,7 @@ echo "[entrypoint] Agent: ${AGENT_NAME} (${AGENT_ROLE}, ${AGENT_MODE:-oneshot})"
 setup_node_user() {
     if [ "$(id -u)" = "0" ]; then
         mkdir -p /home/node/.claude
-        cp -a ~/.claude/. /home/node/.claude/
+        cp -r ~/.claude/. /home/node/.claude/ 2>/dev/null || cp ~/.claude/. /home/node/.claude/ 2>/dev/null || true
         [ -f ~/.claude.json ] && cp ~/.claude.json /home/node/.claude.json 2>/dev/null || true
         ln -sf /home/node/.claude/.claude.json /home/node/.claude.json 2>/dev/null || true
         chown -R node:node /home/node/.claude /home/node/.claude.json 2>/dev/null || true

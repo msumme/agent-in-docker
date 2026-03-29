@@ -58,8 +58,11 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         cfg.network_name.clone(),
         // Security hardening
         "--cap-drop=ALL".to_string(),
-        "--cap-add=NET_RAW".to_string(), // DNS resolution
-        "--security-opt=no-new-privileges".to_string(),
+        "--cap-add=NET_RAW".to_string(),   // DNS resolution
+        "--cap-add=CHOWN".to_string(),     // Entrypoint copies credentials
+        "--cap-add=SETUID".to_string(),    // su from root to node
+        "--cap-add=SETGID".to_string(),    // su from root to node
+        "--cap-add=DAC_OVERRIDE".to_string(), // Write to /home/node
         // Volumes
         "-v".to_string(),
         format!("{}:/workspace:Z", cfg.project_path),

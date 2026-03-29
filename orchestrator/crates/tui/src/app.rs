@@ -94,10 +94,7 @@ impl App {
 
     /// Try to resolve an MCP pending request. Non-blocking.
     fn resolve_mcp(&self, request_id: &str, payload: serde_json::Value) {
-        let mut pending = self.mcp_state.pending.lock().unwrap();
-        if let Some(sender) = pending.remove(request_id) {
-            let _ = sender.send(payload);
-        }
+        self.mcp_state.resolve(request_id, payload);
     }
 
     pub fn submit_answer(&mut self) {
@@ -224,6 +221,15 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Get the name of the currently selected agent (for attach mode).
+    pub fn selected_agent_name(&self) -> Option<String> {
+        if self.agents.is_empty() {
+            return None;
+        }
+        let idx = self.selected_agent.min(self.agents.len() - 1);
+        Some(self.agents[idx].name.clone())
     }
 
     pub fn move_selection_down(&mut self) {

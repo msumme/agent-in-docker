@@ -1,8 +1,12 @@
 # Single-stage: bridge runs on host, container just needs Claude Code
 FROM node:22-alpine
 
-# Install packages + glibc compat layer (needed for pre-built Go binaries like bd)
-RUN apk add --no-cache bash curl python3 git gcompat
+# Install packages + glibc compat + Chromium for Playwright
+RUN apk add --no-cache bash curl python3 git gcompat chromium nss freetype harfbuzz
+
+# Playwright: use system Chromium instead of downloading its own
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code

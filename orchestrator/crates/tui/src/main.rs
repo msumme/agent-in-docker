@@ -80,6 +80,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('q') if app.pending_requests.is_empty() => {
                         app.should_quit = true;
                     }
+                    KeyCode::Char('a') if app.focus == app::FocusPanel::Agents => {
+                        if let Some(name) = app.selected_agent_name() {
+                            // Leave TUI, attach to agent's tmux window
+                            disable_raw_mode()?;
+                            io::stdout().execute(LeaveAlternateScreen)?;
+                            let target = format!("agents:{}", name);
+                            let _ = std::process::Command::new("tmux")
+                                .args(["select-window", "-t", &target])
+                                .status();
+                            let _ = std::process::Command::new("tmux")
+                                .args(["attach-session", "-t", "agents"])
+                                .status();
+                            // Restore TUI when user detaches
+                            enable_raw_mode()?;
+                            io::stdout().execute(EnterAlternateScreen)?;
+                            terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+                        }
+                    }
                     KeyCode::Char('y') if approval_mode => app.approve_request(),
                     KeyCode::Char('n') if approval_mode => app.deny_request(),
                     KeyCode::Tab => app.toggle_focus(),

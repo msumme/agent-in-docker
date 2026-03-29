@@ -70,6 +70,19 @@ cat > /tmp/mcp-config.json <<MCPEOF
 MCPEOF
 [ "$(id -u)" = "0" ] && chown node:node /tmp/mcp-config.json
 
+# Configure beads to connect to host dolt server via a wrapper script.
+# This avoids modifying the workspace's config files.
+if [ -n "${DOLT_HOST:-}" ] && [ -n "${DOLT_PORT:-}" ]; then
+    cat > /usr/local/bin/bd-wrapper <<BDEOF
+#!/bin/sh
+exec /usr/local/bin/bd --server-host="${DOLT_HOST}" --server-port="${DOLT_PORT}" "\$@"
+BDEOF
+    chmod +x /usr/local/bin/bd-wrapper
+    # Move the real bd and replace with wrapper
+    mv /usr/local/bin/bd /usr/local/bin/bd-real
+    mv /usr/local/bin/bd-wrapper /usr/local/bin/bd
+fi
+
 CLAUDE_ARGS="--dangerously-skip-permissions --mcp-config /tmp/mcp-config.json"
 
 if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then

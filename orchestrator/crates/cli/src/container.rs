@@ -42,6 +42,26 @@ pub fn build_image(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Detect the port of a running dolt sql-server on the host.
+fn detect_dolt_port() -> Option<u16> {
+    let output = Command::new("lsof")
+        .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("dolt") {
+            // Parse port from "TCP *:52837 (LISTEN)" or "TCP 127.0.0.1:52837 (LISTEN)"
+            if let Some(addr_part) = line.split_whitespace().find(|s| s.contains(':') && s.chars().last().map_or(false, |c| c.is_ascii_digit())) {
+                if let Some(port_str) = addr_part.rsplit(':').next() {
+                    return port_str.parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn ensure_network(name: &str) -> Result<()> {
     let _ = Command::new("podman")
         .args(["network", "create", name])
@@ -89,6 +109,16 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         if !key.is_empty() {
             args.extend_from_slice(&["-e".to_string(), format!("ANTHROPIC_API_KEY={}", key)]);
         }
+    }
+
+    // Detect host dolt server port for beads
+    if let Some(port) = detect_dolt_port() {
+        args.extend_from_slice(&[
+            "-e".to_string(),
+            "DOLT_HOST=host.containers.internal".to_string(),
+            "-e".to_string(),
+            format!("DOLT_PORT={}", port),
+        ]);
     }
 
     args.push(cfg.image_name.clone());

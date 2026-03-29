@@ -81,9 +81,25 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
 
 pub fn ensure_bridge(cfg: &Config) -> Result<()> {
     if pid_is_running(&cfg.bridge_pid_file) {
-        println!("==> Bridge already running");
-        return Ok(());
+        // Double-check the port is actually reachable
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", cfg.bridge_port).parse().unwrap(),
+            std::time::Duration::from_secs(1),
+        )
+        .is_ok()
+        {
+            println!("==> Bridge already running");
+            return Ok(());
+        }
+        // PID exists but port not reachable -- stale
+        eprintln!("==> Stale bridge PID file, restarting...");
     }
+
+    // Kill anything on the port
+    let _ = Command::new("sh")
+        .args(["-c", &format!("lsof -ti:{} | xargs kill 2>/dev/null", cfg.bridge_port)])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(1));
 
     println!("==> Starting bridge on port {}...", cfg.bridge_port);
 

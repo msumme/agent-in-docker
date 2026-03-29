@@ -89,21 +89,34 @@ export async function startHttpMcpServer(
   const mcpServer = new McpServer({ name: "agent-bridge", version: "0.1.0" });
   registerTools(mcpServer, client);
 
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-  await mcpServer.connect(transport);
-
   const httpServer = http.createServer(async (req, res) => {
-    try {
-      await transport.handleRequest(req, res);
-    } catch (err) {
-      console.error("[bridge] HTTP MCP error:", err);
-      if (!res.headersSent) {
-        res.writeHead(500);
-        res.end("Internal server error");
+    const url = req.url ?? "";
+    if (url.startsWith("/mcp")) {
+      try {
+        // Create a fresh server+transport per request to avoid statefulness issues.
+        // Each container connection is independent.
+        const perReqServer = new McpServer({
+          name: "agent-bridge",
+          version: "0.1.0",
+        });
+        registerTools(perReqServer, client);
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+        });
+        res.on("close", () => transport.close().catch(() => {}));
+        await perReqServer.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        console.error("[bridge] MCP HTTP error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end(String(err));
+        }
       }
+      return;
     }
+    res.writeHead(404);
+    res.end("Not found");
   });
 
   return new Promise((resolve) => {

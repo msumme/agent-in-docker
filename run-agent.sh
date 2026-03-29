@@ -55,18 +55,29 @@ if [ "${1:-}" = "login" ]; then
         echo "==> Restored .claude.json from backup"
     fi
 
-    # Run claude login in a container with a TTY and script to capture output
+    # Run claude login in a container with interactive TTY.
+    # Pre-accept trust dialog and run from /tmp to avoid workspace prompts.
     LOGIN_LOG=$(mktemp)
 
-    # Use 'script' to capture PTY output while keeping TTY for claude login
-    podman run -t --rm \
+    podman run -it --rm \
         --entrypoint bash \
         -v "${SEED_DIR}:/root/.claude:Z" \
+        -w /tmp \
         "${IMAGE_NAME}" \
         -c '
-            # Symlink .claude.json if present in mount
             if [ -f ~/.claude/.claude.json ] && [ ! -f ~/.claude.json ]; then
                 ln -s ~/.claude/.claude.json ~/.claude.json
+            fi
+            # Pre-accept trust for /tmp so login does not prompt
+            if [ -f ~/.claude.json ]; then
+                node -e "
+                  const fs = require(\"fs\");
+                  const d = JSON.parse(fs.readFileSync(process.env.HOME + \"/.claude.json\"));
+                  if (!d.projects) d.projects = {};
+                  d.projects[\"/tmp\"] = {hasTrustDialogAccepted: true};
+                  d.hasCompletedOnboarding = true;
+                  fs.writeFileSync(process.env.HOME + \"/.claude.json\", JSON.stringify(d));
+                " 2>/dev/null || true
             fi
             claude login
         ' 2>&1 | tee "${LOGIN_LOG}" &
@@ -200,7 +211,8 @@ else
 fi
 
 # Copy shared credentials into agent dir (can't symlink -- host paths don't exist in container)
-cp -f "${SEED_DIR}/.credentials.json" "${AGENT_CLAUDE_DIR}/.credentials.json"
+rm -f "${AGENT_CLAUDE_DIR}/.credentials.json"
+cp "${SEED_DIR}/.credentials.json" "${AGENT_CLAUDE_DIR}/.credentials.json"
 
 cleanup_agent_dir() {
     if [ "${CLEANUP_AGENT_DIR}" = true ] && [ -n "${AGENT_CLAUDE_DIR}" ]; then

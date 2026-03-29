@@ -94,10 +94,9 @@ impl App {
 
     /// Try to resolve an MCP pending request. Non-blocking.
     fn resolve_mcp(&self, request_id: &str, payload: serde_json::Value) {
-        if let Ok(mut pending) = self.mcp_state.pending.try_lock() {
-            if let Some(sender) = pending.remove(request_id) {
-                let _ = sender.send(payload);
-            }
+        let mut pending = self.mcp_state.pending.lock().unwrap();
+        if let Some(sender) = pending.remove(request_id) {
+            let _ = sender.send(payload);
         }
     }
 

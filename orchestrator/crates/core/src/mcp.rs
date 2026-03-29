@@ -7,7 +7,8 @@ use axum::routing::post;
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use std::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::types::OrchestratorEvent;
@@ -85,8 +86,8 @@ impl McpState {
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
-    pub async fn resolve(&self, request_id: &str, payload: Value) -> bool {
-        let mut pending = self.pending.lock().await;
+    pub fn resolve(&self, request_id: &str, payload: Value) -> bool {
+        let mut pending = self.pending.lock().unwrap();
         if let Some(sender) = pending.remove(request_id) {
             let _ = sender.send(payload);
             true
@@ -242,7 +243,7 @@ async fn handle_tools_call(
     // Create oneshot channel for the response
     let (tx, rx) = oneshot::channel();
     {
-        let mut pending = state.pending.lock().await;
+        let mut pending = state.pending.lock().unwrap();
         pending.insert(request_id.clone(), tx);
     }
 
@@ -305,7 +306,7 @@ async fn handle_tools_call(
         }
         Err(_) => {
             // Clean up timed-out request
-            let mut pending = state.pending.lock().await;
+            let mut pending = state.pending.lock().unwrap();
             pending.remove(&request_id);
             JsonRpcResponse::error(id, -32000, "Request timed out".into())
         }
@@ -385,11 +386,11 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = state.pending.lock().await;
+            let mut pending = state.pending.lock().unwrap();
             pending.insert("req-1".into(), tx);
         }
 
-        let resolved = state.resolve("req-1", json!({"answer": "blue"})).await;
+        let resolved =         state.resolve("req-1", json!({"answer": "blue"}));
         assert!(resolved);
 
         let result = rx.await.unwrap();
@@ -400,7 +401,7 @@ mod tests {
     async fn mcp_state_resolve_nonexistent_returns_false() {
         let (event_tx, _) = mpsc::unbounded_channel();
         let state = McpState::new(event_tx);
-        assert!(!state.resolve("nonexistent", json!({})).await);
+        assert!(!        state.resolve("nonexistent", json!({})));
     }
 
     #[tokio::test]
@@ -466,7 +467,7 @@ mod tests {
         };
 
         // Resolve it
-        state.resolve(&request_id, json!({"answer": "red"})).await;
+                state.resolve(&request_id, json!({"answer": "red"}));
 
         // Check response
         let resp = resp_future.await.unwrap();

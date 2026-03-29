@@ -1,96 +1,137 @@
 # Architecture Decisions
 
-## Single Rust Binary
+## Overview
 
-The orchestrator is a single Rust binary that handles all host-side responsibilities:
-- **WebSocket server** (port 9800) for agent registration and event routing
-- **HTTP MCP server** (port 9801) for Claude Code tool calls from containers
-- **TUI dashboard** (ratatui) for human interaction
-- **Agent registry** for discovery and inter-agent messaging
-- **Permission checker** for role-based access control
+agent-in-docker runs LLM code agents inside Podman containers. The container is the security boundary -- agents have full freedom inside but restricted host access.
 
-This replaced an earlier architecture with a separate Node.js bridge process. The merge eliminates stale-process bugs and the Node.js host dependency.
+## Components
 
-## Container as Security Boundary
+### 1. Rust Orchestrator Binary (`orchestrator`)
 
-Agents run with `--dangerously-skip-permissions` inside containers. The container IS the security boundary. This means:
-- Full freedom inside (file access, code execution, package installs)
-- No host access except through the orchestrator's permission-checked MCP tools
-- Podman runs rootless with `--cap-drop=ALL` plus selective capabilities
+Single binary with three subsystems:
 
-## MCP HTTP Transport
+**WebSocket Server (port 9800)**
+- Agents register with `{ type: "register", payload: { name, role } }`
+- Handles: `user_prompt`, `file_read`, `git_push`, `discover`, `agent_message`
+- Broadcasts `peer_joined`/`peer_left` on connect/disconnect
+- TUI communicates via channels (`OrchestratorEvent` and `TuiCommand`)
 
-Claude Code in containers connects to the orchestrator's MCP server via HTTP (`http://host.containers.internal:9801/mcp`). This is the MCP Streamable HTTP protocol: JSON-RPC 2.0 requests, SSE responses.
+**MCP HTTP Server (port 9801)**
+- Claude Code in containers connects here for tool calls
+- Implements MCP Streamable HTTP protocol (JSON-RPC over HTTP, SSE responses)
+- Tools: `ask_user`, `read_host_file`, `git_push`, `list_agents`, `message_agent`
+- Each request creates a pending oneshot channel, resolved by TUI interaction
 
-**Known limitation**: Claude Code has a ~60s timeout on MCP tool calls. Human-in-the-loop tools like `ask_user` can exceed this if the user takes too long to respond. A fix is tracked in beads (`agent-in-docker-1gd`).
+**TUI Dashboard (ratatui)**
+- Shows: agent list, pending requests, activity log
+- Handles: text answers for `ask_user`, y/n approval for `file_read`/`git_push`
+- Keybindings: Tab (switch panels), Enter (submit), y/n (approve/deny), a (attach), q (quit)
+- Sends typed input as `SendTask` to selected agent when no pending requests
 
-## `--dangerously-skip-permissions`
+### 2. CLI Binary (`agent`)
 
-Claude Code runs with `--dangerously-skip-permissions` inside containers. This is the core design -- the container IS the security boundary, not Claude Code's permission system. The whole point is to give the agent full freedom inside the sandbox.
+Host-side launcher. Subcommands:
+- `agent run <path> <prompt>` -- launch an agent in a container
+- `agent login` -- authenticate Claude Code
 
-Do not replace this with `--permission-mode dontAsk` or other alternatives.
+Responsibilities:
+- Reads credentials from `.claude-container/`
+- Copies credentials into per-agent config dirs (`.claude-agents/<name>/`)
+- Ensures orchestrator is running (starts in tmux if needed)
+- Ensures project's dolt server is running (for beads)
+- Launches containers via podman, manages tmux sessions for named agents
+- Auto-accepts bypass permissions dialog via `tmux send-keys`
 
-## Privilege Dropping and UID Matching
+### 3. Container (`Containerfile`)
 
-`--dangerously-skip-permissions` refuses to run as root. The entrypoint runs as root for setup, then drops to a non-root user before starting Claude Code.
+Alpine-based image containing:
+- Claude Code CLI (Node.js)
+- Python 3, Git, Chromium (Playwright), bash, curl
+- beads (`bd`) + dolt (issue tracking)
+- `entrypoint.sh` (setup + launch)
 
-The non-root user must have the same uid as the host user (501 on macOS) so that bind-mounted files are readable/writable without permission issues. The entrypoint creates a user with the matching uid rather than using the container's default `node` user (uid 1000).
+### 4. Entrypoint (`scripts/entrypoint.sh`)
 
-## Mount Permissions
+Runs inside the container at startup:
+1. Symlinks/restores `~/.claude.json` from mount
+2. Pre-accepts workspace trust (modifies JSON via `node -e`)
+3. Sets `BEADS_DOLT_SERVER_HOST/PORT` env vars for host dolt connection
+4. Generates MCP config pointing to `host.containers.internal:9801/mcp`
+5. Detects workspace owner uid, creates matching user
+6. Drops to that user via `su`, runs Claude Code with `--dangerously-skip-permissions`
 
-- `/workspace` -- read-write, contains the project the agent works on
-- `/root/.claude` -- read-write, agent's Claude Code config and credentials
-- `.beads/` directory inside workspace -- read-write, beads auto-starts dolt locally per command
+## Data Flow
 
-## Agent Config Directories
+### Oneshot Agent
+```
+CLI → podman run → entrypoint → claude -p "prompt" → MCP HTTP → orchestrator → TUI
+                                                                                 ↓
+CLI ← podman exit ← claude exits ← MCP response ← orchestrator ← TUI (user answers)
+```
+
+### Named Long-Running Agent
+```
+CLI → tmux window → podman run -it → entrypoint → claude (interactive)
+                                                      ↕
+                                                 MCP HTTP ↔ orchestrator ↔ TUI
+```
+User attaches to agent via `tmux attach -t agents`, or interacts via TUI.
+
+## Credential Flow
 
 ```
-.claude-container/          # Seed directory (shared OAuth credentials)
-  .credentials.json         # From 'run-agent.sh login'
-  .claude.json              # Claude Code config
-  backups/                  # Config backups
+./run-agent.sh login
+  → podman run -it (interactive Claude Code)
+  → user runs /login, completes OAuth in browser
+  → credentials saved to .claude-container/.credentials.json
 
-.claude-agents/             # Per-agent directories
-  Alice/                    # Named agent (persistent across runs)
-    .credentials.json       # Copied from seed on each launch
-    .claude.json            # Agent's own config (evolves over time)
-  ephemeral-agent-123/      # Ephemeral (deleted on exit)
+./run-agent.sh . "prompt" --name X
+  → CLI copies .claude-container/ → .claude-agents/X/
+  → container mounts .claude-agents/X/ at /root/.claude
+  → entrypoint symlinks .claude.json, creates uid-matched user
+  → Claude Code reads credentials from /home/agent/.claude/
 ```
 
-Named agents get persistent directories that survive across container restarts. Credentials are always copied fresh from the seed directory on launch (not symlinked, because host paths don't exist inside the container).
+## Beads/Dolt Integration
 
-## Beads and Dolt
+Each project has its own dolt server on a fixed port stored in `.beads/dolt-server.port`.
 
-Beads (`bd`) is the issue tracker. It requires a Dolt database server.
+- **Host**: `bd` auto-starts dolt pointing at `.beads/dolt/` data directory
+- **Container**: CLI reads the port, ensures dolt is running, passes `DOLT_HOST` + `DOLT_PORT` env vars. Entrypoint sets `BEADS_DOLT_SERVER_HOST/PORT` so `bd` connects to host dolt over the network.
 
-**Host side**: Dolt runs on the host machine (auto-started by `bd` on a dynamic port). Beads connects to it directly.
+## Permission Model
 
-**Container side**: Agents that need beads access must connect to the host's Dolt server over the network. The configuration requires:
-- `--server-host=host.containers.internal` to reach the host from inside the container
-- `--server-port=<port>` matching the host's dolt server port
+Roles defined in `roles/*.yml` with:
+- Capability flags (`file_read`, `git_push`, `user_prompt`, etc.)
+- Path allow/deny globs for file reads
+- Allowed git remotes
+- Hardcoded denials: SSH keys, cloud credentials, Claude credentials
 
-The entrypoint passes `DOLT_HOST` and `DOLT_PORT` environment variables to containers. Agents use `bd --server-host=$DOLT_HOST --server-port=$DOLT_PORT` or configure these in `.beads/config.yaml`.
+All host actions require TUI approval (human-in-the-loop).
 
-**Important**: Beads should NOT try to auto-start its own dolt server inside the container. It should only connect to the host's existing server. The `.beads/` directory in the workspace is bind-mounted and may contain files owned by the host uid.
+## Security
 
-## Long-Running Agents via Host tmux
+- `--dangerously-skip-permissions` -- always. Container is the boundary, not Claude Code's permission system.
+- `--cap-drop=ALL` + selective capabilities (NET_RAW, CHOWN, SETUID, SETGID, DAC_OVERRIDE)
+- Rootless Podman (no daemon, no root on host)
+- Workspace is the only writable bind mount from the project
 
-Named agents run Claude Code interactively inside host-side tmux windows (session `agents`, one window per agent). This means:
-- Users can attach/detach from any agent: `tmux attach -t agents`
-- The container runs with `-it` (interactive TTY) inside the tmux pane
-- The CLI auto-accepts Claude Code's bypass permissions dialog via `tmux send-keys`
-- No tmux inside the container -- the container is just `podman run -it`
+## Known Issues and Gaps
 
-## Role-Based Permissions
+### MCP clients invisible to TUI
+Containers connect via MCP HTTP (port 9801) but never register as WebSocket agents (port 9800). The TUI's "Agents" panel only shows WS-connected agents. MCP HTTP clients are invisible -- the TUI shows "Agents: 0" even when containers are running and making tool calls. The pending requests still appear but without agent identity.
 
-Roles are defined in `roles/*.yml`. Each role specifies:
-- **Capabilities**: which tool categories are enabled (file_read, git_push, etc.)
-- **Path patterns**: which host paths can be read (with glob matching)
-- **Deny patterns**: always-blocked paths (checked before allow patterns)
-- **Remote restrictions**: which git remotes can be pushed to
+### ask_user timeout
+Claude Code has a ~60s timeout on MCP tool calls. If the user takes longer than 60s to answer `ask_user` in the TUI, the response is lost. The MCP HTTP request times out on Claude Code's side before the TUI resolves the oneshot channel. Tracked in `agent-in-docker-1gd`.
 
-Hardcoded security denials (cannot be overridden by role config):
-- SSH private keys (`~/.ssh/id_*`)
-- AWS credentials (`~/.aws/credentials`)
-- GCloud credentials (`~/.config/gcloud/application_default_credentials.json`)
-- Claude credentials (`~/.claude/.credentials.json`)
+### Entrypoint fragility
+The bash entrypoint handles: JSON editing via `node -e`, uid detection via `stat`, user creation via `adduser`, privilege dropping via `su`. Each of these has platform-specific edge cases (Alpine `stat` flags, `adduser` syntax, `su` with caps). The Rust CLI handles the host-side complexity well but the container-side is still bash.
+
+### No agent output streaming
+The TUI has an "Activity Log" panel but no live streaming of agent output. You can only see what agents are doing by attaching to their tmux window. The orchestrator has an `AgentOutput` event type but nothing populates it.
+
+### Disconnected registries
+The WebSocket agent registry and MCP HTTP pending requests are separate systems. `list_agents` and `message_agent` MCP tools query the WS registry, which MCP-only clients aren't part of. Multi-agent coordination only works between WS-connected agents.
+
+### Token expiry
+OAuth tokens expire and there's no automatic refresh. When tokens expire, agents fail with auth errors. The user must manually run `./run-agent.sh login` to refresh.

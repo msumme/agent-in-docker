@@ -13,7 +13,6 @@ ROLE="code-agent"
 AGENT_NAME=""
 NAMED_AGENT=false
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
-CLAUDE_CREDENTIALS="${CLAUDE_CREDENTIALS:-}"
 SEED_DIR="${SCRIPT_DIR}/.claude-container"
 AGENTS_DIR="${SCRIPT_DIR}/.claude-agents"
 
@@ -122,6 +121,7 @@ shift 2
 
 FORCE_BUILD=false
 NO_TUI=false
+ONESHOT=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -129,9 +129,17 @@ while [ $# -gt 0 ]; do
         --name) AGENT_NAME="$2"; NAMED_AGENT=true; shift 2 ;;
         --build) FORCE_BUILD=true; shift ;;
         --no-tui) NO_TUI=true; shift ;;
+        --oneshot) ONESHOT=true; shift ;;
         *) echo "Unknown option: $1"; usage ;;
     esac
 done
+
+# Named agents default to long-running, ephemeral default to oneshot
+if [ "${NAMED_AGENT}" = true ] && [ "${ONESHOT}" = false ]; then
+    AGENT_MODE="long-running"
+else
+    AGENT_MODE="oneshot"
+fi
 
 # Assign ephemeral name if none given
 if [ -z "${AGENT_NAME}" ]; then
@@ -140,7 +148,7 @@ fi
 
 echo "==> Project: ${PROJECT_PATH}"
 echo "==> Prompt: ${PROMPT}"
-echo "==> Agent: ${AGENT_NAME} (role: ${ROLE}, $([ "${NAMED_AGENT}" = true ] && echo "persistent" || echo "ephemeral"))"
+echo "==> Agent: ${AGENT_NAME} (role: ${ROLE}, ${AGENT_MODE})"
 
 # Set up per-agent claude config directory.
 # .claude-container/ is the seed (shared credentials from 'claude login').
@@ -191,8 +199,8 @@ else
     done
 fi
 
-# Always symlink shared credentials into agent dir
-ln -sf "${SEED_DIR}/.credentials.json" "${AGENT_CLAUDE_DIR}/.credentials.json"
+# Copy shared credentials into agent dir (can't symlink -- host paths don't exist in container)
+cp -f "${SEED_DIR}/.credentials.json" "${AGENT_CLAUDE_DIR}/.credentials.json"
 
 cleanup_agent_dir() {
     if [ "${CLEANUP_AGENT_DIR}" = true ] && [ -n "${AGENT_CLAUDE_DIR}" ]; then
@@ -201,17 +209,9 @@ cleanup_agent_dir() {
 }
 trap cleanup_agent_dir EXIT
 
-# Resolve credentials: ANTHROPIC_API_KEY > Keychain OAuth > error
+# Credentials come from .claude-container/ (via 'run-agent.sh login')
 if [ -n "${ANTHROPIC_API_KEY}" ]; then
     echo "==> Using ANTHROPIC_API_KEY from environment"
-elif [ -z "${CLAUDE_CREDENTIALS}" ] && command -v security &>/dev/null; then
-    echo "==> Extracting Claude Code OAuth credentials from macOS Keychain..."
-    CLAUDE_CREDENTIALS=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || {
-        echo "Error: No ANTHROPIC_API_KEY and could not read 'Claude Code-credentials' from Keychain."
-        echo "Set ANTHROPIC_API_KEY or run 'claude login' first."
-        exit 1
-    }
-    echo "==> Got OAuth credentials from Keychain"
 fi
 
 # Step 1: Build orchestrator if needed
@@ -273,10 +273,10 @@ if ! orchestrator_running; then
                 -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
                 -e "AGENT_NAME=${AGENT_NAME}" \
                 -e "AGENT_ROLE=${ROLE}" \
+                -e "AGENT_MODE=${AGENT_MODE}" \
                 -e "AGENT_PROMPT=${PROMPT}" \
                 -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
                 ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
-                ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
                 "${IMAGE_NAME}")
             echo "==> Container started: ${CONTAINER_ID:0:12}"
             echo "    Logs: podman logs -f ${AGENT_NAME}"
@@ -290,16 +290,37 @@ else
 fi
 
 # Step 5: Launch container
-echo "==> Launching agent container..."
-podman run --rm \
-    --name "${AGENT_NAME}" \
-    --network "${NETWORK_NAME}" \
-    -v "${PROJECT_PATH}:/workspace:Z" \
-    -v "${SCRIPT_DIR}/.claude-container:/root/.claude:Z" \
-    -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
-    -e "AGENT_NAME=${AGENT_NAME}" \
-    -e "AGENT_ROLE=${ROLE}" \
-    -e "AGENT_PROMPT=${PROMPT}" \
-    ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
-    ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
-    "${IMAGE_NAME}"
+if [ "${AGENT_MODE}" = "long-running" ]; then
+    echo "==> Launching long-running agent container (detached)..."
+    CONTAINER_ID=$(podman run -d --rm \
+        --name "${AGENT_NAME}" \
+        --network "${NETWORK_NAME}" \
+        -v "${PROJECT_PATH}:/workspace:Z" \
+        -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
+        -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
+        -e "AGENT_NAME=${AGENT_NAME}" \
+        -e "AGENT_ROLE=${ROLE}" \
+        -e "AGENT_MODE=${AGENT_MODE}" \
+        -e "AGENT_PROMPT=${PROMPT}" \
+        ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
+        ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
+        "${IMAGE_NAME}")
+    echo "==> Agent '${AGENT_NAME}' started (container: ${CONTAINER_ID:0:12})"
+    echo "    Logs: podman logs -f ${AGENT_NAME}"
+    echo "    Interact via TUI: tmux attach -t orchestrator"
+else
+    echo "==> Launching agent container..."
+    podman run --rm \
+        --name "${AGENT_NAME}" \
+        --network "${NETWORK_NAME}" \
+        -v "${PROJECT_PATH}:/workspace:Z" \
+        -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
+        -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
+        -e "AGENT_NAME=${AGENT_NAME}" \
+        -e "AGENT_ROLE=${ROLE}" \
+        -e "AGENT_MODE=${AGENT_MODE}" \
+        -e "AGENT_PROMPT=${PROMPT}" \
+        ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
+        ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
+        "${IMAGE_NAME}"
+fi

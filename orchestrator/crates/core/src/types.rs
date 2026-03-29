@@ -107,5 +107,9 @@ pub enum TuiCommand {
         request_id: String,
         reason: String,
     },
+    SendTask {
+        agent_id: String,
+        prompt: String,
+    },
     Shutdown,
 }

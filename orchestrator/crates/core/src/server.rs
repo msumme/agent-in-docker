@@ -276,6 +276,16 @@ pub async fn run_with_id_gen(
                         serde_json::json!({"code": "PERMISSION_DENIED", "message": reason}),
                     );
                 }
+                TuiCommand::SendTask { agent_id, prompt } => {
+                    let msg = Message {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        msg_type: "send_task".into(),
+                        from: "orchestrator".into(),
+                        to: Some(agent_id.clone()),
+                        payload: serde_json::json!({"prompt": prompt}),
+                    };
+                    s.send_to_agent(&agent_id, &msg);
+                }
                 TuiCommand::Shutdown => break,
             }
         }

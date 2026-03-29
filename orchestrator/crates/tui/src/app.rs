@@ -88,7 +88,21 @@ impl App {
     }
 
     pub fn submit_answer(&mut self) {
+        // If no pending requests, send the input as a task to the selected agent
         if self.pending_requests.is_empty() {
+            if self.input_text.is_empty() || self.agents.is_empty() {
+                return;
+            }
+            let agent = &self.agents[self.selected_agent.min(self.agents.len() - 1)];
+            self.completed_log.push(format!(
+                "[{}] << {}",
+                agent.name, self.input_text
+            ));
+            let _ = self.cmd_tx.send(TuiCommand::SendTask {
+                agent_id: agent.id.clone(),
+                prompt: self.input_text.clone(),
+            });
+            self.input_text.clear();
             return;
         }
 

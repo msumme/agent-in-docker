@@ -111,11 +111,23 @@ export class WsClient {
     );
   }
 
+  private pushHandlers: Array<(msg: Message) => void> = [];
+
+  /** Register a handler for push messages (not request/response). */
+  onPush(handler: (msg: Message) => void): void {
+    this.pushHandlers.push(handler);
+  }
+
   private handleMessage(msg: Message) {
     const resolver = this.pending.get(msg.id);
     if (resolver) {
       this.pending.delete(msg.id);
       resolver.resolve(msg);
+    } else {
+      // No pending request for this id -- it's a push message
+      for (const handler of this.pushHandlers) {
+        handler(msg);
+      }
     }
   }
 

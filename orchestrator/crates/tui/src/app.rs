@@ -89,6 +89,12 @@ impl App {
             OrchestratorEvent::AgentOutput { agent_id: _, text } => {
                 self.completed_log.push(text);
             }
+            OrchestratorEvent::ManagedAgentUpdated(agent) => {
+                self.completed_log.push(format!(
+                    "[{}] status: {} - {}",
+                    agent.name, agent.status, agent.last_activity
+                ));
+            }
         }
     }
 

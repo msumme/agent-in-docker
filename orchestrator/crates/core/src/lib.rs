@@ -1,3 +1,4 @@
+pub mod agent_manager;
 pub mod handlers;
 pub mod mcp;
 pub mod permissions;

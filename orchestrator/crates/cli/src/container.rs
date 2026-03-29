@@ -157,9 +157,10 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     }
 
     println!("==> Agent '{}' started in tmux session 'agents'", cfg.agent_name);
-    println!("    Attach: tmux attach -t agents");
-    println!("    Switch agents: Ctrl-b n / Ctrl-b p");
-    println!("    Detach: Ctrl-b d");
+    println!("    Attach to agent:       tmux attach -t agents");
+    println!("    Switch agents:         Ctrl-b n / Ctrl-b p");
+    println!("    Detach:                Ctrl-b d");
+    println!("    Orchestrator TUI:      tmux attach -t orchestrator");
 
     // Auto-accept dialogs (blocks until done)
     auto_accept_dialogs(&cfg.agent_name, &cfg.prompt);

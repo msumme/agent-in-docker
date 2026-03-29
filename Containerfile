@@ -9,7 +9,8 @@ RUN npm run build
 # Stage 2: Runtime
 FROM node:22-slim
 
-# Install Claude Code CLI
+# Install curl (for task queue polling in long-running mode)
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @anthropic-ai/claude-code
 
 # Non-root user (node:22-slim already has uid 1000 as 'node', reuse it)

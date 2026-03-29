@@ -21,7 +21,6 @@ export class TaskQueue {
     }
   }
 
-  /** Returns a promise that resolves with the next task. */
   next(): Promise<string> {
     if (this.queue.length > 0) {
       return Promise.resolve(this.queue.shift()!);
@@ -31,32 +30,30 @@ export class TaskQueue {
     });
   }
 
-  /** Start HTTP server on given port for the entrypoint to poll. */
   startServer(port: number): void {
-    this.server = http.createServer(async (req, res) => {
+    this.server = http.createServer((req, res) => {
       if (req.url === "/next-task" && req.method === "GET") {
-        // Long-poll: wait up to 30s for a task
-        const timeout = setTimeout(() => {
-          res.writeHead(204);
-          res.end();
+        let responded = false;
+
+        const timer = setTimeout(() => {
+          if (!responded) {
+            responded = true;
+            res.writeHead(204);
+            res.end();
+          }
         }, 30_000);
 
-        const task = await Promise.race([
-          this.next(),
-          new Promise<null>((resolve) =>
-            setTimeout(() => resolve(null), 30_000),
-          ),
-        ]);
-
-        clearTimeout(timeout);
-
-        if (task) {
-          res.writeHead(200, { "Content-Type": "text/plain" });
-          res.end(task);
-        } else {
-          res.writeHead(204);
-          res.end();
-        }
+        this.next().then((task) => {
+          if (!responded) {
+            responded = true;
+            clearTimeout(timer);
+            res.writeHead(200, { "Content-Type": "text/plain" });
+            res.end(task);
+          } else {
+            // Timeout already fired -- put the task back
+            this.queue.unshift(task);
+          }
+        });
       } else {
         res.writeHead(404);
         res.end();
@@ -64,7 +61,9 @@ export class TaskQueue {
     });
 
     this.server.listen(port, "127.0.0.1", () => {
-      console.error(`[bridge] Task queue listening on http://127.0.0.1:${port}`);
+      console.error(
+        `[bridge] Task queue listening on http://127.0.0.1:${port}`,
+      );
     });
   }
 

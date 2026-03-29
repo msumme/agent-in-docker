@@ -290,27 +290,72 @@ else
 fi
 
 # Step 5: Launch container
+# Write podman command to a script to avoid quoting issues with tmux
+AGENT_SCRIPT="${AGENTS_DIR}/run-${AGENT_NAME}.sh"
+cat > "${AGENT_SCRIPT}" <<RUNEOF
+#!/bin/bash
+podman run -it --rm \\
+    --name "${AGENT_NAME}" \\
+    --network "${NETWORK_NAME}" \\
+    -v "${PROJECT_PATH}:/workspace:Z" \\
+    -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \\
+    -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \\
+    -e "AGENT_NAME=${AGENT_NAME}" \\
+    -e "AGENT_ROLE=${ROLE}" \\
+    -e "AGENT_MODE=${AGENT_MODE}" \\
+    -e "AGENT_PROMPT=${PROMPT}" \\
+    ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"} \\
+    "${IMAGE_NAME}"
+echo "[Agent exited. Press Enter to close.]"
+read
+RUNEOF
+chmod +x "${AGENT_SCRIPT}"
+
 if [ "${AGENT_MODE}" = "long-running" ]; then
-    echo "==> Launching long-running agent container (detached)..."
-    CONTAINER_ID=$(podman run -d --rm \
-        --name "${AGENT_NAME}" \
-        --network "${NETWORK_NAME}" \
-        -v "${PROJECT_PATH}:/workspace:Z" \
-        -v "${AGENT_CLAUDE_DIR}:/root/.claude:Z" \
-        -e "ORCHESTRATOR_URL=ws://host.containers.internal:${ORCHESTRATOR_PORT}" \
-        -e "AGENT_NAME=${AGENT_NAME}" \
-        -e "AGENT_ROLE=${ROLE}" \
-        -e "AGENT_MODE=${AGENT_MODE}" \
-        -e "AGENT_PROMPT=${PROMPT}" \
-        ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
-        ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
-        "${IMAGE_NAME}")
-    echo "==> Agent '${AGENT_NAME}' started (container: ${CONTAINER_ID:0:12})"
-    echo "    Logs: podman logs -f ${AGENT_NAME}"
-    echo "    Interact via TUI: tmux attach -t orchestrator"
+    TMUX_SESSION="agents"
+
+    if ! tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+        tmux new-session -d -s "${TMUX_SESSION}" -n "${AGENT_NAME}" "${AGENT_SCRIPT}"
+    else
+        tmux new-window -t "${TMUX_SESSION}" -n "${AGENT_NAME}" "${AGENT_SCRIPT}"
+    fi
+
+    # Auto-accept Claude Code dialogs via tmux send-keys (like ish)
+    (
+        # Wait for bypass permissions dialog
+        for i in $(seq 1 30); do
+            sleep 2
+            PANE=$(tmux capture-pane -t "agents:${AGENT_NAME}" -p 2>/dev/null)
+            if echo "${PANE}" | grep -q "Yes, I accept"; then
+                # Arrow down to "Yes, I accept", wait, then press Enter
+                tmux send-keys -t "agents:${AGENT_NAME}" Down
+                sleep 1
+                tmux send-keys -t "agents:${AGENT_NAME}" Enter
+                echo "==> Auto-accepted bypass permissions dialog" >&2
+                break
+            fi
+            if echo "${PANE}" | grep -q "╭─"; then
+                # Claude Code is at the prompt -- no dialog to accept
+                break
+            fi
+        done
+
+        # Send initial prompt if provided
+        if [ -n "${PROMPT}" ]; then
+            sleep 3
+            tmux send-keys -t "agents:${AGENT_NAME}" "${PROMPT}" Enter
+            echo "==> Sent initial prompt to agent" >&2
+        fi
+    ) &
+
+    echo "==> Agent '${AGENT_NAME}' started in tmux session 'agents'"
+    echo "    Attach: tmux attach -t agents"
+    echo "    Switch agents: Ctrl-b n / Ctrl-b p"
+    echo "    Detach: Ctrl-b d"
+    echo "    Orchestrator TUI: tmux attach -t orchestrator"
 else
     echo "==> Launching agent container..."
-    podman run --rm \
+    podman run --rm -it \
         --name "${AGENT_NAME}" \
         --network "${NETWORK_NAME}" \
         -v "${PROJECT_PATH}:/workspace:Z" \
@@ -321,6 +366,5 @@ else
         -e "AGENT_MODE=${AGENT_MODE}" \
         -e "AGENT_PROMPT=${PROMPT}" \
         ${ANTHROPIC_API_KEY:+-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"} \
-        ${CLAUDE_CREDENTIALS:+-e "CLAUDE_CREDENTIALS=$CLAUDE_CREDENTIALS"} \
         "${IMAGE_NAME}"
 fi

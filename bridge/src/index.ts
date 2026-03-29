@@ -14,12 +14,13 @@ async function main() {
   const client = new WsClient(orchestratorUrl, agentName, agentRole);
   await client.connect();
 
-  // In long-running mode, start the task queue HTTP server
   if (agentMode === "long-running") {
+    // Long-running mode: run as a persistent background process.
+    // Serve the task queue HTTP endpoint for the entrypoint to poll.
+    // Do NOT start the MCP stdio server (no stdin available).
     const taskQueue = new TaskQueue();
     taskQueue.startServer(9801);
 
-    // Listen for send_task push messages from orchestrator
     client.onPush((msg) => {
       if (msg.type === "send_task") {
         const prompt = msg.payload.prompt as string;
@@ -31,10 +32,12 @@ async function main() {
     });
 
     console.error("[bridge] Task queue ready (long-running mode)");
+    // Keep process alive
+  } else {
+    // One-shot mode: run as MCP server on stdio (launched by Claude Code).
+    console.error("[bridge] Starting MCP server on stdio");
+    await startMcpServer(client);
   }
-
-  console.error("[bridge] Starting MCP server on stdio");
-  await startMcpServer(client);
 }
 
 main().catch((err) => {

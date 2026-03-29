@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::types::OrchestratorEvent;
+use crate::types::{OrchestratorEvent, PeerInfo};
 
 /// JSON-RPC 2.0 request.
 #[derive(Debug, Deserialize)]
@@ -69,11 +69,27 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+/// Injectable registry for querying connected agents.
+pub trait AgentRegistry: Send + Sync {
+    fn list_agents(&self) -> Vec<PeerInfo>;
+    fn route_message(&self, from: &str, to: &str, content: &str) -> Result<(), String>;
+}
+
+/// No-op registry for tests and when WS server isn't available.
+pub struct NoOpRegistry;
+impl AgentRegistry for NoOpRegistry {
+    fn list_agents(&self) -> Vec<PeerInfo> { vec![] }
+    fn route_message(&self, _from: &str, _to: &str, _content: &str) -> Result<(), String> {
+        Err("No agent registry available".into())
+    }
+}
+
 /// Shared state for the MCP HTTP server.
 pub struct McpState {
     pub event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     pub pending: Mutex<std::collections::HashMap<String, oneshot::Sender<Value>>>,
     pub tools: Vec<ToolDef>,
+    pub registry: Mutex<Box<dyn AgentRegistry>>,
 }
 
 impl McpState {
@@ -82,7 +98,12 @@ impl McpState {
             event_tx,
             pending: Mutex::new(std::collections::HashMap::new()),
             tools: default_tools(),
+            registry: Mutex::new(Box::new(NoOpRegistry)),
         }
+    }
+
+    pub fn set_registry(&self, registry: Box<dyn AgentRegistry>) {
+        *self.registry.lock().unwrap() = registry;
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
@@ -130,6 +151,23 @@ fn default_tools() -> Vec<ToolDef> {
                     "remote": {"type": "string", "description": "Git remote name (default: origin)"},
                     "branch": {"type": "string", "description": "Branch to push (default: current branch)"}
                 }
+            }),
+        },
+        ToolDef {
+            name: "list_agents".into(),
+            description: "List all currently connected agents and their roles.".into(),
+            input_schema: json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "message_agent".into(),
+            description: "Send a message to another connected agent.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agentId": {"type": "string", "description": "ID of the agent to message"},
+                    "message": {"type": "string", "description": "Message content"}
+                },
+                "required": ["agentId", "message"]
             }),
         },
     ]
@@ -232,6 +270,21 @@ async fn handle_tools_call(
             let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
             let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
             ("git_push", json!({"remote": remote, "branch": branch}))
+        }
+        "list_agents" => {
+            let agents = state.registry.lock().unwrap().list_agents();
+            let text = serde_json::to_string_pretty(&agents).unwrap_or_default();
+            return JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": text}]}));
+        }
+        "message_agent" => {
+            let agent_id = args.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let result = state.registry.lock().unwrap().route_message("mcp-client", agent_id, message);
+            let text = match result {
+                Ok(()) => format!("Message delivered to {}", agent_id),
+                Err(e) => format!("Failed to deliver message: {}", e),
+            };
+            return JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": text}]}));
         }
         _ => {
             return JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name));
@@ -372,11 +425,13 @@ mod tests {
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 5);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"read_host_file"));
         assert!(names.contains(&"git_push"));
+        assert!(names.contains(&"list_agents"));
+        assert!(names.contains(&"message_agent"));
     }
 
     #[tokio::test]

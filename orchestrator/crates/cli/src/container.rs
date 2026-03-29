@@ -56,6 +56,11 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         cfg.agent_name.clone(),
         "--network".to_string(),
         cfg.network_name.clone(),
+        // Security hardening
+        "--cap-drop=ALL".to_string(),
+        "--cap-add=NET_RAW".to_string(), // DNS resolution
+        "--security-opt=no-new-privileges".to_string(),
+        // Volumes
         "-v".to_string(),
         format!("{}:/workspace:Z", cfg.project_path),
         "-v".to_string(),

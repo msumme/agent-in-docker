@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
+use crate::mcp::AgentRegistry;
 use crate::types::*;
 
 type AgentSender = mpsc::UnboundedSender<String>;
@@ -62,6 +63,11 @@ impl ServerState {
         }
     }
 
+    fn send_to_agent_direct(&self, sender: &AgentSender, msg: &Message) {
+        let text = serde_json::to_string(msg).unwrap();
+        let _ = sender.send(text);
+    }
+
     fn agent_name(&self, agent_id: &str) -> String {
         self.agents
             .get(agent_id)
@@ -96,11 +102,95 @@ impl ServerState {
             workspace_path,
         };
         let peers = self.peer_list(&id);
+
+        // Broadcast peer_joined to existing agents
+        let joined_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            msg_type: "peer_joined".into(),
+            from: "orchestrator".into(),
+            to: None,
+            payload: serde_json::to_value(PeerInfo {
+                id: id.clone(),
+                name: name.clone(),
+                role: role.clone(),
+            })
+            .unwrap(),
+        };
+        for agent in self.agents.values() {
+            self.send_to_agent_direct(&agent.sender, &joined_msg);
+        }
+
         let _ = self
             .event_tx
             .send(OrchestratorEvent::AgentConnected(info.clone()));
         self.agents.insert(id.clone(), ConnectedAgent { info, sender });
         (id, peers)
+    }
+
+    /// Handle a discover request: return list of all agents.
+    pub fn handle_discover(&self, agent_id: &str, request_id: &str) {
+        let peers = self.peer_list(agent_id);
+        let response = Message {
+            id: request_id.to_string(),
+            msg_type: "discover_response".into(),
+            from: "orchestrator".into(),
+            to: Some(agent_id.to_string()),
+            payload: serde_json::json!({"agents": peers}),
+        };
+        self.send_to_agent(agent_id, &response);
+    }
+
+    /// Route a message from one agent to another.
+    pub fn route_agent_message(
+        &self,
+        from_id: &str,
+        request_id: &str,
+        to_id: &str,
+        content: &str,
+    ) -> bool {
+        if !self.agents.contains_key(to_id) {
+            let err = Message {
+                id: request_id.to_string(),
+                msg_type: "error".into(),
+                from: "orchestrator".into(),
+                to: Some(from_id.to_string()),
+                payload: serde_json::json!({"code": "AGENT_NOT_FOUND", "message": format!("Agent {} not found", to_id)}),
+            };
+            self.send_to_agent(from_id, &err);
+            return false;
+        }
+
+        let from_name = self.agent_name(from_id);
+        let delivery = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            msg_type: "agent_message_delivery".into(),
+            from: "orchestrator".into(),
+            to: Some(to_id.to_string()),
+            payload: serde_json::json!({"from": from_id, "fromName": from_name, "content": content}),
+        };
+        self.send_to_agent(to_id, &delivery);
+
+        let ack = Message {
+            id: request_id.to_string(),
+            msg_type: "agent_message_ack".into(),
+            from: "orchestrator".into(),
+            to: Some(from_id.to_string()),
+            payload: serde_json::json!({"delivered": true}),
+        };
+        self.send_to_agent(from_id, &ack);
+        true
+    }
+
+    /// Get a snapshot of all connected agents (for MCP tools).
+    pub fn agent_list(&self) -> Vec<PeerInfo> {
+        self.agents
+            .values()
+            .map(|a| PeerInfo {
+                id: a.info.id.clone(),
+                name: a.info.name.clone(),
+                role: a.info.role.clone(),
+            })
+            .collect()
     }
 
     pub fn handle_request(
@@ -207,6 +297,19 @@ impl ServerState {
 
     pub fn remove_agent(&mut self, agent_id: &str) {
         self.agents.remove(agent_id);
+
+        // Broadcast peer_left to remaining agents
+        let left_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            msg_type: "peer_left".into(),
+            from: "orchestrator".into(),
+            to: None,
+            payload: serde_json::json!({"id": agent_id}),
+        };
+        for agent in self.agents.values() {
+            self.send_to_agent_direct(&agent.sender, &left_msg);
+        }
+
         let _ = self
             .event_tx
             .send(OrchestratorEvent::AgentDisconnected {
@@ -233,12 +336,34 @@ impl ServerState {
     }
 }
 
+/// Wraps Arc<Mutex<ServerState>> to implement AgentRegistry for the MCP server.
+pub struct ServerStateRegistry {
+    state: Arc<Mutex<ServerState>>,
+}
+
+impl AgentRegistry for ServerStateRegistry {
+    fn list_agents(&self) -> Vec<PeerInfo> {
+        let s = self.state.blocking_lock();
+        s.agent_list()
+    }
+
+    fn route_message(&self, from: &str, to: &str, content: &str) -> Result<(), String> {
+        let s = self.state.blocking_lock();
+        if s.route_agent_message(from, "", to, content) {
+            Ok(())
+        } else {
+            Err(format!("Agent {} not found", to))
+        }
+    }
+}
+
 pub async fn run(
     addr: &str,
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     cmd_rx: mpsc::UnboundedReceiver<TuiCommand>,
+    mcp_state: Option<Arc<crate::mcp::McpState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator)).await
+    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state).await
 }
 
 pub async fn run_with_id_gen(
@@ -246,11 +371,19 @@ pub async fn run_with_id_gen(
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     mut cmd_rx: mpsc::UnboundedReceiver<TuiCommand>,
     id_gen: Arc<dyn IdGenerator>,
+    mcp_state: Option<Arc<crate::mcp::McpState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
 
     let state = Arc::new(Mutex::new(ServerState::new(event_tx, id_gen)));
+
+    // Wire the agent registry into the MCP state
+    if let Some(ref mcp) = mcp_state {
+        mcp.set_registry(Box::new(ServerStateRegistry {
+            state: state.clone(),
+        }));
+    }
 
     let state_for_cmds = state.clone();
     tokio::spawn(async move {
@@ -380,6 +513,22 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
                 if let Some(ref aid) = agent_id {
                     let mut s = state.lock().await;
                     s.handle_request(aid, message.id.clone(), &message.msg_type, message.payload);
+                }
+            }
+
+            "discover" => {
+                if let Some(ref aid) = agent_id {
+                    let s = state.lock().await;
+                    s.handle_discover(aid, &message.id);
+                }
+            }
+
+            "agent_message" => {
+                if let Some(ref aid) = agent_id {
+                    let to_id = message.payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
+                    let content = message.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    let s = state.lock().await;
+                    s.route_agent_message(aid, &message.id, to_id, content);
                 }
             }
 
@@ -601,7 +750,7 @@ mod tests {
         let id_gen = Arc::new(SequentialIdGenerator::new());
         let addr_str = addr.to_string();
         tokio::spawn(async move {
-            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen).await;
+            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -726,5 +875,116 @@ mod tests {
         let approve: Message = serde_json::from_str(&approve_text).unwrap();
         assert_eq!(approve.msg_type, "file_read_response");
         assert_eq!(approve.payload["content"], "test content here");
+    }
+
+    #[test]
+    fn register_broadcasts_peer_joined() {
+        let (mut state, _event_rx) = setup();
+        let (s1, mut r1) = mpsc::unbounded_channel();
+        let (s2, _r2) = mpsc::unbounded_channel();
+
+        state.register_agent("first".into(), "code-agent".into(), None, s1);
+        // Register second -- first should get peer_joined
+        state.register_agent("second".into(), "review-agent".into(), None, s2);
+
+        let msg_text = r1.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&msg_text).unwrap();
+        assert_eq!(msg.msg_type, "peer_joined");
+        assert_eq!(msg.payload["name"], "second");
+        assert_eq!(msg.payload["role"], "review-agent");
+    }
+
+    #[test]
+    fn remove_broadcasts_peer_left() {
+        let (mut state, _event_rx) = setup();
+        let (s1, mut r1) = mpsc::unbounded_channel();
+        let (s2, _r2) = mpsc::unbounded_channel();
+
+        state.register_agent("first".into(), "code-agent".into(), None, s1);
+        let (id2, _) = state.register_agent("second".into(), "review-agent".into(), None, s2);
+        let _ = r1.try_recv(); // consume peer_joined
+
+        state.remove_agent(&id2);
+
+        let msg_text = r1.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&msg_text).unwrap();
+        assert_eq!(msg.msg_type, "peer_left");
+        assert_eq!(msg.payload["id"], id2);
+    }
+
+    #[test]
+    fn discover_returns_peer_list() {
+        let (mut state, _event_rx) = setup();
+        let (s1, mut r1) = mpsc::unbounded_channel();
+        let (s2, _r2) = mpsc::unbounded_channel();
+
+        let (id1, _) = state.register_agent("first".into(), "code-agent".into(), None, s1);
+        state.register_agent("second".into(), "review-agent".into(), None, s2);
+        let _ = r1.try_recv(); // consume peer_joined
+
+        state.handle_discover(&id1, "disc-1");
+
+        let msg_text = r1.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&msg_text).unwrap();
+        assert_eq!(msg.msg_type, "discover_response");
+        let agents = msg.payload["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["name"], "second");
+    }
+
+    #[test]
+    fn route_message_delivers_to_target() {
+        let (mut state, _event_rx) = setup();
+        let (s1, mut r1) = mpsc::unbounded_channel();
+        let (s2, mut r2) = mpsc::unbounded_channel();
+
+        let (id1, _) = state.register_agent("sender".into(), "code-agent".into(), None, s1);
+        let (id2, _) = state.register_agent("receiver".into(), "review-agent".into(), None, s2);
+        let _ = r1.try_recv(); // peer_joined
+
+        let delivered = state.route_agent_message(&id1, "msg-1", &id2, "hello from sender");
+        assert!(delivered);
+
+        // Sender gets ack
+        let ack_text = r1.try_recv().unwrap();
+        let ack: Message = serde_json::from_str(&ack_text).unwrap();
+        assert_eq!(ack.msg_type, "agent_message_ack");
+        assert!(ack.payload["delivered"].as_bool().unwrap());
+
+        // Receiver gets delivery (no peer_joined since receiver registered after sender)
+        let del_text = r2.try_recv().unwrap();
+        let del: Message = serde_json::from_str(&del_text).unwrap();
+        assert_eq!(del.msg_type, "agent_message_delivery");
+        assert_eq!(del.payload["content"], "hello from sender");
+        assert_eq!(del.payload["from"], id1);
+    }
+
+    #[test]
+    fn route_message_to_nonexistent_agent_fails() {
+        let (mut state, _event_rx) = setup();
+        let (s1, mut r1) = mpsc::unbounded_channel();
+
+        let (id1, _) = state.register_agent("sender".into(), "code-agent".into(), None, s1);
+
+        let delivered = state.route_agent_message(&id1, "msg-1", "nonexistent", "hello");
+        assert!(!delivered);
+
+        let err_text = r1.try_recv().unwrap();
+        let err: Message = serde_json::from_str(&err_text).unwrap();
+        assert_eq!(err.msg_type, "error");
+        assert_eq!(err.payload["code"], "AGENT_NOT_FOUND");
+    }
+
+    #[test]
+    fn agent_list_returns_all() {
+        let (mut state, _event_rx) = setup();
+        let (s1, _) = mpsc::unbounded_channel();
+        let (s2, _) = mpsc::unbounded_channel();
+
+        state.register_agent("a".into(), "code-agent".into(), None, s1);
+        state.register_agent("b".into(), "review-agent".into(), None, s2);
+
+        let list = state.agent_list();
+        assert_eq!(list.len(), 2);
     }
 }

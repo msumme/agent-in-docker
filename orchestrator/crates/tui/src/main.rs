@@ -35,10 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MCP HTTP state (shared with TUI for resolving pending requests)
     let mcp_state = Arc::new(McpState::new(event_tx.clone()));
 
-    // Start WebSocket server
+    // Start WebSocket server (with MCP state for agent registry)
     let server_addr = addr.clone();
+    let mcp_for_server = mcp_state.clone();
     tokio::spawn(async move {
-        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx).await {
+        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server)).await {
             tracing::error!("Server error: {}", e);
         }
     });

@@ -12,6 +12,7 @@ pub struct RunConfig {
     pub prompt: String,
     pub orchestrator_port: u16,
     pub mcp_port: u16,
+    pub dolt_port: Option<u16>,
     pub image_name: String,
     pub network_name: String,
 }
@@ -109,6 +110,13 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         if !key.is_empty() {
             args.extend_from_slice(&["-e".to_string(), format!("ANTHROPIC_API_KEY={}", key)]);
         }
+    }
+
+    if let Some(port) = cfg.dolt_port {
+        args.extend_from_slice(&[
+            "-e".to_string(), "DOLT_HOST=host.containers.internal".to_string(),
+            "-e".to_string(), format!("DOLT_PORT={}", port),
+        ]);
     }
 
 
@@ -270,6 +278,7 @@ mod tests {
             prompt: "hello".into(),
             orchestrator_port: 9800,
             mcp_port: 9801,
+            dolt_port: None,
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };
@@ -294,6 +303,7 @@ mod tests {
             prompt: "hi there".into(),
             orchestrator_port: 9800,
             mcp_port: 9801,
+            dolt_port: None,
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };

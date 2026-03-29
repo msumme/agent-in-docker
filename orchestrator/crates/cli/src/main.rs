@@ -92,6 +92,9 @@ fn main() -> Result<()> {
             // Ensure orchestrator is running (includes built-in MCP server)
             services::ensure_orchestrator(&cfg)?;
 
+            // Ensure dolt is running for beads
+            let dolt_port = services::ensure_dolt(&project_path)?;
+
             // Launch agent
             let run_cfg = container::RunConfig {
                 agent_name: agent_name.clone(),
@@ -102,6 +105,7 @@ fn main() -> Result<()> {
                 prompt,
                 orchestrator_port: cfg.orchestrator_port,
                 mcp_port: cfg.mcp_port,
+                dolt_port,
                 image_name: cfg.image_name.clone(),
                 network_name: cfg.network_name.clone(),
             };

@@ -73,6 +73,63 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Ensure the project's dolt server is running. Reads the port from
+/// .beads/dolt-server.port in the project directory. If dolt isn't running,
+/// starts it via `bd dolt start`.
+pub fn ensure_dolt(project_path: &std::path::Path) -> Result<Option<u16>> {
+    let port_file = project_path.join(".beads/dolt-server.port");
+    if !port_file.exists() {
+        // No beads database in this project
+        return Ok(None);
+    }
+
+    let port_str = std::fs::read_to_string(&port_file)
+        .context("Failed to read .beads/dolt-server.port")?;
+    let port: u16 = port_str
+        .trim()
+        .parse()
+        .context("Invalid port in .beads/dolt-server.port")?;
+
+    if port == 0 {
+        // Auto-detect mode -- let bd handle it, but we can't pass it to containers
+        return Ok(None);
+    }
+
+    // Check if dolt is reachable on this port
+    if std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        std::time::Duration::from_secs(2),
+    )
+    .is_ok()
+    {
+        println!("==> Dolt server running on port {}", port);
+        return Ok(Some(port));
+    }
+
+    // Not running -- start it
+    println!("==> Starting dolt server for project...");
+    let status = Command::new("bd")
+        .args(["dolt", "start"])
+        .current_dir(project_path)
+        .status()
+        .context("Failed to start dolt server")?;
+
+    if !status.success() {
+        eprintln!("Warning: dolt server failed to start (beads may not work in containers)");
+        return Ok(None);
+    }
+
+    // Re-read port in case it changed
+    let port_str = std::fs::read_to_string(&port_file)?;
+    let port: u16 = port_str.trim().parse().unwrap_or(0);
+    if port > 0 {
+        println!("==> Dolt server started on port {}", port);
+        Ok(Some(port))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

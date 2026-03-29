@@ -33,6 +33,13 @@ fi
 
 echo "[entrypoint] Agent: ${AGENT_NAME} (${AGENT_ROLE}, ${AGENT_MODE:-oneshot})" >&2
 
+# Beads: connect to host dolt server if port is provided.
+# This avoids starting dolt inside the container (slow, resource-heavy).
+if [ -n "${DOLT_HOST:-}" ] && [ -n "${DOLT_PORT:-}" ]; then
+    export BEADS_DOLT_SERVER_HOST="${DOLT_HOST}"
+    export BEADS_DOLT_SERVER_PORT="${DOLT_PORT}"
+fi
+
 # MCP config: connect to the orchestrator's built-in MCP server on the host
 MCP_PORT="${MCP_PORT:-9801}"
 BRIDGE_URL="http://host.containers.internal:${MCP_PORT}/mcp"

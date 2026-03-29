@@ -2,6 +2,7 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
+  "dolt_server_port": 3307,
   "dolt_database": "agent_in_docker",
   "project_id": "04a202b6-455a-402f-bc58-39a28b0df0b4"
 }

@@ -33,27 +33,6 @@ fi
 
 echo "[entrypoint] Agent: ${AGENT_NAME} (${AGENT_ROLE}, ${AGENT_MODE:-oneshot})" >&2
 
-# Privilege drop
-setup_node_user() {
-    if [ "$(id -u)" = "0" ]; then
-        mkdir -p /home/node/.claude
-        cp -r ~/.claude/. /home/node/.claude/ 2>/dev/null || cp ~/.claude/. /home/node/.claude/ 2>/dev/null || true
-        [ -f ~/.claude.json ] && cp ~/.claude.json /home/node/.claude.json 2>/dev/null || true
-        ln -sf /home/node/.claude/.claude.json /home/node/.claude.json 2>/dev/null || true
-        chown -R node:node /home/node/.claude /home/node/.claude.json 2>/dev/null || true
-    fi
-}
-
-run_as_node() {
-    if [ "$(id -u)" = "0" ]; then
-        su -s /bin/bash node -c "HOME=/home/node $*"
-    else
-        eval "$@"
-    fi
-}
-
-setup_node_user
-
 # MCP config: connect to the orchestrator's built-in MCP server on the host
 MCP_PORT="${MCP_PORT:-9801}"
 BRIDGE_URL="http://host.containers.internal:${MCP_PORT}/mcp"
@@ -68,28 +47,45 @@ cat > /tmp/mcp-config.json <<MCPEOF
   }
 }
 MCPEOF
-[ "$(id -u)" = "0" ] && chown node:node /tmp/mcp-config.json
-
-# Configure beads to connect to host dolt server via a wrapper script.
-# This avoids modifying the workspace's config files.
-if [ -n "${DOLT_HOST:-}" ] && [ -n "${DOLT_PORT:-}" ]; then
-    cat > /usr/local/bin/bd-wrapper <<BDEOF
-#!/bin/sh
-exec /usr/local/bin/bd --server-host="${DOLT_HOST}" --server-port="${DOLT_PORT}" "\$@"
-BDEOF
-    chmod +x /usr/local/bin/bd-wrapper
-    # Move the real bd and replace with wrapper
-    mv /usr/local/bin/bd /usr/local/bin/bd-real
-    mv /usr/local/bin/bd-wrapper /usr/local/bin/bd
-fi
 
 CLAUDE_ARGS="--dangerously-skip-permissions --mcp-config /tmp/mcp-config.json"
 
-if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
-    run_as_node "claude ${CLAUDE_ARGS} -p '${AGENT_PROMPT}'"
+# --dangerously-skip-permissions refuses to run as root.
+# Create a user matching the workspace owner's uid so file permissions work.
+if [ "$(id -u)" = "0" ]; then
+    WORKSPACE_UID=$(stat -c '%u' /workspace 2>/dev/null || stat -f '%u' /workspace)
+    WORKSPACE_GID=$(stat -c '%g' /workspace 2>/dev/null || stat -f '%g' /workspace)
+    USERNAME="agent"
+
+    # Create user with matching uid so bind-mounted files are accessible
+    if ! id -u "${WORKSPACE_UID}" >/dev/null 2>&1; then
+        adduser -D -u "${WORKSPACE_UID}" -h /home/agent -s /bin/sh "${USERNAME}" 2>/dev/null || \
+            echo "${USERNAME}:x:${WORKSPACE_UID}:${WORKSPACE_GID}::/home/agent:/bin/sh" >> /etc/passwd
+    else
+        USERNAME=$(id -un "${WORKSPACE_UID}")
+    fi
+
+    # Copy claude config to the agent user's home
+    mkdir -p /home/agent/.claude
+    cp -r ~/.claude/. /home/agent/.claude/
+    [ -f ~/.claude.json ] && cp ~/.claude.json /home/agent/.claude.json
+    ln -sf /home/agent/.claude/.claude.json /home/agent/.claude.json 2>/dev/null || true
+    cp /tmp/mcp-config.json /home/agent/mcp-config.json
+    chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" /home/agent
+
+    CLAUDE_ARGS="--dangerously-skip-permissions --mcp-config /home/agent/mcp-config.json"
+
+    if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
+        exec su -s /bin/bash "${USERNAME}" -c "HOME=/home/agent claude ${CLAUDE_ARGS} -p '${AGENT_PROMPT}'"
+    else
+        echo "[entrypoint] Starting Claude Code (interactive)..." >&2
+        exec su -s /bin/bash "${USERNAME}" -c "HOME=/home/agent claude ${CLAUDE_ARGS}"
+    fi
 else
-    # Long-running: run Claude Code interactively.
-    # The host-side run-agent.sh handles auto-accepting dialogs via tmux send-keys.
-    echo "[entrypoint] Starting Claude Code (interactive)..." >&2
-    run_as_node "exec claude ${CLAUDE_ARGS}"
+    if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
+        exec claude ${CLAUDE_ARGS} -p "${AGENT_PROMPT}"
+    else
+        echo "[entrypoint] Starting Claude Code (interactive)..." >&2
+        exec claude ${CLAUDE_ARGS}
+    fi
 fi

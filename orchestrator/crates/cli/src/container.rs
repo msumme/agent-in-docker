@@ -78,11 +78,11 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         cfg.network_name.clone(),
         // Security hardening
         "--cap-drop=ALL".to_string(),
-        "--cap-add=NET_RAW".to_string(),   // DNS resolution
-        "--cap-add=CHOWN".to_string(),     // Entrypoint copies credentials
-        "--cap-add=SETUID".to_string(),    // su from root to node
-        "--cap-add=SETGID".to_string(),    // su from root to node
-        "--cap-add=DAC_OVERRIDE".to_string(), // Write to /home/node
+        "--cap-add=NET_RAW".to_string(),     // DNS resolution
+        "--cap-add=CHOWN".to_string(),       // Entrypoint sets up agent user home
+        "--cap-add=SETUID".to_string(),      // su from root to agent user
+        "--cap-add=SETGID".to_string(),      // su from root to agent user
+        "--cap-add=DAC_OVERRIDE".to_string(),// Create /home/agent
         // Volumes
         "-v".to_string(),
         format!("{}:/workspace:Z", cfg.project_path),
@@ -111,15 +111,6 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         }
     }
 
-    // Detect host dolt server port for beads
-    if let Some(port) = detect_dolt_port() {
-        args.extend_from_slice(&[
-            "-e".to_string(),
-            "DOLT_HOST=host.containers.internal".to_string(),
-            "-e".to_string(),
-            format!("DOLT_PORT={}", port),
-        ]);
-    }
 
     args.push(cfg.image_name.clone());
     args

@@ -24,11 +24,23 @@ Claude Code in containers connects to the orchestrator's MCP server via HTTP (`h
 
 **Known limitation**: Claude Code has a ~60s timeout on MCP tool calls. Human-in-the-loop tools like `ask_user` can exceed this if the user takes too long to respond. A fix is tracked in beads (`agent-in-docker-1gd`).
 
-## Privilege Dropping
+## `--dangerously-skip-permissions`
 
-The container runs as root initially (for setup), then drops to the `node` user (uid 1000) before running Claude Code. This is because `--dangerously-skip-permissions` refuses to run as root. The entrypoint copies credentials and config to `/home/node/.claude/` before the drop.
+Claude Code runs with `--dangerously-skip-permissions` inside containers. This is the core design -- the container IS the security boundary, not Claude Code's permission system. The whole point is to give the agent full freedom inside the sandbox.
 
-**Consequence**: Workspace files mounted from the host (owned by macOS uid 501) are not writable by uid 1000. The workspace mount uses `:Z` for SELinux relabeling which helps, but file permission mismatches can still occur for restrictive files (mode 600).
+Do not replace this with `--permission-mode dontAsk` or other alternatives.
+
+## Privilege Dropping and UID Matching
+
+`--dangerously-skip-permissions` refuses to run as root. The entrypoint runs as root for setup, then drops to a non-root user before starting Claude Code.
+
+The non-root user must have the same uid as the host user (501 on macOS) so that bind-mounted files are readable/writable without permission issues. The entrypoint creates a user with the matching uid rather than using the container's default `node` user (uid 1000).
+
+## Mount Permissions
+
+- `/workspace` -- read-write, contains the project the agent works on
+- `/root/.claude` -- read-write, agent's Claude Code config and credentials
+- `.beads/` directory inside workspace -- read-write, beads auto-starts dolt locally per command
 
 ## Agent Config Directories
 

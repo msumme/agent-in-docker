@@ -1,0 +1,1 @@
+FROM localhost/agent-base

@@ -1,4 +1,5 @@
 name: code-agent
+image: agent-in-docker
 capabilities:
   file_read: true
   git_push: true

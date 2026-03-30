@@ -67,6 +67,7 @@ impl ContainerOps for RealContainerOps {
             "--cap-add=DAC_OVERRIDE".to_string(),
             format!("-v {}:/workspace:Z", cfg.project_path),
             format!("-v {}:/root/.claude:Z", cfg.agent_dir),
+            "-e IS_SANDBOX=1".to_string(),
             format!("-e ORCHESTRATOR_URL=ws://host.containers.internal:{}", cfg.orchestrator_port),
             format!("-e MCP_PORT={}", cfg.mcp_port),
             format!("-e AGENT_NAME={}", cfg.name),

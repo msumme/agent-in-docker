@@ -1,98 +1,68 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# ~/.claude.json lives OUTSIDE ~/.claude/ but we only mount ~/.claude/.
+# Restore .claude.json (lives outside .claude/ dir but we only mount .claude/)
 if [ ! -f ~/.claude.json ] && [ -f ~/.claude/.claude.json ]; then
     ln -s ~/.claude/.claude.json ~/.claude.json
 elif [ ! -f ~/.claude.json ]; then
     BACKUP=$(ls -t ~/.claude/backups/.claude.json.backup.* 2>/dev/null | head -1)
-    if [ -n "${BACKUP}" ]; then
+    if [ -n "${BACKUP:-}" ]; then
         cp "${BACKUP}" ~/.claude/.claude.json
         ln -s ~/.claude/.claude.json ~/.claude.json
     fi
 fi
 
+# Verify credentials
 if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ ! -f ~/.claude/.credentials.json ]; then
-    echo "[entrypoint] No credentials found. Run './run-agent.sh login' first." >&2
+    echo "[entrypoint] No credentials. Run './run-agent.sh login' first." >&2
     exit 1
 fi
 
-# Pre-accept workspace trust
+# Pre-accept workspace trust (pure JSON edit, no node)
 if [ -f ~/.claude.json ]; then
-    node -e "
-      const fs = require('fs');
-      const f = process.env.HOME + '/.claude.json';
-      const d = JSON.parse(fs.readFileSync(f, 'utf8'));
-      if (!d.projects) d.projects = {};
-      d.projects['/workspace'] = d.projects['/workspace'] || {};
-      d.projects['/workspace'].hasTrustDialogAccepted = true;
-      d.hasCompletedOnboarding = true;
-      fs.writeFileSync(f, JSON.stringify(d, null, 2));
-    " 2>/dev/null || true
+    python3 -c "
+import json, os
+f = os.path.expanduser('~/.claude.json')
+d = json.load(open(f))
+d.setdefault('projects', {})['/workspace'] = d.get('projects', {}).get('/workspace', {})
+d['projects']['/workspace']['hasTrustDialogAccepted'] = True
+d['hasCompletedOnboarding'] = True
+json.dump(d, open(f, 'w'))
+" 2>/dev/null || true
 fi
 
-echo "[entrypoint] Agent: ${AGENT_NAME} (${AGENT_ROLE}, ${AGENT_MODE:-oneshot})" >&2
-
-# Beads: connect to host dolt server if port is provided.
-# This avoids starting dolt inside the container (slow, resource-heavy).
+# Beads: connect to host dolt server if provided
 if [ -n "${DOLT_HOST:-}" ] && [ -n "${DOLT_PORT:-}" ]; then
     export BEADS_DOLT_SERVER_HOST="${DOLT_HOST}"
     export BEADS_DOLT_SERVER_PORT="${DOLT_PORT}"
 fi
 
-# MCP config: connect to the orchestrator's built-in MCP server on the host
+# MCP config
 MCP_PORT="${MCP_PORT:-9801}"
-BRIDGE_URL="http://host.containers.internal:${MCP_PORT}/mcp"
-
 cat > /tmp/mcp-config.json <<MCPEOF
 {
   "mcpServers": {
     "agent-bridge": {
       "type": "http",
-      "url": "${BRIDGE_URL}"
+      "url": "http://host.containers.internal:${MCP_PORT}/mcp"
     }
   }
 }
 MCPEOF
 
+echo "[entrypoint] ${AGENT_NAME} (${AGENT_ROLE}, ${AGENT_MODE:-oneshot})" >&2
+
+# IS_SANDBOX=1 allows --dangerously-skip-permissions as root.
+# No uid matching, no privilege dropping, no user creation needed.
+export IS_SANDBOX=1
 CLAUDE_ARGS="--dangerously-skip-permissions --mcp-config /tmp/mcp-config.json"
 
-# --dangerously-skip-permissions refuses to run as root.
-# Create a user matching the workspace owner's uid so file permissions work.
-if [ "$(id -u)" = "0" ]; then
-    WORKSPACE_UID=$(stat -c '%u' /workspace 2>/dev/null || stat -f '%u' /workspace)
-    WORKSPACE_GID=$(stat -c '%g' /workspace 2>/dev/null || stat -f '%g' /workspace)
-    USERNAME="agent"
-
-    # Create user with matching uid so bind-mounted files are accessible
-    if ! id -u "${WORKSPACE_UID}" >/dev/null 2>&1; then
-        adduser -D -u "${WORKSPACE_UID}" -h /home/agent -s /bin/sh "${USERNAME}" 2>/dev/null || \
-            echo "${USERNAME}:x:${WORKSPACE_UID}:${WORKSPACE_GID}::/home/agent:/bin/sh" >> /etc/passwd
-    else
-        USERNAME=$(id -un "${WORKSPACE_UID}")
-    fi
-
-    # Copy claude config to the agent user's home
-    mkdir -p /home/agent/.claude
-    cp -r ~/.claude/. /home/agent/.claude/
-    [ -f ~/.claude.json ] && cp ~/.claude.json /home/agent/.claude.json
-    ln -sf /home/agent/.claude/.claude.json /home/agent/.claude.json 2>/dev/null || true
-    cp /tmp/mcp-config.json /home/agent/mcp-config.json
-    chown -R "${WORKSPACE_UID}:${WORKSPACE_GID}" /home/agent
-
-    CLAUDE_ARGS="--dangerously-skip-permissions --mcp-config /home/agent/mcp-config.json"
-
-    if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
-        exec su -s /bin/bash "${USERNAME}" -c "HOME=/home/agent claude ${CLAUDE_ARGS} -p '${AGENT_PROMPT}'"
-    else
-        echo "[entrypoint] Starting Claude Code (interactive)..." >&2
-        exec su -s /bin/bash "${USERNAME}" -c "HOME=/home/agent claude ${CLAUDE_ARGS}"
-    fi
+if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
+    # Write prompt to temp file to avoid shell injection
+    PROMPT_FILE=$(mktemp)
+    printf '%s' "${AGENT_PROMPT}" > "${PROMPT_FILE}"
+    exec claude ${CLAUDE_ARGS} -p "$(cat "${PROMPT_FILE}")"
 else
-    if [ "${AGENT_MODE:-oneshot}" = "oneshot" ]; then
-        exec claude ${CLAUDE_ARGS} -p "${AGENT_PROMPT}"
-    else
-        echo "[entrypoint] Starting Claude Code (interactive)..." >&2
-        exec claude ${CLAUDE_ARGS}
-    fi
+    echo "[entrypoint] Starting Claude Code (interactive)..." >&2
+    exec claude ${CLAUDE_ARGS}
 fi

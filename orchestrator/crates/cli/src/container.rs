@@ -77,13 +77,10 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         cfg.agent_name.clone(),
         "--network".to_string(),
         cfg.network_name.clone(),
-        // Security hardening
+        // Security: drop all caps, add only what's needed
         "--cap-drop=ALL".to_string(),
-        "--cap-add=NET_RAW".to_string(),     // DNS resolution
-        "--cap-add=CHOWN".to_string(),       // Entrypoint sets up agent user home
-        "--cap-add=SETUID".to_string(),      // su from root to agent user
-        "--cap-add=SETGID".to_string(),      // su from root to agent user
-        "--cap-add=DAC_OVERRIDE".to_string(),// Create /home/agent
+        "--cap-add=NET_RAW".to_string(),      // DNS resolution
+        "--cap-add=DAC_OVERRIDE".to_string(),  // Root writes to bind-mounted files (host uid)
         // Volumes
         "-v".to_string(),
         format!("{}:/workspace:Z", cfg.project_path),
@@ -104,6 +101,8 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         format!("AGENT_MODE={}", cfg.mode),
         "-e".to_string(),
         format!("AGENT_PROMPT={}", cfg.prompt),
+        "-e".to_string(),
+        "IS_SANDBOX=1".to_string(),
     ];
 
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {

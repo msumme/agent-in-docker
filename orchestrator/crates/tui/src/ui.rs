@@ -177,11 +177,19 @@ fn draw_requests_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let status = format!(
-        " Agents: {} | Pending: {} | Tab: switch | a: attach | r: reattach | Ctrl-b d: detach | q: quit",
-        app.agents.len(),
-        app.pending_requests.len()
-    );
+    let status = match app.input_mode {
+        crate::app::InputMode::NewAgent => format!(
+            " NEW AGENT: type name[:role] then Enter | Esc: cancel"
+        ),
+        crate::app::InputMode::ConfirmQuit => format!(
+            " QUIT? Press y to confirm, any other key to cancel"
+        ),
+        crate::app::InputMode::Normal => format!(
+            " Agents: {} | Pending: {} | N: new agent | a: attach | r: reattach | Ctrl-b d: detach | q: quit",
+            app.agents.len(),
+            app.pending_requests.len()
+        ),
+    };
     let bar = Paragraph::new(status).style(
         Style::default()
             .fg(Color::White)

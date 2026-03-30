@@ -446,6 +446,28 @@ pub async fn run_with_id_gen(
                     };
                     s.send_to_agent(&agent_id, &msg);
                 }
+                TuiCommand::StartNewAgent { name, role } => {
+                    if let Some(ref mgr) = agent_mgr_for_cmds {
+                        let payload = StartAgentPayload {
+                            name: name.clone(),
+                            role,
+                            mode: "long-running".into(),
+                            project_path: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+                            prompt: String::new(),
+                            agent_dir: String::new(), // Will need config
+                            image_name: "agent-in-docker".into(),
+                            network_name: "agent-net".into(),
+                            orchestrator_port: 9800,
+                            mcp_port: 9801,
+                            dolt_port: None,
+                        };
+                        let mut m = mgr.lock().unwrap();
+                        match m.start_agent(&payload) {
+                            Ok(_) => info!("Started agent '{}' from TUI", name),
+                            Err(e) => warn!("Failed to start agent '{}': {}", name, e),
+                        }
+                    }
+                }
                 TuiCommand::ReattachAgent { name } => {
                     if let Some(ref mgr) = agent_mgr_for_cmds {
                         let mut m = mgr.lock().unwrap();

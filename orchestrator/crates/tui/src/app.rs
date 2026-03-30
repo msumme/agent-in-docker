@@ -11,6 +11,13 @@ pub enum FocusPanel {
     Requests,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputMode {
+    Normal,
+    NewAgent,
+    ConfirmQuit,
+}
+
 pub struct PendingRequest {
     pub agent_name: String,
     pub request_id: String,
@@ -28,6 +35,7 @@ pub struct App {
     pub selected_request: usize,
     pub input_text: String,
     pub should_quit: bool,
+    pub input_mode: InputMode,
     pub cmd_tx: mpsc::UnboundedSender<TuiCommand>,
     mcp_state: Arc<McpState>,
 }
@@ -44,6 +52,7 @@ impl App {
             selected_request: 0,
             input_text: String::new(),
             should_quit: false,
+            input_mode: InputMode::Normal,
             cmd_tx,
             mcp_state,
         }

@@ -168,6 +168,10 @@ pub enum TuiCommand {
     ReattachAgent {
         name: String,
     },
+    StartNewAgent {
+        name: String,
+        role: String,
+    },
     Shutdown,
 }
 

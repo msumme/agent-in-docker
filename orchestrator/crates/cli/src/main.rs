@@ -3,10 +3,8 @@ mod container;
 mod login;
 mod services;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[derive(Parser)]
 #[command(name = "agent", about = "Run LLM agents in containers")]
@@ -40,8 +38,7 @@ enum Commands {
     Login,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = config::Config::discover()?;
 
@@ -69,45 +66,19 @@ async fn main() -> Result<()> {
 
             println!("==> Agent: {} (role: {}, {})", agent_name, role, mode);
 
-            // Ensure credentials exist
             config::ensure_credentials(&cfg)?;
 
-            // Set up per-agent config directory
             let agent_dir = config::setup_agent_dir(&cfg, &agent_name, named)?;
 
-            // Ensure container image exists
             if build || !container::image_exists(&cfg.image_name)? {
                 println!("==> Building container image...");
                 container::build_image(&cfg)?;
             }
 
-            // Ensure network exists
             container::ensure_network(&cfg.network_name)?;
-
-            // Ensure orchestrator is running
             services::ensure_orchestrator(&cfg)?;
-
-            // Ensure dolt is running for beads
             let dolt_port = services::ensure_dolt(&project_path)?;
 
-            // Send start_agent to orchestrator via WS
-            let payload = serde_json::json!({
-                "name": agent_name,
-                "role": role,
-                "mode": mode,
-                "project_path": project_path.to_string_lossy(),
-                "prompt": prompt,
-                "agent_dir": agent_dir.to_string_lossy(),
-                "image_name": cfg.image_name,
-                "network_name": cfg.network_name,
-                "orchestrator_port": cfg.orchestrator_port,
-                "mcp_port": cfg.mcp_port,
-                "dolt_port": dolt_port,
-            });
-
-            // Launch container directly (CLI manages tmux + podman).
-            // The Rust entrypoint inside the container registers with the
-            // orchestrator via WS, making the agent visible in the TUI.
             let run_cfg = container::RunConfig {
                 agent_name: agent_name.clone(),
                 project_path: project_path.to_string_lossy().to_string(),
@@ -128,7 +99,6 @@ async fn main() -> Result<()> {
                 container::launch_oneshot(&run_cfg)?;
             }
 
-            // Clean up ephemeral agent dir
             if !named {
                 let _ = std::fs::remove_dir_all(&agent_dir);
             }
@@ -136,35 +106,4 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// Send a command to the orchestrator via WebSocket and wait for the ack.
-async fn send_ws_command(url: &str, msg_type: &str, payload: serde_json::Value) -> Result<serde_json::Value> {
-    let (ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .context("Failed to connect to orchestrator WS")?;
-
-    let (mut sender, mut receiver) = ws.split();
-
-    let msg = serde_json::json!({
-        "id": format!("cli-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
-        "type": msg_type,
-        "from": "cli",
-        "payload": payload,
-    });
-
-    sender.send(WsMessage::Text(serde_json::to_string(&msg)?.into())).await?;
-
-    // Wait for ack (5s timeout)
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(Ok(WsMessage::Text(text))) = receiver.next().await {
-            let resp: serde_json::Value = serde_json::from_str(&text)?;
-            if resp.get("type").and_then(|v| v.as_str()).map_or(false, |t| t.ends_with("_ack")) {
-                return Ok::<_, anyhow::Error>(resp.get("payload").cloned().unwrap_or_default());
-            }
-        }
-        anyhow::bail!("No ack received")
-    }).await.context("Timeout waiting for orchestrator response")??;
-
-    Ok(response)
 }

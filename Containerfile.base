@@ -34,10 +34,6 @@ RUN mkdir -p /workspace && chown node:node /workspace
 COPY orchestrator/target/release/entrypoint /opt/entrypoint
 RUN chmod +x /opt/entrypoint
 
-# Keep bash entrypoint as fallback
-COPY scripts/entrypoint.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh
-
 WORKDIR /workspace
 
 ENTRYPOINT ["/opt/entrypoint"]

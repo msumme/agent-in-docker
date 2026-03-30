@@ -61,11 +61,8 @@ impl ContainerOps for RealContainerOps {
             format!("--name {}", cfg.name),
             format!("--network {}", cfg.network_name),
             "--cap-drop=ALL".to_string(),
-            "--cap-add=NET_RAW".to_string(),
-            "--cap-add=CHOWN".to_string(),
-            "--cap-add=SETUID".to_string(),
-            "--cap-add=SETGID".to_string(),
-            "--cap-add=DAC_OVERRIDE".to_string(),
+            "--cap-add=NET_RAW".to_string(),      // DNS resolution
+            "--cap-add=DAC_OVERRIDE".to_string(),  // Root writes to bind-mounted files
             format!("-v {}:/workspace:Z", cfg.project_path),
             format!("-v {}:/root/.claude:Z", cfg.agent_dir),
             "-e IS_SANDBOX=1".to_string(),

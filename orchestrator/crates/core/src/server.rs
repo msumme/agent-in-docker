@@ -64,6 +64,7 @@ pub struct ServerState {
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     id_gen: Arc<dyn IdGenerator>,
     executor: Arc<dyn RequestExecutor>,
+    registry_snapshot: Option<Arc<std::sync::Mutex<Vec<PeerInfo>>>>,
 }
 
 impl ServerState {
@@ -77,6 +78,17 @@ impl ServerState {
             event_tx,
             id_gen,
             executor: Arc::new(RealRequestExecutor),
+            registry_snapshot: None,
+        }
+    }
+
+    pub fn set_registry_snapshot(&mut self, snapshot: Arc<std::sync::Mutex<Vec<PeerInfo>>>) {
+        self.registry_snapshot = Some(snapshot);
+    }
+
+    fn sync_registry_snapshot(&self) {
+        if let Some(ref snapshot) = self.registry_snapshot {
+            *snapshot.lock().unwrap() = self.agent_list();
         }
     }
 
@@ -148,6 +160,7 @@ impl ServerState {
             .event_tx
             .send(OrchestratorEvent::AgentConnected(info.clone()));
         self.agents.insert(id.clone(), ConnectedAgent { info, sender });
+        self.sync_registry_snapshot();
         (id, peers)
     }
 
@@ -334,6 +347,8 @@ impl ServerState {
             self.send_to_agent_direct(&agent.sender, &left_msg);
         }
 
+        self.sync_registry_snapshot();
+
         let _ = self
             .event_tx
             .send(OrchestratorEvent::AgentDisconnected {
@@ -360,23 +375,36 @@ impl ServerState {
     }
 }
 
-/// Wraps Arc<Mutex<ServerState>> to implement AgentRegistry for the MCP server.
+/// Snapshot-based registry that avoids blocking_lock on the tokio Mutex.
+/// Updated by the server whenever agents connect/disconnect.
 pub struct ServerStateRegistry {
+    agents: Arc<std::sync::Mutex<Vec<PeerInfo>>>,
     state: Arc<Mutex<ServerState>>,
+}
+
+impl ServerStateRegistry {
+    pub fn update_agents(&self, agents: Vec<PeerInfo>) {
+        *self.agents.lock().unwrap() = agents;
+    }
 }
 
 impl AgentRegistry for ServerStateRegistry {
     fn list_agents(&self) -> Vec<PeerInfo> {
-        let s = self.state.blocking_lock();
-        s.agent_list()
+        self.agents.lock().unwrap().clone()
     }
 
     fn route_message(&self, from: &str, to: &str, content: &str) -> Result<(), String> {
-        let s = self.state.blocking_lock();
-        if s.route_agent_message(from, "", to, content) {
-            Ok(())
-        } else {
-            Err(format!("Agent {} not found", to))
+        // route_message needs the full state to send WS messages.
+        // Use try_lock to avoid blocking; if contended, return error.
+        match self.state.try_lock() {
+            Ok(s) => {
+                if s.route_agent_message(from, "", to, content) {
+                    Ok(())
+                } else {
+                    Err(format!("Agent {} not found", to))
+                }
+            }
+            Err(_) => Err("Server busy, try again".into()),
         }
     }
 }
@@ -405,8 +433,14 @@ pub async fn run_with_id_gen(
     let state = Arc::new(Mutex::new(ServerState::new(event_tx, id_gen)));
 
     // Wire the agent registry into the MCP state
+    let registry_snapshot = Arc::new(std::sync::Mutex::new(Vec::<PeerInfo>::new()));
+    {
+        let mut s = state.lock().await;
+        s.set_registry_snapshot(registry_snapshot.clone());
+    }
     if let Some(ref mcp) = mcp_state {
         mcp.set_registry(Box::new(ServerStateRegistry {
+            agents: registry_snapshot.clone(),
             state: state.clone(),
         }));
     }

@@ -13,6 +13,8 @@ pub trait TmuxOps: Send + Sync {
 /// Abstraction over podman operations. Injectable for testing.
 pub trait ContainerOps: Send + Sync {
     fn build_run_command(&self, cfg: &StartAgentPayload) -> String;
+    fn is_running(&self, container_name: &str) -> bool;
+    fn stop(&self, container_name: &str) -> Result<(), String>;
 }
 
 /// Real implementations using std::process::Command.
@@ -81,6 +83,22 @@ impl ContainerOps for RealContainerOps {
 
         parts.push(cfg.image_name.clone());
         parts.join(" ")
+    }
+
+    fn is_running(&self, container_name: &str) -> bool {
+        std::process::Command::new("podman")
+            .args(["inspect", "--format", "{{.State.Running}}", container_name])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false)
+    }
+
+    fn stop(&self, container_name: &str) -> Result<(), String> {
+        let status = std::process::Command::new("podman")
+            .args(["stop", container_name])
+            .status()
+            .map_err(|e| format!("podman stop failed: {}", e))?;
+        if status.success() { Ok(()) } else { Err("podman stop returned non-zero".into()) }
     }
 }
 
@@ -175,14 +193,7 @@ impl AgentManager {
     pub fn reattach_agent(&mut self, name: &str) -> Result<(), String> {
         let agent = self.agents.get(name).ok_or(format!("Agent '{}' not found", name))?;
 
-        // Check if container is actually running
-        let is_running = std::process::Command::new("podman")
-            .args(["inspect", "--format", "{{.State.Running}}", &agent.container_name])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-            .unwrap_or(false);
-
-        if !is_running {
+        if !self.container.is_running(&agent.container_name) {
             return Err(format!("Container '{}' is not running", name));
         }
 
@@ -198,9 +209,7 @@ impl AgentManager {
     }
 
     pub fn stop_agent(&mut self, name: &str) -> Result<(), String> {
-        let _ = std::process::Command::new("podman")
-            .args(["stop", name])
-            .status();
+        let _ = self.container.stop(name);
         if let Some(agent) = self.agents.get_mut(name) {
             agent.status = AgentStatus::Exited;
             agent.last_activity = "stopped by user".into();
@@ -259,6 +268,8 @@ mod tests {
         fn build_run_command(&self, cfg: &StartAgentPayload) -> String {
             format!("podman run --name {} {}", cfg.name, cfg.image_name)
         }
+        fn is_running(&self, _name: &str) -> bool { true }
+        fn stop(&self, _name: &str) -> Result<(), String> { Ok(()) }
     }
 
     fn make_manager() -> AgentManager {
@@ -353,5 +364,31 @@ mod tests {
         mgr.start_agent(&make_payload("Alice")).unwrap();
         mgr.start_agent(&make_payload("Bob")).unwrap();
         assert_eq!(mgr.list_agents().len(), 2);
+    }
+
+    #[test]
+    fn stop_agent_sets_exited() {
+        let mut mgr = make_manager();
+        mgr.start_agent(&make_payload("Alice")).unwrap();
+        mgr.agent_registered("Alice", "ws-1");
+        mgr.stop_agent("Alice").unwrap();
+        assert_eq!(mgr.get_agent("Alice").unwrap().status, AgentStatus::Exited);
+    }
+
+    #[test]
+    fn reattach_running_agent_sets_connected() {
+        let mut mgr = make_manager();
+        mgr.start_agent(&make_payload("Alice")).unwrap();
+        mgr.agent_registered("Alice", "ws-1");
+        mgr.agent_disconnected("ws-1"); // simulate disconnect
+        // FakeContainer.is_running returns true
+        mgr.reattach_agent("Alice").unwrap();
+        assert_eq!(mgr.get_agent("Alice").unwrap().status, AgentStatus::Connected);
+    }
+
+    #[test]
+    fn reattach_unknown_agent_fails() {
+        let mut mgr = make_manager();
+        assert!(mgr.reattach_agent("Nobody").is_err());
     }
 }

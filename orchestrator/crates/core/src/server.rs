@@ -72,12 +72,20 @@ impl ServerState {
         event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
         id_gen: Arc<dyn IdGenerator>,
     ) -> Self {
+        Self::with_executor(event_tx, id_gen, Arc::new(RealRequestExecutor))
+    }
+
+    pub fn with_executor(
+        event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+        id_gen: Arc<dyn IdGenerator>,
+        executor: Arc<dyn RequestExecutor>,
+    ) -> Self {
         Self {
             agents: HashMap::new(),
             pending_requests: HashMap::new(),
             event_tx,
             id_gen,
-            executor: Arc::new(RealRequestExecutor),
+            executor,
             registry_snapshot: None,
         }
     }
@@ -1190,5 +1198,61 @@ mod tests {
 
         let list = state.agent_list();
         assert_eq!(list.len(), 2);
+    }
+
+    struct FakeExecutor;
+    impl RequestExecutor for FakeExecutor {
+        fn execute_file_read(&self, path: &str) -> Result<String, String> {
+            Ok(format!("fake content of {}", path))
+        }
+        fn execute_git_push(&self, _ws: &str, _remote: &str, _branch: &str) -> Result<String, String> {
+            Ok("fake push ok".into())
+        }
+        fn current_branch(&self, _ws: &str) -> Result<String, String> {
+            Ok("main".into())
+        }
+    }
+
+    #[test]
+    fn execute_approved_file_read_with_fake_executor() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
+        let _ = event_rx.try_recv();
+
+        state.handle_request(&id, "fr-1".into(), "file_read", json!({"path": "/etc/hosts"}));
+        let _ = event_rx.try_recv();
+
+        state.execute_approved_request("fr-1");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "file_read_response");
+        assert_eq!(msg.payload["content"], "fake content of /etc/hosts");
+    }
+
+    #[test]
+    fn execute_approved_git_push_with_fake_executor() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), Some("/ws".into()), sender);
+        let _ = event_rx.try_recv();
+
+        state.handle_request(&id, "gp-1".into(), "git_push", json!({"remote": "origin", "branch": "main"}));
+        let _ = event_rx.try_recv();
+
+        state.execute_approved_request("gp-1");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "git_push_response");
+        assert!(msg.payload["success"].as_bool().unwrap());
+        assert_eq!(msg.payload["output"], "fake push ok");
     }
 }

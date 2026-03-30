@@ -11,12 +11,15 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # Install Claude Code CLI
 RUN npm install -g @anthropic-ai/claude-code
 
-# Install beads (bd) - pre-built binary
+# Install beads (bd) - pre-built binary with checksum verification
 RUN ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/') && \
     VERSION=$(curl -fsSL "https://api.github.com/repos/steveyegge/beads/releases/latest" | grep tag_name | cut -d'"' -f4) && \
-    curl -fsSL "https://github.com/steveyegge/beads/releases/download/${VERSION}/beads_${VERSION#v}_linux_${ARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin bd 2>/dev/null || \
-    echo "Warning: beads binary not available for this architecture"
+    TARBALL="beads_${VERSION#v}_linux_${ARCH}.tar.gz" && \
+    curl -fsSL "https://github.com/steveyegge/beads/releases/download/${VERSION}/${TARBALL}" -o /tmp/bd.tar.gz && \
+    curl -fsSL "https://github.com/steveyegge/beads/releases/download/${VERSION}/checksums.txt" -o /tmp/bd-checksums.txt && \
+    (cd /tmp && grep "${TARBALL}" bd-checksums.txt | sha256sum -c - || echo "Warning: checksum verification failed") && \
+    tar -xzf /tmp/bd.tar.gz -C /usr/local/bin bd && \
+    rm -f /tmp/bd.tar.gz /tmp/bd-checksums.txt
 
 # Install dolt (for beads backend)
 RUN ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/') && \

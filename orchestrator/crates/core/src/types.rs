@@ -165,6 +165,9 @@ pub enum TuiCommand {
         agent_id: String,
         prompt: String,
     },
+    ReattachAgent {
+        name: String,
+    },
     Shutdown,
 }
 

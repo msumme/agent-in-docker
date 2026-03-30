@@ -172,6 +172,33 @@ impl AgentManager {
         }
     }
 
+    /// Reattach an orphaned container to a new tmux window.
+    /// Use when the container is running but its tmux window was lost.
+    pub fn reattach_agent(&mut self, name: &str) -> Result<(), String> {
+        let agent = self.agents.get(name).ok_or(format!("Agent '{}' not found", name))?;
+
+        // Check if container is actually running
+        let is_running = std::process::Command::new("podman")
+            .args(["inspect", "--format", "{{.State.Running}}", &agent.container_name])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false);
+
+        if !is_running {
+            return Err(format!("Container '{}' is not running", name));
+        }
+
+        // Create a new tmux window that attaches to the running container
+        let cmd = format!("podman attach {}", agent.container_name);
+        self.tmux.create_window(&self.tmux_session, name, &cmd)?;
+
+        if let Some(agent) = self.agents.get_mut(name) {
+            agent.status = AgentStatus::Connected;
+            agent.last_activity = "reattached".into();
+        }
+        Ok(())
+    }
+
     pub fn stop_agent(&mut self, name: &str) -> Result<(), String> {
         let _ = std::process::Command::new("podman")
             .args(["stop", name])

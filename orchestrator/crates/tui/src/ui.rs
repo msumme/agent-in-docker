@@ -178,7 +178,7 @@ fn draw_requests_panel(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let status = format!(
-        " Agents: {} | Pending: {} | Tab: switch | a: attach | Ctrl-b d: detach | q: quit",
+        " Agents: {} | Pending: {} | Tab: switch | a: attach | r: reattach | Ctrl-b d: detach | q: quit",
         app.agents.len(),
         app.pending_requests.len()
     );

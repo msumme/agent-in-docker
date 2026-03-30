@@ -412,6 +412,7 @@ pub async fn run_with_id_gen(
     }
 
     let state_for_cmds = state.clone();
+    let agent_mgr_for_cmds = agent_mgr.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let mut s = state_for_cmds.lock().await;
@@ -444,6 +445,15 @@ pub async fn run_with_id_gen(
                         payload: serde_json::json!({"prompt": prompt}),
                     };
                     s.send_to_agent(&agent_id, &msg);
+                }
+                TuiCommand::ReattachAgent { name } => {
+                    if let Some(ref mgr) = agent_mgr_for_cmds {
+                        let mut m = mgr.lock().unwrap();
+                        match m.reattach_agent(&name) {
+                            Ok(()) => info!("Reattached agent: {}", name),
+                            Err(e) => warn!("Failed to reattach {}: {}", name, e),
+                        }
+                    }
                 }
                 TuiCommand::Shutdown => break,
             }
@@ -617,6 +627,27 @@ async fn handle_connection(
                 let ack = Message {
                     id: message.id.clone(),
                     msg_type: "stop_agent_ack".into(),
+                    from: "orchestrator".into(),
+                    to: None,
+                    payload: match result {
+                        Ok(()) => serde_json::json!({"success": true}),
+                        Err(e) => serde_json::json!({"success": false, "message": e}),
+                    },
+                };
+                let _ = out_tx.send(serde_json::to_string(&ack).unwrap());
+            }
+
+            "reattach_agent" => {
+                let name = message.payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let result = if let Some(ref mgr) = agent_mgr {
+                    let mut m = mgr.lock().unwrap();
+                    m.reattach_agent(name)
+                } else {
+                    Err("Agent manager not available".into())
+                };
+                let ack = Message {
+                    id: message.id.clone(),
+                    msg_type: "reattach_agent_ack".into(),
                     from: "orchestrator".into(),
                     to: None,
                     payload: match result {

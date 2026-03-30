@@ -99,6 +99,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('q') if app.pending_requests.is_empty() => {
                         app.should_quit = true;
                     }
+                    KeyCode::Char('r') if app.focus == app::FocusPanel::Agents => {
+                        if let Some(name) = app.selected_agent_name() {
+                            let _ = cmd_tx.send(TuiCommand::ReattachAgent { name: name.clone() });
+                            app.completed_log.push(format!("Reattaching {}...", name));
+                        }
+                    }
                     KeyCode::Char('a') if app.focus == app::FocusPanel::Agents => {
                         if let Some(name) = app.selected_agent_name() {
                             // Switch to agent's window in the same tmux session.

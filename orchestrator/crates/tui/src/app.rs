@@ -236,6 +236,85 @@ impl App {
         Some(self.agents[idx].name.clone())
     }
 
+}
+
+/// Effects returned by handle_key for the main loop to execute.
+#[derive(Debug, PartialEq)]
+pub enum KeyEffect {
+        None,
+        Quit,
+        AttachAgent(String),
+    }
+
+impl App {
+    /// Handle a key press. Returns an effect for the main loop to act on.
+    /// All state transitions happen here -- main.rs only executes effects.
+    pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> KeyEffect {
+        use crossterm::event::KeyCode;
+
+        if self.input_mode == InputMode::ConfirmQuit {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => return KeyEffect::Quit,
+                _ => { self.input_mode = InputMode::Normal; return KeyEffect::None; }
+            }
+        }
+
+        if self.input_mode == InputMode::NewAgent {
+            match code {
+                KeyCode::Enter => {
+                    if !self.input_text.is_empty() {
+                        let parts: Vec<&str> = self.input_text.splitn(2, ':').collect();
+                        let name = parts[0].trim().to_string();
+                        let role = parts.get(1).map(|r| r.trim().to_string()).unwrap_or_else(|| "code-agent".into());
+                        self.completed_log.push(format!("Starting agent '{}'...", name));
+                        let _ = self.cmd_tx.send(TuiCommand::StartNewAgent { name, role });
+                    }
+                    self.input_text.clear();
+                    self.input_mode = InputMode::Normal;
+                }
+                KeyCode::Esc => { self.input_text.clear(); self.input_mode = InputMode::Normal; }
+                KeyCode::Backspace => { self.input_text.pop(); }
+                KeyCode::Char(c) => { self.input_text.push(c); }
+                _ => {}
+            }
+            return KeyEffect::None;
+        }
+
+        // Normal mode
+        let approval_mode = self.focus == FocusPanel::Requests
+            && !self.pending_requests.is_empty()
+            && self.pending_requests
+                [self.selected_request.min(self.pending_requests.len() - 1)]
+                .request_type != "user_prompt";
+
+        match code {
+            KeyCode::Char('q') => { self.input_mode = InputMode::ConfirmQuit; }
+            KeyCode::Char('N') => { self.input_mode = InputMode::NewAgent; self.input_text.clear(); }
+            KeyCode::Char('r') if self.focus == FocusPanel::Agents => {
+                if let Some(name) = self.selected_agent_name() {
+                    let _ = self.cmd_tx.send(TuiCommand::ReattachAgent { name: name.clone() });
+                    self.completed_log.push(format!("Reattaching {}...", name));
+                }
+            }
+            KeyCode::Char('a') if self.focus == FocusPanel::Agents => {
+                if let Some(name) = self.selected_agent_name() {
+                    return KeyEffect::AttachAgent(name);
+                }
+            }
+            KeyCode::Char('y') if approval_mode => self.approve_request(),
+            KeyCode::Char('n') if approval_mode => self.deny_request(),
+            KeyCode::Tab => self.toggle_focus(),
+            KeyCode::Up => self.move_selection_up(),
+            KeyCode::Down => self.move_selection_down(),
+            KeyCode::Enter => self.submit_answer(),
+            KeyCode::Backspace => { self.input_text.pop(); }
+            KeyCode::Char(c) => { self.input_text.push(c); }
+            KeyCode::Esc => { self.input_text.clear(); }
+            _ => {}
+        }
+        KeyEffect::None
+    }
+
     pub fn move_selection_down(&mut self) {
         match self.focus {
             FocusPanel::Agents => {
@@ -410,5 +489,103 @@ mod tests {
         app.submit_answer(); // removes r2, selected was 1
 
         assert_eq!(app.selected_request, 0);
+    }
+
+    // --- Key dispatch tests ---
+
+    #[test]
+    fn key_q_enters_confirm_quit() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        let effect = app.handle_key(KeyCode::Char('q'));
+        assert_eq!(effect, KeyEffect::None);
+        assert_eq!(app.input_mode, InputMode::ConfirmQuit);
+    }
+
+    #[test]
+    fn confirm_quit_y_returns_quit_effect() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.input_mode = InputMode::ConfirmQuit;
+        let effect = app.handle_key(KeyCode::Char('y'));
+        assert_eq!(effect, KeyEffect::Quit);
+    }
+
+    #[test]
+    fn confirm_quit_other_key_cancels() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.input_mode = InputMode::ConfirmQuit;
+        let effect = app.handle_key(KeyCode::Char('x'));
+        assert_eq!(effect, KeyEffect::None);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn key_n_enters_new_agent_mode() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.handle_key(KeyCode::Char('N'));
+        assert_eq!(app.input_mode, InputMode::NewAgent);
+    }
+
+    #[test]
+    fn new_agent_enter_sends_start_command() {
+        let (mut app, mut rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.input_mode = InputMode::NewAgent;
+        app.handle_key(KeyCode::Char('B'));
+        app.handle_key(KeyCode::Char('o'));
+        app.handle_key(KeyCode::Char('b'));
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            TuiCommand::StartNewAgent { name, role } => {
+                assert_eq!(name, "Bob");
+                assert_eq!(role, "code-agent");
+            }
+            _ => panic!("Expected StartNewAgent"),
+        }
+    }
+
+    #[test]
+    fn new_agent_with_role() {
+        let (mut app, mut rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.input_mode = InputMode::NewAgent;
+        for c in "Alice:review-agent".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        app.handle_key(KeyCode::Enter);
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            TuiCommand::StartNewAgent { name, role } => {
+                assert_eq!(name, "Alice");
+                assert_eq!(role, "review-agent");
+            }
+            _ => panic!("Expected StartNewAgent"),
+        }
+    }
+
+    #[test]
+    fn new_agent_esc_cancels() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.input_mode = InputMode::NewAgent;
+        app.handle_key(KeyCode::Char('B'));
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_text.is_empty());
+    }
+
+    #[test]
+    fn key_a_returns_attach_effect() {
+        let (mut app, _rx) = make_app();
+        use crossterm::event::KeyCode;
+        app.handle_event(agent_connected("a1", "Bob", "code-agent"));
+        app.focus = FocusPanel::Agents;
+        let effect = app.handle_key(KeyCode::Char('a'));
+        assert_eq!(effect, KeyEffect::AttachAgent("Bob".into()));
     }
 }

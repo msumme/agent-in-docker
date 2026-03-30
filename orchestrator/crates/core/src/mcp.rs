@@ -1,7 +1,10 @@
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
@@ -141,17 +144,6 @@ impl McpState {
 fn default_tools() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "ask_user".into(),
-            description: "Ask the user a question and get their answer.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "The question to ask the user"}
-                },
-                "required": ["question"]
-            }),
-        },
-        ToolDef {
             name: "read_host_file".into(),
             description: "Read a file from the host machine. Only allowed paths are accessible.".into(),
             input_schema: json!({
@@ -232,21 +224,21 @@ async fn handle_mcp(
 
     let id = req.id.clone().unwrap_or(Value::Null);
 
-    let resp = match req.method.as_str() {
-        "initialize" => handle_initialize(id),
-        "tools/list" => handle_tools_list(&state, id),
-        "tools/call" => handle_tools_call(&state, id, req.params, &agent_name).await,
+    match req.method.as_str() {
+        "initialize" => sse_response(&handle_initialize(id)).into_response(),
+        "tools/list" => sse_response(&handle_tools_list(&state, id)).into_response(),
+        "tools/call" => {
+            // Return SSE stream with keepalives for approval-gated tools
+            handle_tools_call_streaming(state, id, req.params, agent_name).into_response()
+        }
         "notifications/initialized" => {
-            // Client notification, no response needed
-            return (StatusCode::NO_CONTENT, "").into_response();
+            (StatusCode::NO_CONTENT, "").into_response()
         }
         method => {
             warn!("Unknown MCP method: {}", method);
-            JsonRpcResponse::error(id, -32601, format!("Method not found: {}", method))
+            sse_response(&JsonRpcResponse::error(id, -32601, format!("Method not found: {}", method))).into_response()
         }
-    };
-
-    sse_response(&resp).into_response()
+    }
 }
 
 fn handle_initialize(id: Value) -> JsonRpcResponse {
@@ -311,10 +303,6 @@ async fn handle_tools_call(
     }
 
     let (request_type, payload) = match tool_name {
-        "ask_user" => {
-            let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-            ("user_prompt", json!({"question": question}))
-        }
         "read_host_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             ("file_read", json!({"path": path}))
@@ -346,79 +334,162 @@ async fn handle_tools_call(
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Create oneshot channel for the response
-    let (tx, rx) = oneshot::channel();
-    {
-        let mut pending = state.pending.lock().unwrap();
-        pending.insert(request_id.clone(), tx);
-    }
+    // Immediate tools -- no approval needed
+    JsonRpcResponse::error(id, -32602, format!("Unknown tool: {}", tool_name))
+}
 
-    // Emit event to TUI
-    let _ = state.event_tx.send(OrchestratorEvent::RequestReceived {
-        agent_id: format!("mcp-{}", agent_name),
-        agent_name: agent_name.to_string(),
-        request_id: request_id.clone(),
-        request_type: request_type.into(),
-        payload: payload.clone(),
-    });
+/// Streaming handler for tools that need TUI approval (file_read, git_push).
+/// Sends SSE keepalive comments every 15s while waiting for approval.
+fn handle_tools_call_streaming(
+    state: Arc<McpState>,
+    id: Value,
+    params: Value,
+    agent_name: String,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    info!("MCP tool call: {} (request_id: {})", tool_name, request_id);
-
-    // Wait for response (5 minute timeout)
-    let result = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
-
-    match result {
-        Ok(Ok(response_payload)) => {
-            // Check for error response
-            if let Some(error_msg) = response_payload.get("message").and_then(|v| v.as_str()) {
-                if response_payload.get("code").is_some() {
-                    return JsonRpcResponse::success(
-                        id,
-                        json!({
-                            "content": [{"type": "text", "text": format!("Error: {}", error_msg)}],
-                            "isError": true,
-                        }),
-                    );
+    // Permission check (before stream, no mutex across yield)
+    let denied = {
+        let agent_role = "code-agent";
+        let perms = state.permissions.lock().unwrap();
+        match tool_name.as_str() {
+            "read_host_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                match perms.check_file_read(agent_role, path) {
+                    PermissionResult::Deny(reason) => Some(reason),
+                    _ => None,
                 }
             }
+            "git_push" => {
+                let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                match perms.check_git_push(agent_role, remote) {
+                    PermissionResult::Deny(reason) => Some(reason),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
 
-            info!("MCP tool response: {} payload={}", tool_name, response_payload);
-
-            // Map response to MCP tool result
-            let text = match tool_name {
-                "ask_user" => response_payload
-                    .get("answer")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                "read_host_file" => response_payload
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                "git_push" => response_payload
-                    .get("output")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Push completed")
-                    .to_string(),
-                _ => serde_json::to_string(&response_payload).unwrap_or_default(),
+    // Immediate tools (no approval needed)
+    let immediate_response: Option<String> = match tool_name.as_str() {
+        "list_agents" => {
+            let agents = state.registry.lock().unwrap().list_agents();
+            let text = serde_json::to_string_pretty(&agents).unwrap_or_default();
+            let resp = JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}));
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "message_agent" => {
+            let agent_id = args.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+            let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let result = state.registry.lock().unwrap().route_message("mcp-client", agent_id, message);
+            let text = match result {
+                Ok(()) => format!("Message delivered to {}", agent_id),
+                Err(e) => format!("Failed: {}", e),
             };
+            let resp = JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}));
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        _ => None,
+    };
 
-            JsonRpcResponse::success(
-                id,
-                json!({ "content": [{"type": "text", "text": text}] }),
-            )
-        }
-        Ok(Err(_)) => {
-            JsonRpcResponse::error(id, -32000, "Request cancelled".into())
-        }
-        Err(_) => {
-            // Clean up timed-out request
+    // Set up approval-gated request (before stream)
+    let rx = if denied.is_none() && immediate_response.is_none() {
+        let (request_type, payload) = match tool_name.as_str() {
+            "read_host_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                ("file_read".to_string(), json!({"path": path}))
+            }
+            "git_push" => {
+                let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin").to_string();
+                let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                ("git_push".to_string(), json!({"remote": remote, "branch": branch}))
+            }
+            _ => ("unknown".to_string(), json!({})),
+        };
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        {
             let mut pending = state.pending.lock().unwrap();
-            pending.remove(&request_id);
-            JsonRpcResponse::error(id, -32000, "Request timed out".into())
+            pending.insert(request_id.clone(), tx);
         }
-    }
+        let _ = state.event_tx.send(OrchestratorEvent::RequestReceived {
+            agent_id: format!("mcp-{}", agent_name),
+            agent_name: agent_name.clone(),
+            request_id: request_id.clone(),
+            request_type,
+            payload,
+        });
+        info!("MCP tool call: {} (request_id: {})", tool_name, request_id);
+        Some((rx, request_id))
+    } else {
+        None
+    };
+
+    // Build the stream (no mutex guards held here)
+    let tool = tool_name.clone();
+    let stream = async_stream::stream! {
+        // Denied
+        if let Some(reason) = denied {
+            let resp = JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": format!("Permission denied: {}", reason)}], "isError": true}));
+            yield Ok::<_, Infallible>(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
+            return;
+        }
+
+        // Immediate
+        if let Some(data) = immediate_response {
+            yield Ok(Event::default().event("message").data(data));
+            return;
+        }
+
+        // Approval-gated: stream keepalives
+        if let Some((rx, _request_id)) = rx {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            let timeout = tokio::time::sleep(Duration::from_secs(300));
+            tokio::pin!(timeout);
+            tokio::pin!(rx);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        yield Ok(Event::default().comment("keepalive"));
+                    }
+                    result = &mut rx => {
+                        match result {
+                            Ok(response_payload) => {
+                                if response_payload.get("code").is_some() {
+                                    let msg = response_payload.get("message").and_then(|v| v.as_str()).unwrap_or("Error");
+                                    let resp = JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": format!("Error: {}", msg)}], "isError": true}));
+                                    yield Ok(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
+                                } else {
+                                    let text = match tool.as_str() {
+                                        "read_host_file" => response_payload.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        "git_push" => response_payload.get("output").and_then(|v| v.as_str()).unwrap_or("Push completed").to_string(),
+                                        _ => serde_json::to_string(&response_payload).unwrap_or_default(),
+                                    };
+                                    let resp = JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": text}]}));
+                                    yield Ok(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
+                                }
+                            }
+                            Err(_) => {
+                                let resp = JsonRpcResponse::error(id, -32000, "Request cancelled".into());
+                                yield Ok(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
+                            }
+                        }
+                        break;
+                    }
+                    _ = &mut timeout => {
+                        let resp = JsonRpcResponse::error(id, -32000, "Request timed out".into());
+                        yield Ok(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    Sse::new(stream)
 }
 
 /// Create the axum router for the MCP HTTP server.
@@ -442,11 +513,11 @@ mod tests {
 
     #[test]
     fn parse_tools_call_request() {
-        let json = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"What color?"}}}"#;
+        let json = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_host_file","arguments":{"path":"/etc/hosts"}}}"#;
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.method, "tools/call");
-        assert_eq!(req.params["name"], "ask_user");
-        assert_eq!(req.params["arguments"]["question"], "What color?");
+        assert_eq!(req.params["name"], "read_host_file");
+        assert_eq!(req.params["arguments"]["path"], "/etc/hosts");
     }
 
     #[test]
@@ -480,9 +551,8 @@ mod tests {
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 4);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"ask_user"));
         assert!(names.contains(&"read_host_file"));
         assert!(names.contains(&"git_push"));
         assert!(names.contains(&"list_agents"));
@@ -557,13 +627,14 @@ mod tests {
 
         let client = reqwest::Client::new();
 
-        // Send ask_user tool call in background
+        // Send read_host_file tool call in background
         let url = format!("http://{}/mcp", addr);
         let resp_future = tokio::spawn(async move {
             client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_user","arguments":{"question":"Color?"}}}"#)
+                .header("X-Agent-Name", "test-agent")
+                .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_host_file","arguments":{"path":"/tmp/test"}}}"#)
                 .send()
                 .await
                 .unwrap()
@@ -576,12 +647,12 @@ mod tests {
             _ => panic!("Expected RequestReceived"),
         };
 
-        // Resolve it
-                state.resolve(&request_id, json!({"answer": "red"}));
+        // Resolve it with file content
+        state.resolve(&request_id, json!({"content": "file data here"}));
 
         // Check response
         let resp = resp_future.await.unwrap();
         let body = resp.text().await.unwrap();
-        assert!(body.contains("red"));
+        assert!(body.contains("file data here"));
     }
 }

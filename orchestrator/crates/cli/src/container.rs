@@ -151,8 +151,9 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
         .unwrap_or(false);
 
     if has_session {
+        let target = format!("{}:", tmux_session);
         let status = Command::new("tmux")
-            .args(["new-window", "-t", tmux_session, "-n", &cfg.agent_name, &script_path])
+            .args(["new-window", "-t", &target, "-n", &cfg.agent_name, &script_path])
             .status()?;
         if !status.success() {
             bail!("Failed to create tmux window");

@@ -20,8 +20,9 @@ pub struct RealTmuxOps;
 
 impl TmuxOps for RealTmuxOps {
     fn create_window(&self, session: &str, window_name: &str, command: &str) -> Result<(), String> {
+        let target = format!("{}:", session); // trailing colon = next available index
         let status = std::process::Command::new("tmux")
-            .args(["new-window", "-t", session, "-n", window_name, command])
+            .args(["new-window", "-t", &target, "-n", window_name, command])
             .status()
             .map_err(|e| format!("tmux new-window failed: {}", e))?;
         if status.success() { Ok(()) } else { Err("tmux new-window returned non-zero".into()) }

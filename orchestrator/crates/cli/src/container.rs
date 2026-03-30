@@ -139,7 +139,9 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     );
     write_run_script(cfg, &script_path)?;
 
-    let tmux_session = "agents";
+    // Agents run in the same tmux session as the orchestrator
+    // so you can switch between TUI and agents with Ctrl-b n/p
+    let tmux_session = "orchestrator";
 
     // Create or add to tmux session
     let has_session = Command::new("tmux")
@@ -172,11 +174,10 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
         }
     }
 
-    println!("==> Agent '{}' started in tmux session 'agents'", cfg.agent_name);
-    println!("    Attach to agent:       tmux attach -t agents");
-    println!("    Switch agents:         Ctrl-b n / Ctrl-b p");
-    println!("    Detach:                Ctrl-b d");
-    println!("    Orchestrator TUI:      tmux attach -t orchestrator");
+    println!("==> Agent '{}' started", cfg.agent_name);
+    println!("    Attach:      tmux attach -t orchestrator");
+    println!("    Switch:      Ctrl-b n (next) / Ctrl-b p (prev)");
+    println!("    Detach:      Ctrl-b d");
 
     // Auto-accept dialogs (blocks until done)
     auto_accept_dialogs(&cfg.agent_name, &cfg.prompt);
@@ -201,7 +202,7 @@ pub fn launch_oneshot(cfg: &RunConfig) -> Result<()> {
 }
 
 fn auto_accept_dialogs(agent_name: &str, prompt: &str) {
-    let target = format!("agents:{}", agent_name);
+    let target = format!("orchestrator:{}", agent_name);
 
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -236,7 +237,7 @@ fn auto_accept_dialogs(agent_name: &str, prompt: &str) {
     if !prompt.is_empty() {
         std::thread::sleep(std::time::Duration::from_secs(3));
         let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &format!("agents:{}", agent_name), prompt, "Enter"])
+            .args(["send-keys", "-t", &format!("orchestrator:{}", agent_name), prompt, "Enter"])
             .status();
         eprintln!("==> Sent initial prompt to agent");
     }

@@ -138,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         while let Ok(event) = event_rx.try_recv() {
+            tracing::info!("TUI received event: {:?}", event);
             app.handle_event(event);
         }
 

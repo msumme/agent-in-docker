@@ -8,9 +8,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

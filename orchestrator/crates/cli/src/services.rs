@@ -3,21 +3,18 @@ use std::process::Command;
 
 use crate::config::Config;
 
-fn pid_is_running(pid_file: &std::path::Path) -> bool {
-    if let Ok(content) = std::fs::read_to_string(pid_file) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-        }
-    }
-    false
+/// Check if the orchestrator is running by trying to connect to its port.
+/// More reliable than PID file checks (no race conditions, no stale PIDs).
+fn is_port_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        std::time::Duration::from_secs(1),
+    )
+    .is_ok()
 }
 
 pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
-    if pid_is_running(&cfg.orchestrator_pid_file) {
+    if is_port_listening(cfg.orchestrator_port) {
         println!("==> Orchestrator already running");
         return Ok(());
     }
@@ -135,16 +132,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pid_is_running_returns_false_for_missing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(!pid_is_running(&tmp.path().join("nonexistent.pid")));
+    fn port_check_returns_false_for_unused_port() {
+        assert!(!is_port_listening(19999));
     }
 
     #[test]
-    fn pid_is_running_returns_false_for_invalid_pid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_file = tmp.path().join("test.pid");
-        std::fs::write(&pid_file, "99999999").unwrap();
-        assert!(!pid_is_running(&pid_file));
+    fn port_check_returns_true_for_listening_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(is_port_listening(port));
     }
 }

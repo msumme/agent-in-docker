@@ -50,13 +50,52 @@ pub async fn register_and_stay_connected(
             Ok(WsMessage::Ping(data)) => {
                 let _ = sender.send(WsMessage::Pong(data)).await;
             }
-            Ok(WsMessage::Close(_)) => break,
-            Err(_) => break,
-            _ => {} // Ignore other messages
+            Ok(WsMessage::Close(_)) => {
+                eprintln!("[entrypoint] WS connection closed by server");
+                break;
+            }
+            Err(e) => {
+                eprintln!("[entrypoint] WS error: {}", e);
+                break;
+            }
+            _ => {}
         }
     }
 
-    eprintln!("[entrypoint] WS connection closed");
+    // Attempt reconnection with exponential backoff
+    let mut delay = 1;
+    for attempt in 1..=5 {
+        eprintln!("[entrypoint] Reconnecting (attempt {}/5, {}s delay)...", attempt, delay);
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((ws, _)) => {
+                let (mut s, mut r) = ws.split();
+                let re_register = serde_json::json!({
+                    "id": uuid_v4(),
+                    "type": "register",
+                    "from": "pending",
+                    "payload": {"name": name, "role": role}
+                });
+                let _ = s.send(WsMessage::Text(serde_json::to_string(&re_register).unwrap().into())).await;
+                eprintln!("[entrypoint] Reconnected");
+
+                while let Some(msg) = r.next().await {
+                    match msg {
+                        Ok(WsMessage::Ping(data)) => { let _ = s.send(WsMessage::Pong(data)).await; }
+                        Ok(WsMessage::Close(_)) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            Err(_) => {
+                delay = (delay * 2).min(30);
+                continue;
+            }
+        }
+    }
+
+    eprintln!("[entrypoint] WS connection lost permanently");
     Ok(())
 }
 

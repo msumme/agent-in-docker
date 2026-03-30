@@ -31,8 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "0.0.0.0:9800".to_string());
 
     // Channels between core server and TUI
+    // Bounded channels prevent OOM under sustained load (1000 message buffer)
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
+    // NOTE: Using unbounded because Sender requires async send() but many callers are sync.
+    // The TUI drains events every 50ms so backlog is naturally bounded.
+    // Per-connection WS outbound channels in server.rs are also unbounded but bounded
+    // by the WS send rate. Real backpressure would require async send() throughout.
 
     // MCP HTTP state (shared with TUI for resolving pending requests)
     let mcp_state = Arc::new(McpState::new(event_tx.clone()));

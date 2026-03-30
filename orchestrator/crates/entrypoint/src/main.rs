@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     setup::verify_credentials()?;
     setup::pre_accept_workspace_trust()?;
     setup::configure_beads()?;
-    setup::write_mcp_config(&mcp_port, &agent_name)?;
+    setup::write_mcp_config(&mcp_port, &agent_name, &agent_role)?;
 
     // Register with orchestrator via WebSocket (background task)
     let ws_handle = tokio::spawn(register::register_and_stay_connected(

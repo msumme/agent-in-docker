@@ -276,67 +276,51 @@ impl ServerState {
         }
     }
 
-    /// Execute an approved request (file_read, git_push) and send the result.
-    pub fn execute_approved_request(&mut self, request_id: &str) {
+    /// Execute an approved request and return the result payload (for MCP resolution).
+    pub fn execute_approved_request_with_result(&mut self, request_id: &str) -> Option<serde_json::Value> {
         if let Some(pending) = self.pending_requests.remove(request_id) {
-            let (msg_type, payload) = match pending.request_type.as_str() {
-                "file_read" => {
-                    let path = pending.payload.get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    match self.executor.execute_file_read(path) {
-                        Ok(content) => (
-                            "file_read_response",
-                            serde_json::json!({"content": content}),
-                        ),
-                        Err(e) => (
-                            "error",
-                            serde_json::json!({"code": "READ_FAILED", "message": e}),
-                        ),
-                    }
-                }
-                "git_push" => {
-                    let remote = pending.payload.get("remote")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("origin");
-                    let branch = pending.payload.get("branch")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let workspace = self.agent_workspace(&pending.agent_id)
-                        .unwrap_or_default();
-
-                    let branch = if branch.is_empty() {
-                        self.executor.current_branch(&workspace)
-                            .unwrap_or_else(|_| "main".into())
-                    } else {
-                        branch.to_string()
-                    };
-
-                    match self.executor.execute_git_push(&workspace, remote, &branch) {
-                        Ok(output) => (
-                            "git_push_response",
-                            serde_json::json!({"success": true, "output": output}),
-                        ),
-                        Err(e) => (
-                            "error",
-                            serde_json::json!({"code": "PUSH_FAILED", "message": e}),
-                        ),
-                    }
-                }
-                _ => (
-                    "error",
-                    serde_json::json!({"code": "UNKNOWN_REQUEST", "message": "Cannot execute this request type"}),
-                ),
-            };
-
+            let (msg_type, payload) = self.execute_request(&pending);
             let response = Message {
                 id: request_id.to_string(),
                 msg_type: msg_type.to_string(),
                 from: "orchestrator".into(),
                 to: Some(pending.agent_id.clone()),
-                payload,
+                payload: payload.clone(),
             };
             self.send_to_agent(&pending.agent_id, &response);
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+    /// Execute an approved request (file_read, git_push) and send the result.
+    pub fn execute_approved_request(&mut self, request_id: &str) {
+        self.execute_approved_request_with_result(request_id);
+    }
+
+    fn execute_request(&self, pending: &PendingRequest) -> (&'static str, serde_json::Value) {
+        match pending.request_type.as_str() {
+            "file_read" => {
+                let path = pending.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                match self.executor.execute_file_read(path) {
+                    Ok(content) => ("file_read_response", serde_json::json!({"content": content})),
+                    Err(e) => ("error", serde_json::json!({"code": "READ_FAILED", "message": e})),
+                }
+            }
+            "git_push" => {
+                let remote = pending.payload.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                let branch = pending.payload.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+                let workspace = self.agent_workspace(&pending.agent_id).unwrap_or_default();
+                let branch = if branch.is_empty() {
+                    self.executor.current_branch(&workspace).unwrap_or_else(|_| "main".into())
+                } else { branch.to_string() };
+                match self.executor.execute_git_push(&workspace, remote, &branch) {
+                    Ok(output) => ("git_push_response", serde_json::json!({"success": true, "output": output})),
+                    Err(e) => ("error", serde_json::json!({"code": "PUSH_FAILED", "message": e})),
+                }
+            }
+            _ => ("error", serde_json::json!({"code": "UNKNOWN_REQUEST", "message": "Cannot execute this request type"})),
         }
     }
 
@@ -455,6 +439,7 @@ pub async fn run_with_id_gen(
 
     let state_for_cmds = state.clone();
     let agent_mgr_for_cmds = agent_mgr.clone();
+    let mcp_for_cmds = mcp_state.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let mut s = state_for_cmds.lock().await;
@@ -463,20 +448,28 @@ pub async fn run_with_id_gen(
                     request_id,
                     payload,
                 } => {
-                    s.respond_to_request(&request_id, "user_prompt_response", payload);
+                    s.respond_to_request(&request_id, "user_prompt_response", payload.clone());
+                    if let Some(ref mcp) = mcp_for_cmds {
+                        mcp.resolve(&request_id, payload);
+                    }
                 }
                 TuiCommand::ApproveRequest { request_id } => {
-                    s.execute_approved_request(&request_id);
+                    // Execute and get the result payload
+                    let result = s.execute_approved_request_with_result(&request_id);
+                    // Also resolve MCP pending request
+                    if let (Some(ref mcp), Some(payload)) = (&mcp_for_cmds, result) {
+                        mcp.resolve(&request_id, payload);
+                    }
                 }
                 TuiCommand::DenyRequest {
                     request_id,
                     reason,
                 } => {
-                    s.respond_to_request(
-                        &request_id,
-                        "error",
-                        serde_json::json!({"code": "PERMISSION_DENIED", "message": reason}),
-                    );
+                    let payload = serde_json::json!({"code": "PERMISSION_DENIED", "message": reason});
+                    s.respond_to_request(&request_id, "error", payload.clone());
+                    if let Some(ref mcp) = mcp_for_cmds {
+                        mcp.resolve(&request_id, payload);
+                    }
                 }
                 TuiCommand::SendTask { agent_id, prompt } => {
                     let msg = Message {

@@ -87,7 +87,7 @@ pub fn configure_beads() -> Result<()> {
 }
 
 /// Write MCP config file pointing to the orchestrator's HTTP MCP server.
-pub fn write_mcp_config(mcp_port: &str, agent_name: &str) -> Result<()> {
+pub fn write_mcp_config(mcp_port: &str, agent_name: &str, agent_role: &str) -> Result<()> {
     let url = format!("http://host.containers.internal:{}/mcp", mcp_port);
     let config = serde_json::json!({
         "mcpServers": {
@@ -95,7 +95,8 @@ pub fn write_mcp_config(mcp_port: &str, agent_name: &str) -> Result<()> {
                 "type": "http",
                 "url": url,
                 "headers": {
-                    "X-Agent-Name": agent_name
+                    "X-Agent-Name": agent_name,
+                    "X-Agent-Role": agent_role
                 }
             }
         }

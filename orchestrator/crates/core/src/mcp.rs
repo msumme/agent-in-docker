@@ -210,6 +210,11 @@ async fn handle_mcp(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
+    let agent_role = headers
+        .get("x-agent-role")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("code-agent")
+        .to_string();
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -229,7 +234,7 @@ async fn handle_mcp(
         "tools/list" => sse_response(&handle_tools_list(&state, id)).into_response(),
         "tools/call" => {
             // Return SSE stream with keepalives for approval-gated tools
-            handle_tools_call_streaming(state, id, req.params, agent_name).into_response()
+            handle_tools_call_streaming(state, id, req.params, agent_name, agent_role).into_response()
         }
         "notifications/initialized" => {
             (StatusCode::NO_CONTENT, "").into_response()
@@ -268,13 +273,14 @@ fn handle_tools_call_streaming(
     id: Value,
     params: Value,
     agent_name: String,
+    agent_role: String,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // Permission check (before stream, no mutex across yield)
     let denied = {
-        let agent_role = "code-agent";
+        let agent_role = &agent_role;
         let perms = state.permissions.lock().unwrap();
         match tool_name.as_str() {
             "read_host_file" => {

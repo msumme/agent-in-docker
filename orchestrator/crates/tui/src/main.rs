@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cmd_tx.clone(), mcp_state.clone());
+    let mut app = App::new(cmd_tx.clone());
 
     loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;

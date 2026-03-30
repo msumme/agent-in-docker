@@ -105,60 +105,27 @@ async fn main() -> Result<()> {
                 "dolt_port": dolt_port,
             });
 
-            let ws_url = format!("ws://localhost:{}", cfg.orchestrator_port);
-            match send_ws_command(&ws_url, "start_agent", payload).await {
-                Ok(response) => {
-                    let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if success {
-                        println!("==> Agent '{}' started by orchestrator", agent_name);
-                        println!("    Attach to agent:       tmux attach -t orchestrator");
-                        println!("    Orchestrator TUI:      tmux attach -t orchestrator");
-                    } else {
-                        let msg = response.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown error");
-                        // Fallback: start directly (orchestrator may not have AgentManager)
-                        eprintln!("==> Orchestrator couldn't start agent ({}), launching directly...", msg);
-                        let run_cfg = container::RunConfig {
-                            agent_name: agent_name.clone(),
-                            project_path: project_path.to_string_lossy().to_string(),
-                            agent_dir: agent_dir.to_string_lossy().to_string(),
-                            role,
-                            mode: mode.to_string(),
-                            prompt,
-                            orchestrator_port: cfg.orchestrator_port,
-                            mcp_port: cfg.mcp_port,
-                            dolt_port,
-                            image_name: cfg.image_name.clone(),
-                            network_name: cfg.network_name.clone(),
-                        };
-                        if mode == "long-running" {
-                            container::launch_long_running(&run_cfg)?;
-                        } else {
-                            container::launch_oneshot(&run_cfg)?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    // WS connection failed -- orchestrator might be old version, fall back
-                    eprintln!("==> WS command failed ({}), launching directly...", e);
-                    let run_cfg = container::RunConfig {
-                        agent_name: agent_name.clone(),
-                        project_path: project_path.to_string_lossy().to_string(),
-                        agent_dir: agent_dir.to_string_lossy().to_string(),
-                        role,
-                        mode: mode.to_string(),
-                        prompt,
-                        orchestrator_port: cfg.orchestrator_port,
-                        mcp_port: cfg.mcp_port,
-                        dolt_port,
-                        image_name: cfg.image_name.clone(),
-                        network_name: cfg.network_name.clone(),
-                    };
-                    if mode == "long-running" {
-                        container::launch_long_running(&run_cfg)?;
-                    } else {
-                        container::launch_oneshot(&run_cfg)?;
-                    }
-                }
+            // Launch container directly (CLI manages tmux + podman).
+            // The Rust entrypoint inside the container registers with the
+            // orchestrator via WS, making the agent visible in the TUI.
+            let run_cfg = container::RunConfig {
+                agent_name: agent_name.clone(),
+                project_path: project_path.to_string_lossy().to_string(),
+                agent_dir: agent_dir.to_string_lossy().to_string(),
+                role,
+                mode: mode.to_string(),
+                prompt,
+                orchestrator_port: cfg.orchestrator_port,
+                mcp_port: cfg.mcp_port,
+                dolt_port,
+                image_name: cfg.image_name.clone(),
+                network_name: cfg.network_name.clone(),
+            };
+
+            if mode == "long-running" {
+                container::launch_long_running(&run_cfg)?;
+            } else {
+                container::launch_oneshot(&run_cfg)?;
             }
 
             // Clean up ephemeral agent dir

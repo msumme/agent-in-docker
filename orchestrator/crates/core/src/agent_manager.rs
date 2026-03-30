@@ -120,6 +120,7 @@ impl AgentManager {
         let podman_cmd = self.container.build_run_command(cfg);
         let window_cmd = format!("{}; echo '[Agent exited. Press Enter to close.]'; read", podman_cmd);
 
+        // Create window FIRST -- if this fails, don't insert the agent
         self.tmux.create_window(&self.tmux_session, &cfg.name, &window_cmd)?;
 
         let agent = ManagedAgent {

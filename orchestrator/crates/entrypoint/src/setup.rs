@@ -88,6 +88,10 @@ pub fn configure_beads() -> Result<()> {
 
 /// Write MCP config file pointing to the orchestrator's HTTP MCP server.
 pub fn write_mcp_config(mcp_port: &str, agent_name: &str, agent_role: &str) -> Result<()> {
+    write_mcp_config_to("/tmp/mcp-config.json", mcp_port, agent_name, agent_role)
+}
+
+pub fn write_mcp_config_to(path: &str, mcp_port: &str, agent_name: &str, agent_role: &str) -> Result<()> {
     let url = format!("http://host.containers.internal:{}/mcp", mcp_port);
     let config = serde_json::json!({
         "mcpServers": {
@@ -101,7 +105,7 @@ pub fn write_mcp_config(mcp_port: &str, agent_name: &str, agent_role: &str) -> R
             }
         }
     });
-    std::fs::write("/tmp/mcp-config.json", serde_json::to_string_pretty(&config)?)?;
+    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
     Ok(())
 }
 
@@ -128,20 +132,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("mcp-config.json");
 
-        // Can't write to /tmp/mcp-config.json in tests, so test the JSON generation
-        let url = format!("http://host.containers.internal:{}/mcp", "9801");
-        let config = serde_json::json!({
-            "mcpServers": {
-                "agent-bridge": {
-                    "type": "http",
-                    "url": url,
-                    "headers": { "X-Agent-Name": "test" }
-                }
-            }
-        });
-        let json = serde_json::to_string_pretty(&config).unwrap();
-        assert!(json.contains("9801"));
-        assert!(json.contains("X-Agent-Name"));
+        write_mcp_config_to(path.to_str().unwrap(), "9801", "TestBot", "review-agent").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("9801"));
+        assert!(content.contains("X-Agent-Name"));
+        assert!(content.contains("TestBot"));
+        assert!(content.contains("X-Agent-Role"));
+        assert!(content.contains("review-agent"));
     }
 
     #[test]

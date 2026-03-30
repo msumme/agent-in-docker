@@ -30,10 +30,10 @@ pub fn build_image(cfg: &Config) -> Result<()> {
         .args([
             "build",
             "-f",
-            cfg.containerfile.to_str().unwrap(),
+            &cfg.containerfile.to_string_lossy(),
             "-t",
             &cfg.image_name,
-            cfg.project_root.to_str().unwrap(),
+            &cfg.project_root.to_string_lossy(),
         ])
         .status()
         .context("Failed to build container image")?;

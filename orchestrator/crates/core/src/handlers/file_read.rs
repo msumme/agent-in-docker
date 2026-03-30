@@ -7,10 +7,12 @@ pub fn read_file(path: &str) -> Result<String, String> {
     if !p.exists() {
         return Err(format!("File not found: {}", path));
     }
-    if !p.is_file() {
+    // Resolve symlinks to prevent traversal attacks
+    let canonical = p.canonicalize().map_err(|e| format!("Cannot resolve path '{}': {}", path, e))?;
+    if !canonical.is_file() {
         return Err(format!("Not a file: {}", path));
     }
-    std::fs::read_to_string(p).map_err(|e| format!("Failed to read '{}': {}", path, e))
+    std::fs::read_to_string(&canonical).map_err(|e| format!("Failed to read '{}': {}", path, e))
 }
 
 #[cfg(test)]

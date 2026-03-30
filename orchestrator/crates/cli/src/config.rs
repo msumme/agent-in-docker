@@ -22,7 +22,7 @@ impl Config {
         let exe = std::env::current_exe().context("Cannot determine executable path")?;
         // The binary lives at orchestrator/target/debug/agent or similar.
         // Walk up to find the project root (contains Containerfile).
-        let mut dir = exe.parent().unwrap().to_path_buf();
+        let mut dir = exe.parent().context("Cannot determine executable parent directory")?.to_path_buf();
         loop {
             if dir.join("Containerfile").exists() {
                 break;

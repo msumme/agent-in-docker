@@ -18,7 +18,9 @@ use orchestrator_core::types::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let log_file = std::fs::File::create("/tmp/orchestrator.log")?;
+    // Truncate log on each startup to prevent unbounded growth
+    let log_path = std::env::temp_dir().join("orchestrator.log");
+    let log_file = std::fs::File::create(&log_path)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .with_writer(log_file)

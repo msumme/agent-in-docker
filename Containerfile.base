@@ -30,10 +30,14 @@ RUN ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/') && \
 # Workspace
 RUN mkdir -p /workspace && chown node:node /workspace
 
-# Copy entrypoint
+# Copy Rust entrypoint binary (cross-compiled for musl)
+COPY orchestrator/target/release/entrypoint /opt/entrypoint
+RUN chmod +x /opt/entrypoint
+
+# Keep bash entrypoint as fallback
 COPY scripts/entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh
 
 WORKDIR /workspace
 
-ENTRYPOINT ["/opt/entrypoint.sh"]
+ENTRYPOINT ["/opt/entrypoint"]

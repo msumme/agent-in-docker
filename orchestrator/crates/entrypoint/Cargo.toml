@@ -1,0 +1,18 @@
+[package]
+name = "agent-entrypoint"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "entrypoint"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "process", "signal"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

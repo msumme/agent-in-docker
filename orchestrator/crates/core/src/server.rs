@@ -11,6 +11,28 @@ use tracing::{error, info, warn};
 use crate::mcp::AgentRegistry;
 use crate::types::*;
 
+/// Executes approved requests (file reads, git pushes). Injectable for testing.
+pub trait RequestExecutor: Send + Sync {
+    fn execute_file_read(&self, path: &str) -> Result<String, String>;
+    fn execute_git_push(&self, workspace: &str, remote: &str, branch: &str) -> Result<String, String>;
+    fn current_branch(&self, workspace: &str) -> Result<String, String>;
+}
+
+/// Real executor using file I/O and git commands.
+pub struct RealRequestExecutor;
+
+impl RequestExecutor for RealRequestExecutor {
+    fn execute_file_read(&self, path: &str) -> Result<String, String> {
+        crate::handlers::file_read::read_file(path)
+    }
+    fn execute_git_push(&self, workspace: &str, remote: &str, branch: &str) -> Result<String, String> {
+        crate::handlers::git_push::git_push(workspace, remote, branch)
+    }
+    fn current_branch(&self, workspace: &str) -> Result<String, String> {
+        crate::handlers::git_push::current_branch(workspace)
+    }
+}
+
 type AgentSender = mpsc::UnboundedSender<String>;
 
 struct ConnectedAgent {
@@ -41,6 +63,7 @@ pub struct ServerState {
     pending_requests: HashMap<String, PendingRequest>,
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     id_gen: Arc<dyn IdGenerator>,
+    executor: Arc<dyn RequestExecutor>,
 }
 
 impl ServerState {
@@ -53,6 +76,7 @@ impl ServerState {
             pending_requests: HashMap::new(),
             event_tx,
             id_gen,
+            executor: Arc::new(RealRequestExecutor),
         }
     }
 
@@ -239,7 +263,7 @@ impl ServerState {
                     let path = pending.payload.get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    match crate::handlers::file_read::read_file(path) {
+                    match self.executor.execute_file_read(path) {
                         Ok(content) => (
                             "file_read_response",
                             serde_json::json!({"content": content}),
@@ -261,13 +285,13 @@ impl ServerState {
                         .unwrap_or_default();
 
                     let branch = if branch.is_empty() {
-                        crate::handlers::git_push::current_branch(&workspace)
+                        self.executor.current_branch(&workspace)
                             .unwrap_or_else(|_| "main".into())
                     } else {
                         branch.to_string()
                     };
 
-                    match crate::handlers::git_push::git_push(&workspace, remote, &branch) {
+                    match self.executor.execute_git_push(&workspace, remote, &branch) {
                         Ok(output) => (
                             "git_push_response",
                             serde_json::json!({"success": true, "output": output}),

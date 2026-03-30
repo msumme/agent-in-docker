@@ -20,6 +20,7 @@ pub struct PendingRequest {
 
 pub struct App {
     pub agents: Vec<AgentInfo>,
+    pub managed_agents: Vec<orchestrator_core::types::ManagedAgent>,
     pub pending_requests: Vec<PendingRequest>,
     pub completed_log: Vec<String>,
     pub focus: FocusPanel,
@@ -35,6 +36,7 @@ impl App {
     pub fn new(cmd_tx: mpsc::UnboundedSender<TuiCommand>, mcp_state: Arc<McpState>) -> Self {
         Self {
             agents: Vec::new(),
+            managed_agents: Vec::new(),
             pending_requests: Vec::new(),
             completed_log: Vec::new(),
             focus: FocusPanel::Requests,
@@ -94,6 +96,12 @@ impl App {
                     "[{}] status: {} - {}",
                     agent.name, agent.status, agent.last_activity
                 ));
+                // Update or insert in managed agents list
+                if let Some(existing) = self.managed_agents.iter_mut().find(|a| a.name == agent.name) {
+                    *existing = agent;
+                } else {
+                    self.managed_agents.push(agent);
+                }
             }
         }
     }

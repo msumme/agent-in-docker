@@ -44,7 +44,10 @@ cat > /tmp/mcp-config.json <<MCPEOF
   "mcpServers": {
     "agent-bridge": {
       "type": "http",
-      "url": "http://host.containers.internal:${MCP_PORT}/mcp"
+      "url": "http://host.containers.internal:${MCP_PORT}/mcp",
+      "headers": {
+        "X-Agent-Name": "${AGENT_NAME}"
+      }
     }
   }
 }

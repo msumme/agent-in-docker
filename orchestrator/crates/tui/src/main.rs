@@ -37,11 +37,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MCP HTTP state (shared with TUI for resolving pending requests)
     let mcp_state = Arc::new(McpState::new(event_tx.clone()));
 
-    // Start WebSocket server (with MCP state for agent registry)
+    // Create agent manager
+    let agent_mgr = Arc::new(std::sync::Mutex::new(
+        orchestrator_core::agent_manager::AgentManager::new(
+            "orchestrator".into(),
+            Box::new(orchestrator_core::agent_manager::RealTmuxOps),
+            Box::new(orchestrator_core::agent_manager::RealContainerOps),
+        ),
+    ));
+
+    // Start WebSocket server (with MCP state and agent manager)
     let server_addr = addr.clone();
     let mcp_for_server = mcp_state.clone();
+    let mgr_for_server = agent_mgr.clone();
     tokio::spawn(async move {
-        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server)).await {
+        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server)).await {
             tracing::error!("Server error: {}", e);
         }
     });

@@ -210,8 +210,14 @@ fn sse_response(resp: &JsonRpcResponse) -> impl IntoResponse {
 
 async fn handle_mcp(
     State(state): State<Arc<McpState>>,
+    headers: axum::http::HeaderMap,
     body: String,
 ) -> impl IntoResponse {
+    let agent_name = headers
+        .get("x-agent-name")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
     let req: JsonRpcRequest = match serde_json::from_str(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -229,7 +235,7 @@ async fn handle_mcp(
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(id),
         "tools/list" => handle_tools_list(&state, id),
-        "tools/call" => handle_tools_call(&state, id, req.params).await,
+        "tools/call" => handle_tools_call(&state, id, req.params, &agent_name).await,
         "notifications/initialized" => {
             // Client notification, no response needed
             return (StatusCode::NO_CONTENT, "").into_response();
@@ -267,6 +273,7 @@ async fn handle_tools_call(
     state: &McpState,
     id: Value,
     params: Value,
+    agent_name: &str,
 ) -> JsonRpcResponse {
     let tool_name = params
         .get("name")
@@ -348,8 +355,8 @@ async fn handle_tools_call(
 
     // Emit event to TUI
     let _ = state.event_tx.send(OrchestratorEvent::RequestReceived {
-        agent_id: "mcp-http".into(),
-        agent_name: "mcp-client".into(),
+        agent_id: format!("mcp-{}", agent_name),
+        agent_name: agent_name.to_string(),
         request_id: request_id.clone(),
         request_type: request_type.into(),
         payload: payload.clone(),

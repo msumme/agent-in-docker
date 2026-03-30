@@ -386,8 +386,9 @@ pub async fn run(
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
     cmd_rx: mpsc::UnboundedReceiver<TuiCommand>,
     mcp_state: Option<Arc<crate::mcp::McpState>>,
+    agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state).await
+    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state, agent_mgr).await
 }
 
 pub async fn run_with_id_gen(
@@ -396,6 +397,7 @@ pub async fn run_with_id_gen(
     mut cmd_rx: mpsc::UnboundedReceiver<TuiCommand>,
     id_gen: Arc<dyn IdGenerator>,
     mcp_state: Option<Arc<crate::mcp::McpState>>,
+    agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -452,11 +454,16 @@ pub async fn run_with_id_gen(
         let (stream, addr) = listener.accept().await?;
         info!("New TCP connection from {}", addr);
         let state = state.clone();
-        tokio::spawn(handle_connection(stream, state));
+        let mgr = agent_mgr.clone();
+        tokio::spawn(handle_connection(stream, state, mgr));
     }
 }
 
-async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
+async fn handle_connection(
+    stream: TcpStream,
+    state: Arc<Mutex<ServerState>>,
+    agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
+) {
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -530,6 +537,13 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
                 let _ = out_tx.send(serde_json::to_string(&ack).unwrap());
 
                 agent_id = Some(id.clone());
+
+                // Notify agent manager that this agent connected
+                if let Some(ref mgr) = agent_mgr {
+                    let mut m = mgr.lock().unwrap();
+                    m.agent_registered(&payload.name, &id);
+                }
+
                 info!("Agent registered: {} ({})", payload.name, id);
             }
 
@@ -556,13 +570,92 @@ async fn handle_connection(stream: TcpStream, state: Arc<Mutex<ServerState>>) {
                 }
             }
 
+            "start_agent" => {
+                let payload: StartAgentPayload = match serde_json::from_value(message.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("Invalid start_agent payload: {}", e);
+                        let err = Message {
+                            id: message.id.clone(),
+                            msg_type: "start_agent_ack".into(),
+                            from: "orchestrator".into(),
+                            to: None,
+                            payload: serde_json::json!({"success": false, "message": format!("Invalid payload: {}", e)}),
+                        };
+                        let _ = out_tx.send(serde_json::to_string(&err).unwrap());
+                        continue;
+                    }
+                };
+                let result = if let Some(ref mgr) = agent_mgr {
+                    let mut m = mgr.lock().unwrap();
+                    m.start_agent(&payload)
+                } else {
+                    Err("Agent manager not available".into())
+                };
+                let ack = Message {
+                    id: message.id.clone(),
+                    msg_type: "start_agent_ack".into(),
+                    from: "orchestrator".into(),
+                    to: None,
+                    payload: match result {
+                        Ok(agent) => serde_json::json!({"success": true, "agent": agent}),
+                        Err(e) => serde_json::json!({"success": false, "message": e}),
+                    },
+                };
+                let _ = out_tx.send(serde_json::to_string(&ack).unwrap());
+                info!("start_agent: {}", payload.name);
+            }
+
+            "stop_agent" => {
+                let name = message.payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let result = if let Some(ref mgr) = agent_mgr {
+                    let mut m = mgr.lock().unwrap();
+                    m.stop_agent(name)
+                } else {
+                    Err("Agent manager not available".into())
+                };
+                let ack = Message {
+                    id: message.id.clone(),
+                    msg_type: "stop_agent_ack".into(),
+                    from: "orchestrator".into(),
+                    to: None,
+                    payload: match result {
+                        Ok(()) => serde_json::json!({"success": true}),
+                        Err(e) => serde_json::json!({"success": false, "message": e}),
+                    },
+                };
+                let _ = out_tx.send(serde_json::to_string(&ack).unwrap());
+            }
+
+            "list_managed" => {
+                let agents = if let Some(ref mgr) = agent_mgr {
+                    let m = mgr.lock().unwrap();
+                    m.list_agents()
+                } else {
+                    vec![]
+                };
+                let resp = Message {
+                    id: message.id.clone(),
+                    msg_type: "list_managed_response".into(),
+                    from: "orchestrator".into(),
+                    to: None,
+                    payload: serde_json::json!({"agents": agents}),
+                };
+                let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+            }
+
             other => {
                 warn!("Unknown message type from agent: {}", other);
             }
         }
     }
 
+    // Update agent manager on disconnect
     if let Some(ref id) = agent_id {
+        if let Some(ref mgr) = agent_mgr {
+            let mut m = mgr.lock().unwrap();
+            m.agent_disconnected(id);
+        }
         let mut s = state.lock().await;
         s.remove_agent(id);
         info!("Agent disconnected: {}", id);
@@ -774,7 +867,7 @@ mod tests {
         let id_gen = Arc::new(SequentialIdGenerator::new());
         let addr_str = addr.to_string();
         tokio::spawn(async move {
-            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None).await;
+            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None, None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

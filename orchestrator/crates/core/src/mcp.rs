@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::permissions::PermissionResult;
 use crate::types::{OrchestratorEvent, PeerInfo};
 
 /// JSON-RPC 2.0 request.
@@ -69,6 +70,19 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+/// Injectable permission checker for MCP tool calls.
+pub trait PermissionCheck: Send + Sync {
+    fn check_file_read(&self, role: &str, path: &str) -> PermissionResult;
+    fn check_git_push(&self, role: &str, remote: &str) -> PermissionResult;
+}
+
+/// No-op permission checker that allows everything (needs TUI approval anyway).
+pub struct AllowAllPermissions;
+impl PermissionCheck for AllowAllPermissions {
+    fn check_file_read(&self, _role: &str, _path: &str) -> PermissionResult { PermissionResult::NeedsApproval }
+    fn check_git_push(&self, _role: &str, _remote: &str) -> PermissionResult { PermissionResult::NeedsApproval }
+}
+
 /// Injectable registry for querying connected agents.
 pub trait AgentRegistry: Send + Sync {
     fn list_agents(&self) -> Vec<PeerInfo>;
@@ -90,6 +104,7 @@ pub struct McpState {
     pub pending: Mutex<std::collections::HashMap<String, oneshot::Sender<Value>>>,
     pub tools: Vec<ToolDef>,
     pub registry: Mutex<Box<dyn AgentRegistry>>,
+    pub permissions: Mutex<Box<dyn PermissionCheck>>,
 }
 
 impl McpState {
@@ -99,11 +114,16 @@ impl McpState {
             pending: Mutex::new(std::collections::HashMap::new()),
             tools: default_tools(),
             registry: Mutex::new(Box::new(NoOpRegistry)),
+            permissions: Mutex::new(Box::new(AllowAllPermissions)),
         }
     }
 
     pub fn set_registry(&self, registry: Box<dyn AgentRegistry>) {
         *self.registry.lock().unwrap() = registry;
+    }
+
+    pub fn set_permissions(&self, checker: Box<dyn PermissionCheck>) {
+        *self.permissions.lock().unwrap() = checker;
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
@@ -256,6 +276,32 @@ async fn handle_tools_call(
         .get("arguments")
         .cloned()
         .unwrap_or(json!({}));
+
+    // Check permissions for file_read and git_push (block scoped to drop guard before await)
+    {
+        let agent_role = "code-agent"; // TODO: extract from X-Agent-Role header
+        let perms = state.permissions.lock().unwrap();
+        let denied = match tool_name {
+            "read_host_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                match perms.check_file_read(agent_role, path) {
+                    PermissionResult::Deny(reason) => Some(reason),
+                    _ => None,
+                }
+            }
+            "git_push" => {
+                let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+                match perms.check_git_push(agent_role, remote) {
+                    PermissionResult::Deny(reason) => Some(reason),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(reason) = denied {
+            return JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": format!("Permission denied: {}", reason)}], "isError": true}));
+        }
+    }
 
     let (request_type, payload) = match tool_name {
         "ask_user" => {

@@ -46,7 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start HTTP MCP server on port 9801 (separate from WS on 9800)
     let mcp_app = mcp_router(mcp_state.clone());
-    let http_addr = addr.replace(":9800", ":9801").replace(":0", ":0");
+    // MCP HTTP port = WS port + 1
+    let ws_port: u16 = addr.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9800);
+    let http_addr = format!("0.0.0.0:{}", ws_port + 1);
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
         tracing::info!("MCP HTTP server listening on {}", http_addr);

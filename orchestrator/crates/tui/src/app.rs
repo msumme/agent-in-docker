@@ -167,15 +167,18 @@ impl App {
             req.agent_name, req.request_type, req.question
         ));
 
-        // For MCP requests, execute the action and resolve directly
+        // For MCP requests, execute the file read and resolve directly.
+        // For WS requests, the server handles execution via ApproveRequest.
         if req.request_type == "file_read" {
             let payload = match orchestrator_core::handlers::file_read::read_file(&req.question) {
                 Ok(content) => json!({"content": content}),
                 Err(e) => json!({"code": "READ_FAILED", "message": e}),
             };
+            // Try MCP first (HTTP requests)
             self.resolve_mcp(&req.request_id, payload);
         }
 
+        // Also send to WS server for WS-connected agents
         let _ = self.cmd_tx.send(TuiCommand::ApproveRequest {
             request_id: req.request_id,
         });

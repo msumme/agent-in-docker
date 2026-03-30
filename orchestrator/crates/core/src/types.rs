@@ -167,3 +167,109 @@ pub enum TuiCommand {
     },
     Shutdown,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn message_serialization_roundtrip() {
+        let msg = Message {
+            id: "test-1".into(),
+            msg_type: "user_prompt".into(),
+            from: "agent-1".into(),
+            to: Some("orchestrator".into()),
+            payload: json!({"question": "What color?"}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "test-1");
+        assert_eq!(parsed.msg_type, "user_prompt");
+        assert_eq!(parsed.payload["question"], "What color?");
+    }
+
+    #[test]
+    fn message_without_to_omits_field() {
+        let msg = Message {
+            id: "1".into(),
+            msg_type: "register".into(),
+            from: "pending".into(),
+            to: None,
+            payload: json!({}),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("\"to\""));
+    }
+
+    #[test]
+    fn register_payload_roundtrip() {
+        let p = RegisterPayload { name: "bob".into(), role: "code-agent".into(), workspace_path: Some("/ws".into()) };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: RegisterPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "bob");
+        assert_eq!(parsed.workspace_path.as_deref(), Some("/ws"));
+    }
+
+    #[test]
+    fn register_payload_missing_workspace() {
+        let json = r#"{"name":"alice","role":"review-agent"}"#;
+        let parsed: RegisterPayload = serde_json::from_str(json).unwrap();
+        assert!(parsed.workspace_path.is_none());
+    }
+
+    #[test]
+    fn agent_status_display() {
+        assert_eq!(AgentStatus::Starting.to_string(), "starting");
+        assert_eq!(AgentStatus::Working.to_string(), "working");
+        assert_eq!(AgentStatus::Exited.to_string(), "exited");
+    }
+
+    #[test]
+    fn managed_agent_serialization() {
+        let agent = ManagedAgent {
+            name: "alice".into(),
+            role: "code-agent".into(),
+            mode: "long-running".into(),
+            status: AgentStatus::Connected,
+            tmux_window: "alice".into(),
+            container_name: "alice".into(),
+            project_path: "/workspace".into(),
+            prompt: "hi".into(),
+            ws_agent_id: Some("ws-1".into()),
+            last_activity: "connected".into(),
+        };
+        let json = serde_json::to_string(&agent).unwrap();
+        let parsed: ManagedAgent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.status, AgentStatus::Connected);
+        assert_eq!(parsed.ws_agent_id.as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn start_agent_payload_roundtrip() {
+        let p = StartAgentPayload {
+            name: "test".into(),
+            role: "code-agent".into(),
+            mode: "oneshot".into(),
+            project_path: "/tmp".into(),
+            prompt: "hi".into(),
+            agent_dir: "/a".into(),
+            image_name: "img".into(),
+            network_name: "net".into(),
+            orchestrator_port: 9800,
+            mcp_port: 9801,
+            dolt_port: Some(3307),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let parsed: StartAgentPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.dolt_port, Some(3307));
+    }
+
+    #[test]
+    fn git_push_payload_defaults() {
+        let json = r#"{}"#;
+        let parsed: GitPushPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.remote, "origin");
+        assert_eq!(parsed.branch, "");
+    }
+}

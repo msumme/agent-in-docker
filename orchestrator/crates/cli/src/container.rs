@@ -184,8 +184,18 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     println!("    Switch:      Ctrl-b n (next) / Ctrl-b p (prev)");
     println!("    Detach:      Ctrl-b d");
 
-    // Auto-accept dialogs (blocks until done)
-    auto_accept_dialogs(&cfg.agent_name, &cfg.prompt);
+    // Auto-accept bypass permissions dialog and send initial prompt.
+    // Spawn a detached shell script that polls tmux and sends keystrokes.
+    // This survives the CLI process exiting.
+    let target = format!("orchestrator:{}", cfg.agent_name);
+    let prompt_escaped = cfg.prompt.replace('\'', "'\\''");
+    let script = format!(
+        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{}' Down; sleep 1; tmux send-keys -t '{}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -n '{}' ]; then sleep 3; tmux send-keys -t '{}' '{}' Enter; fi"#,
+        target, target, target, cfg.prompt, target, prompt_escaped
+    );
+    let _ = Command::new("sh")
+        .args(["-c", &format!("({}) &", script)])
+        .spawn();
 
     Ok(())
 }

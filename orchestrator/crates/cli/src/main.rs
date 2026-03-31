@@ -83,6 +83,7 @@ fn main() -> Result<()> {
                 agent_name: agent_name.clone(),
                 project_path: project_path.to_string_lossy().to_string(),
                 agent_dir: agent_dir.to_string_lossy().to_string(),
+                seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
                 role,
                 mode: mode.to_string(),
                 prompt,

@@ -67,6 +67,7 @@ impl ContainerOps for RealContainerOps {
             "--cap-add=DAC_OVERRIDE".to_string(),  // Root writes to bind-mounted files
             format!("-v {}:/workspace:Z", cfg.project_path),
             format!("-v {}:/root/.claude:Z", cfg.agent_dir),
+            format!("-v {}:/root/.claude/.credentials.json:Z", cfg.seed_credentials),
             "-e IS_SANDBOX=1".to_string(),
             format!("-e ORCHESTRATOR_URL=ws://host.containers.internal:{}", cfg.orchestrator_port),
             format!("-e MCP_PORT={}", cfg.mcp_port),
@@ -288,6 +289,7 @@ mod tests {
             project_path: "/tmp/project".into(),
             prompt: "hello".into(),
             agent_dir: "/tmp/agent".into(),
+            seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
             orchestrator_port: 9800,

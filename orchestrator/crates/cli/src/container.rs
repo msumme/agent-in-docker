@@ -7,6 +7,7 @@ pub struct RunConfig {
     pub agent_name: String,
     pub project_path: String,
     pub agent_dir: String,
+    pub seed_credentials: String, // path to shared .credentials.json
     pub role: String,
     pub mode: String,
     pub prompt: String,
@@ -66,6 +67,9 @@ fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
         format!("{}:/workspace:Z", cfg.project_path),
         "-v".to_string(),
         format!("{}:/root/.claude:Z", cfg.agent_dir),
+        // Mount shared credentials over agent dir's copy so token refreshes are shared
+        "-v".to_string(),
+        format!("{}:/root/.claude/.credentials.json:Z", cfg.seed_credentials),
         "-e".to_string(),
         format!(
             "ORCHESTRATOR_URL=ws://host.containers.internal:{}",
@@ -260,6 +264,7 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: None,
+            seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };
@@ -285,6 +290,7 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: None,
+            seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
         };

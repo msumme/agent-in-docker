@@ -501,6 +501,7 @@ pub async fn run_with_id_gen(
                             project_path: cfg.project_root.to_string_lossy().to_string(),
                             prompt: String::new(),
                             agent_dir,
+                            seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
                             image_name: cfg.image_name.clone(),
                             network_name: cfg.network_name.clone(),
                             orchestrator_port: cfg.orchestrator_port,

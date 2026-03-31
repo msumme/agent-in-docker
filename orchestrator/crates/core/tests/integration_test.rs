@@ -68,7 +68,7 @@ async fn start_orchestrator() -> (
     let mcp_for_server = mcp_state.clone();
     tokio::spawn(async move {
         let _ = server::run_with_id_gen(
-            &ws_addr_clone, event_tx, cmd_rx, id_gen, Some(mcp_for_server), None,
+            &ws_addr_clone, event_tx, cmd_rx, id_gen, Some(mcp_for_server), None, None,
         ).await;
     });
 

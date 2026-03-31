@@ -51,6 +51,20 @@ impl Config {
             project_root: dir,
         })
     }
+
+    /// Convert to shared ProjectConfig for use with core setup functions.
+    pub fn to_project_config(&self, dolt_port: Option<u16>) -> orchestrator_core::project_config::ProjectConfig {
+        orchestrator_core::project_config::ProjectConfig {
+            project_root: self.project_root.clone(),
+            seed_dir: self.seed_dir.clone(),
+            agents_dir: self.agents_dir.clone(),
+            orchestrator_port: self.orchestrator_port,
+            mcp_port: self.mcp_port,
+            image_name: self.image_name.clone(),
+            network_name: self.network_name.clone(),
+            dolt_port,
+        }
+    }
 }
 
 /// Ensure credentials exist in the seed directory.

@@ -29,6 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:9800".to_string());
 
+    // Discover project config for agent setup
+    let project_root = std::env::current_dir().unwrap_or_default();
+    let project_config = Arc::new(orchestrator_core::project_config::ProjectConfig::from_root(project_root));
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
@@ -45,8 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_addr = addr.clone();
     let mcp_for_server = mcp_state.clone();
     let mgr_for_server = agent_mgr.clone();
+    let cfg_for_server = project_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server)).await {
+        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server), Some(cfg_for_server)).await {
             tracing::error!("Server error: {}", e);
         }
     });

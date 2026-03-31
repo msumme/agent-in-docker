@@ -407,8 +407,9 @@ pub async fn run(
     cmd_rx: mpsc::UnboundedReceiver<TuiCommand>,
     mcp_state: Option<Arc<crate::mcp::McpState>>,
     agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
+    project_cfg: Option<Arc<crate::project_config::ProjectConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state, agent_mgr).await
+    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state, agent_mgr, project_cfg).await
 }
 
 pub async fn run_with_id_gen(
@@ -418,6 +419,7 @@ pub async fn run_with_id_gen(
     id_gen: Arc<dyn IdGenerator>,
     mcp_state: Option<Arc<crate::mcp::McpState>>,
     agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
+    project_cfg: Option<Arc<crate::project_config::ProjectConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
@@ -440,6 +442,7 @@ pub async fn run_with_id_gen(
     let state_for_cmds = state.clone();
     let agent_mgr_for_cmds = agent_mgr.clone();
     let mcp_for_cmds = mcp_state.clone();
+    let cfg_for_cmds = project_cfg.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let mut s = state_for_cmds.lock().await;
@@ -482,19 +485,27 @@ pub async fn run_with_id_gen(
                     s.send_to_agent(&agent_id, &msg);
                 }
                 TuiCommand::StartNewAgent { name, role } => {
-                    if let Some(ref mgr) = agent_mgr_for_cmds {
+                    if let (Some(ref mgr), Some(ref cfg)) = (&agent_mgr_for_cmds, &cfg_for_cmds) {
+                        // Use shared setup logic to create agent dir with credentials
+                        let agent_dir = match crate::project_config::setup_agent_dir(cfg, &name, true) {
+                            Ok(dir) => dir.to_string_lossy().to_string(),
+                            Err(e) => {
+                                warn!("Failed to set up agent dir for '{}': {}", name, e);
+                                continue;
+                            }
+                        };
                         let payload = StartAgentPayload {
                             name: name.clone(),
                             role,
                             mode: "long-running".into(),
-                            project_path: std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
+                            project_path: cfg.project_root.to_string_lossy().to_string(),
                             prompt: String::new(),
-                            agent_dir: String::new(), // Will need config
-                            image_name: "agent-in-docker".into(),
-                            network_name: "agent-net".into(),
-                            orchestrator_port: 9800,
-                            mcp_port: 9801,
-                            dolt_port: None,
+                            agent_dir,
+                            image_name: cfg.image_name.clone(),
+                            network_name: cfg.network_name.clone(),
+                            orchestrator_port: cfg.orchestrator_port,
+                            mcp_port: cfg.mcp_port,
+                            dolt_port: cfg.dolt_port,
                         };
                         let mut m = mgr.lock().unwrap();
                         match m.start_agent(&payload) {
@@ -955,7 +966,7 @@ mod tests {
         let id_gen = Arc::new(SequentialIdGenerator::new());
         let addr_str = addr.to_string();
         tokio::spawn(async move {
-            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None, None).await;
+            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None, None, None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

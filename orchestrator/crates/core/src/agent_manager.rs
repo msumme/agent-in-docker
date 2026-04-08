@@ -15,6 +15,7 @@ pub trait ContainerOps: Send + Sync {
     fn build_run_command(&self, cfg: &StartAgentPayload) -> String;
     fn is_running(&self, container_name: &str) -> bool;
     fn stop(&self, container_name: &str) -> Result<(), String>;
+    fn ensure_network(&self, network_name: &str);
 }
 
 /// Real implementations using std::process::Command.
@@ -101,6 +102,12 @@ impl ContainerOps for RealContainerOps {
             .map_err(|e| format!("podman stop failed: {}", e))?;
         if status.success() { Ok(()) } else { Err("podman stop returned non-zero".into()) }
     }
+
+    fn ensure_network(&self, network_name: &str) {
+        let _ = std::process::Command::new("podman")
+            .args(["network", "create", network_name])
+            .output();
+    }
 }
 
 /// Manages agent lifecycles: start, stop, track status.
@@ -133,11 +140,28 @@ impl AgentManager {
             }
         }
 
+        self.container.ensure_network(&cfg.network_name);
         let podman_cmd = self.container.build_run_command(cfg);
         let window_cmd = format!("{}; echo '[Agent exited. Press Enter to close.]'; read", podman_cmd);
 
         // Create window FIRST -- if this fails, don't insert the agent
         self.tmux.create_window(&self.tmux_session, &cfg.name, &window_cmd)?;
+
+        // Spawn background shell to auto-accept the bypass permissions dialog.
+        // Writes the prompt to a temp file to avoid shell injection via special chars.
+        let target = format!("{}:{}", self.tmux_session, cfg.name);
+        let prompt_file = format!("/tmp/agent-prompt-{}.txt", cfg.name);
+        if !cfg.prompt.is_empty() {
+            let _ = std::fs::write(&prompt_file, &cfg.prompt);
+        }
+        let script = format!(
+            r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
+            t = target,
+            pf = prompt_file,
+        );
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("({}) &", script)])
+            .spawn();
 
         let agent = ManagedAgent {
             name: cfg.name.clone(),
@@ -271,6 +295,7 @@ mod tests {
         }
         fn is_running(&self, _name: &str) -> bool { true }
         fn stop(&self, _name: &str) -> Result<(), String> { Ok(()) }
+        fn ensure_network(&self, _name: &str) {}
     }
 
     fn make_manager() -> AgentManager {

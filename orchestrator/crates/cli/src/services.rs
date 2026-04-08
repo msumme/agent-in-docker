@@ -34,12 +34,13 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
     println!("==> Starting orchestrator on port {}...", cfg.orchestrator_port);
 
     let addr = format!("0.0.0.0:{}", cfg.orchestrator_port);
+    let project_root = cfg.project_root.to_string_lossy().to_string();
 
     if Command::new("tmux").arg("--version").output().is_ok() {
         let status = Command::new("tmux")
             .args([
                 "new-session", "-d", "-s", "orchestrator",
-                &format!("{} {}", cfg.orchestrator_bin.display(), addr),
+                &format!("{} {} {}", cfg.orchestrator_bin.display(), addr, project_root),
             ])
             .status()?;
 
@@ -60,6 +61,7 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
 
     let child = Command::new(&cfg.orchestrator_bin)
         .arg(&addr)
+        .arg(&project_root)
         .spawn()
         .context("Failed to start orchestrator")?;
 

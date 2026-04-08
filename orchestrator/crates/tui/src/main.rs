@@ -25,12 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(log_file)
         .init();
 
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:9800".to_string());
-
-    // Discover project config for agent setup
-    let project_root = std::env::current_dir().unwrap_or_default();
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "0.0.0.0:9800".to_string());
+    // Optional second arg: project root (defaults to current dir)
+    let project_root = args.next()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let project_config = Arc::new(orchestrator_core::project_config::ProjectConfig::from_root(project_root));
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();

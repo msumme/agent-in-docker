@@ -185,13 +185,16 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     println!("    Detach:      Ctrl-b d");
 
     // Auto-accept bypass permissions dialog and send initial prompt.
-    // Spawn a detached shell script that polls tmux and sends keystrokes.
-    // This survives the CLI process exiting.
+    // Write prompt to a temp file to avoid shell escaping issues.
     let target = format!("orchestrator:{}", cfg.agent_name);
-    let prompt_escaped = cfg.prompt.replace('\'', "'\\''");
+    let prompt_file = format!("/tmp/agent-prompt-{}.txt", cfg.agent_name);
+    if !cfg.prompt.is_empty() {
+        let _ = std::fs::write(&prompt_file, &cfg.prompt);
+    }
     let script = format!(
-        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{}' Down; sleep 1; tmux send-keys -t '{}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -n '{}' ]; then sleep 3; tmux send-keys -t '{}' '{}' Enter; fi"#,
-        target, target, target, cfg.prompt, target, prompt_escaped
+        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
+        t = target,
+        pf = prompt_file,
     );
     let _ = Command::new("sh")
         .args(["-c", &format!("({}) &", script)])

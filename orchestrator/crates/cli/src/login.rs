@@ -26,37 +26,21 @@ pub fn run_login(cfg: &Config) -> Result<()> {
         }
     }
 
-    // Run claude login interactively
+    // Run Claude Code interactively -- user types /login inside
+    println!("==> Starting Claude Code. Type /login to authenticate.");
     let status = Command::new("podman")
         .args([
             "run",
             "-it",
             "--rm",
             "--entrypoint",
-            "bash",
-            "-w",
-            "/tmp",
+            "claude",
+            "-e", "IS_SANDBOX=1",
+            "-w", "/tmp",
             "-v",
             &format!("{}:/root/.claude:Z", cfg.seed_dir.display()),
             &cfg.image_name,
-            "-c",
-            r#"
-                if [ -f ~/.claude/.claude.json ] && [ ! -f ~/.claude.json ]; then
-                    ln -s ~/.claude/.claude.json ~/.claude.json
-                fi
-                # Pre-accept trust for /tmp
-                if [ -f ~/.claude.json ]; then
-                    node -e "
-                      const fs = require('fs');
-                      const d = JSON.parse(fs.readFileSync(process.env.HOME + '/.claude.json'));
-                      if (!d.projects) d.projects = {};
-                      d.projects['/tmp'] = {hasTrustDialogAccepted: true};
-                      d.hasCompletedOnboarding = true;
-                      fs.writeFileSync(process.env.HOME + '/.claude.json', JSON.stringify(d));
-                    " 2>/dev/null || true
-                fi
-                claude
-            "#,
+            "--dangerously-skip-permissions",
         ])
         .status()
         .context("Failed to run login container")?;

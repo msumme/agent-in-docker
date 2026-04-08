@@ -105,6 +105,24 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Find the latest .claude.json backup file in a directory.
+pub fn find_latest_backup(dir: &Path) -> Result<Option<PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut backups: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".claude.json.backup.")
+        })
+        .map(|e| e.path())
+        .collect();
+    backups.sort();
+    Ok(backups.last().cloned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +171,29 @@ mod tests {
 
         let dir2 = setup_agent_dir(&cfg, "temp", false).unwrap();
         assert!(!dir2.join("extra").exists());
+    }
+
+    #[test]
+    fn find_latest_backup_returns_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".claude.json.backup.100"), "old").unwrap();
+        fs::write(dir.path().join(".claude.json.backup.200"), "new").unwrap();
+        fs::write(dir.path().join("other-file"), "ignore").unwrap();
+
+        let result = find_latest_backup(dir.path()).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().to_str().unwrap().contains("200"));
+    }
+
+    #[test]
+    fn find_latest_backup_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_latest_backup(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_latest_backup_missing_dir() {
+        assert!(find_latest_backup(Path::new("/nonexistent")).unwrap().is_none());
     }
 
     #[test]

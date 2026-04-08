@@ -2,21 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::process::Command;
 
 use crate::config::Config;
-
-pub struct RunConfig {
-    pub agent_name: String,
-    pub project_path: String,
-    pub agent_dir: String,
-    pub seed_credentials: String, // path to shared .credentials.json
-    pub role: String,
-    pub mode: String,
-    pub prompt: String,
-    pub orchestrator_port: u16,
-    pub mcp_port: u16,
-    pub dolt_port: Option<u16>,
-    pub image_name: String,
-    pub network_name: String,
-}
+use orchestrator_core::types::StartAgentPayload;
 
 pub fn image_exists(name: &str) -> Result<bool> {
     let status = Command::new("podman")
@@ -51,65 +37,9 @@ pub fn ensure_network(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn podman_run_args(cfg: &RunConfig) -> Vec<String> {
-    let mut args = vec![
-        "--rm".to_string(),
-        "--name".to_string(),
-        cfg.agent_name.clone(),
-        "--network".to_string(),
-        cfg.network_name.clone(),
-        // Security: drop all caps, add only what's needed
-        "--cap-drop=ALL".to_string(),
-        "--cap-add=NET_RAW".to_string(),      // DNS resolution
-        "--cap-add=DAC_OVERRIDE".to_string(),  // Root writes to bind-mounted files (host uid)
-        // Volumes
-        "-v".to_string(),
-        format!("{}:/workspace:Z", cfg.project_path),
-        "-v".to_string(),
-        format!("{}:/root/.claude:Z", cfg.agent_dir),
-        // Mount shared credentials over agent dir's copy so token refreshes are shared
-        "-v".to_string(),
-        format!("{}:/root/.claude/.credentials.json:Z", cfg.seed_credentials),
-        "-e".to_string(),
-        format!(
-            "ORCHESTRATOR_URL=ws://host.containers.internal:{}",
-            cfg.orchestrator_port
-        ),
-        "-e".to_string(),
-        format!("MCP_PORT={}", cfg.mcp_port),
-        "-e".to_string(),
-        format!("AGENT_NAME={}", cfg.agent_name),
-        "-e".to_string(),
-        format!("AGENT_ROLE={}", cfg.role),
-        "-e".to_string(),
-        format!("AGENT_MODE={}", cfg.mode),
-        "-e".to_string(),
-        format!("AGENT_PROMPT={}", cfg.prompt),
-        "-e".to_string(),
-        "IS_SANDBOX=1".to_string(),
-    ];
-
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        if !key.is_empty() {
-            args.extend_from_slice(&["-e".to_string(), format!("ANTHROPIC_API_KEY={}", key)]);
-        }
-    }
-
-    if let Some(port) = cfg.dolt_port {
-        args.extend_from_slice(&[
-            "-e".to_string(), "DOLT_HOST=host.containers.internal".to_string(),
-            "-e".to_string(), format!("DOLT_PORT={}", port),
-        ]);
-    }
-
-
-    args.push(cfg.image_name.clone());
-    args
-}
-
 /// Write a shell script that runs the podman command (for tmux to execute).
-fn write_run_script(cfg: &RunConfig, script_path: &str) -> Result<()> {
-    let args = podman_run_args(cfg);
+fn write_run_script(cfg: &StartAgentPayload, script_path: &str) -> Result<()> {
+    let args = cfg.container_run_args();
     let quoted_args: Vec<String> = args
         .iter()
         .map(|a| {
@@ -136,10 +66,10 @@ fn write_run_script(cfg: &RunConfig, script_path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
+pub fn launch_long_running(cfg: &StartAgentPayload) -> Result<()> {
     let script_path = format!(
         "{}/../run-{}.sh",
-        cfg.agent_dir, cfg.agent_name
+        cfg.agent_dir, cfg.name
     );
     write_run_script(cfg, &script_path)?;
 
@@ -157,7 +87,7 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     if has_session {
         let target = format!("{}:", tmux_session);
         let status = Command::new("tmux")
-            .args(["new-window", "-t", &target, "-n", &cfg.agent_name, &script_path])
+            .args(["new-window", "-t", &target, "-n", &cfg.name, &script_path])
             .status()?;
         if !status.success() {
             bail!("Failed to create tmux window");
@@ -170,7 +100,7 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
                 "-s",
                 tmux_session,
                 "-n",
-                &cfg.agent_name,
+                &cfg.name,
                 &script_path,
             ])
             .status()?;
@@ -179,23 +109,14 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
         }
     }
 
-    println!("==> Agent '{}' started", cfg.agent_name);
+    println!("==> Agent '{}' started", cfg.name);
     println!("    Attach:      tmux attach -t orchestrator");
     println!("    Switch:      Ctrl-b n (next) / Ctrl-b p (prev)");
     println!("    Detach:      Ctrl-b d");
 
     // Auto-accept bypass permissions dialog and send initial prompt.
-    // Write prompt to a temp file to avoid shell escaping issues.
-    let target = format!("orchestrator:{}", cfg.agent_name);
-    let prompt_file = format!("/tmp/agent-prompt-{}.txt", cfg.agent_name);
-    if !cfg.prompt.is_empty() {
-        let _ = std::fs::write(&prompt_file, &cfg.prompt);
-    }
-    let script = format!(
-        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
-        t = target,
-        pf = prompt_file,
-    );
+    let target = format!("orchestrator:{}", cfg.name);
+    let script = orchestrator_core::agent_manager::auto_accept_script(&target, &cfg.name, &cfg.prompt);
     let _ = Command::new("sh")
         .args(["-c", &format!("({}) &", script)])
         .spawn();
@@ -203,10 +124,10 @@ pub fn launch_long_running(cfg: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn launch_oneshot(cfg: &RunConfig) -> Result<()> {
+pub fn launch_oneshot(cfg: &StartAgentPayload) -> Result<()> {
     println!("==> Launching agent container...");
     let mut args = vec!["run".to_string(), "-it".to_string()];
-    args.extend(podman_run_args(cfg));
+    args.extend(cfg.container_run_args());
 
     let status = Command::new("podman")
         .args(&args)
@@ -219,56 +140,13 @@ pub fn launch_oneshot(cfg: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-fn auto_accept_dialogs(agent_name: &str, prompt: &str) {
-    let target = format!("orchestrator:{}", agent_name);
-
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        let pane = Command::new("tmux")
-            .args(["capture-pane", "-t", &target, "-p"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or_default();
-
-        if pane.contains("Yes, I accept") {
-            // Arrow down to "Yes, I accept" and press Enter
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "Down"])
-                .status();
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &target, "Enter"])
-                .status();
-            eprintln!("==> Auto-accepted bypass permissions dialog");
-            break;
-        }
-
-        if pane.contains("\u{256d}\u{2500}") {
-            // Claude Code prompt box -- no dialog to accept
-            break;
-        }
-    }
-
-    // Send initial prompt
-    if !prompt.is_empty() {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let _ = Command::new("tmux")
-            .args(["send-keys", "-t", &format!("orchestrator:{}", agent_name), prompt, "Enter"])
-            .status();
-        eprintln!("==> Sent initial prompt to agent");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn podman_run_args_contains_required_env() {
-        let cfg = RunConfig {
-            agent_name: "test".into(),
+    fn make_payload() -> StartAgentPayload {
+        StartAgentPayload {
+            name: "test".into(),
             project_path: "/tmp/project".into(),
             agent_dir: "/tmp/agent".into(),
             role: "code-agent".into(),
@@ -280,33 +158,27 @@ mod tests {
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
-        };
+        }
+    }
 
-        let args = podman_run_args(&cfg);
-        assert!(args.contains(&"AGENT_NAME=test".to_string()));
-        assert!(args.contains(&"AGENT_MODE=oneshot".to_string()));
-        assert!(args.contains(&"MCP_PORT=9801".to_string()));
-        assert!(args.contains(&"agent-in-docker".to_string()));
+    #[test]
+    fn container_run_args_contains_required_env() {
+        let cfg = make_payload();
+        let args = cfg.container_run_args();
+        assert!(args.iter().any(|a| a == "AGENT_NAME=test"));
+        assert!(args.iter().any(|a| a == "AGENT_MODE=oneshot"));
+        assert!(args.iter().any(|a| a == "MCP_PORT=9801"));
+        assert!(args.iter().any(|a| a == "agent-in-docker"));
     }
 
     #[test]
     fn write_run_script_creates_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("run.sh");
-        let cfg = RunConfig {
-            agent_name: "test".into(),
-            project_path: "/tmp/p".into(),
-            agent_dir: "/tmp/a".into(),
-            role: "code-agent".into(),
-            mode: "long-running".into(),
-            prompt: "hi there".into(),
-            orchestrator_port: 9800,
-            mcp_port: 9801,
-            dolt_port: None,
-            seed_credentials: "/tmp/creds.json".into(),
-            image_name: "agent-in-docker".into(),
-            network_name: "agent-net".into(),
-        };
+        let mut cfg = make_payload();
+        cfg.mode = "long-running".into();
+        cfg.prompt = "hi there".into();
+
         write_run_script(&cfg, script.to_str().unwrap()).unwrap();
 
         let content = std::fs::read_to_string(&script).unwrap();

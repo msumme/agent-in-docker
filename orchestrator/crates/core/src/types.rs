@@ -129,6 +129,62 @@ pub struct StartAgentPayload {
     pub dolt_port: Option<u16>,
 }
 
+impl StartAgentPayload {
+    /// Generate podman run arguments for this agent configuration.
+    /// Returns args to follow `podman run -it` (includes --rm through image name).
+    pub fn container_run_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "--rm".to_string(),
+            "--name".to_string(),
+            self.name.clone(),
+            "--network".to_string(),
+            self.network_name.clone(),
+            "--cap-drop=ALL".to_string(),
+            "--cap-add=NET_RAW".to_string(),
+            "--cap-add=DAC_OVERRIDE".to_string(),
+            "-v".to_string(),
+            format!("{}:/workspace:Z", self.project_path),
+            "-v".to_string(),
+            format!("{}:/root/.claude:Z", self.agent_dir),
+            "-v".to_string(),
+            format!("{}:/root/.claude/.credentials.json:Z", self.seed_credentials),
+            "-e".to_string(),
+            format!(
+                "ORCHESTRATOR_URL=ws://host.containers.internal:{}",
+                self.orchestrator_port
+            ),
+            "-e".to_string(),
+            format!("MCP_PORT={}", self.mcp_port),
+            "-e".to_string(),
+            format!("AGENT_NAME={}", self.name),
+            "-e".to_string(),
+            format!("AGENT_ROLE={}", self.role),
+            "-e".to_string(),
+            format!("AGENT_MODE={}", self.mode),
+            "-e".to_string(),
+            format!("AGENT_PROMPT={}", self.prompt),
+            "-e".to_string(),
+            "IS_SANDBOX=1".to_string(),
+        ];
+
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            if !key.is_empty() {
+                args.extend_from_slice(&["-e".to_string(), format!("ANTHROPIC_API_KEY={}", key)]);
+            }
+        }
+
+        if let Some(port) = self.dolt_port {
+            args.extend_from_slice(&[
+                "-e".to_string(), "DOLT_HOST=host.containers.internal".to_string(),
+                "-e".to_string(), format!("DOLT_PORT={}", port),
+            ]);
+        }
+
+        args.push(self.image_name.clone());
+        args
+    }
+}
+
 /// Events emitted by the core server to the frontend (TUI).
 #[derive(Debug, Clone)]
 pub enum OrchestratorEvent {
@@ -272,6 +328,52 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let parsed: StartAgentPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.dolt_port, Some(3307));
+    }
+
+    #[test]
+    fn container_run_args_has_required_fields() {
+        let p = StartAgentPayload {
+            name: "test".into(),
+            role: "code-agent".into(),
+            mode: "oneshot".into(),
+            project_path: "/tmp/project".into(),
+            prompt: "hi".into(),
+            agent_dir: "/tmp/agent".into(),
+            seed_credentials: "/tmp/creds.json".into(),
+            image_name: "agent-img".into(),
+            network_name: "agent-net".into(),
+            orchestrator_port: 9800,
+            mcp_port: 9801,
+            dolt_port: None,
+        };
+        let args = p.container_run_args();
+        assert!(args.iter().any(|a| a == "AGENT_NAME=test"));
+        assert!(args.iter().any(|a| a == "AGENT_MODE=oneshot"));
+        assert!(args.iter().any(|a| a == "MCP_PORT=9801"));
+        assert!(args.iter().any(|a| a == "IS_SANDBOX=1"));
+        assert!(args.iter().any(|a| a == "agent-img"));
+        assert!(args.iter().any(|a| a.contains("/workspace:Z")));
+    }
+
+    #[test]
+    fn container_run_args_includes_dolt_when_set() {
+        let p = StartAgentPayload {
+            name: "test".into(),
+            role: "code-agent".into(),
+            mode: "oneshot".into(),
+            project_path: "/tmp".into(),
+            prompt: String::new(),
+            agent_dir: "/tmp/a".into(),
+            seed_credentials: "/tmp/c.json".into(),
+            image_name: "img".into(),
+            network_name: "net".into(),
+            orchestrator_port: 9800,
+            mcp_port: 9801,
+            dolt_port: Some(3307),
+        };
+        let args = p.container_run_args();
+        assert!(args.iter().any(|a| a == "DOLT_PORT=3307"));
+        assert!(args.iter().any(|a| a == "DOLT_HOST=host.containers.internal"));
     }
 
     #[test]

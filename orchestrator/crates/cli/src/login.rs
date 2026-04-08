@@ -18,11 +18,9 @@ pub fn run_login(cfg: &Config) -> Result<()> {
     let claude_json = cfg.seed_dir.join(".claude.json");
     if !claude_json.exists() {
         let backups_dir = cfg.seed_dir.join("backups");
-        if backups_dir.exists() {
-            if let Some(backup) = find_latest_backup(&backups_dir)? {
-                std::fs::copy(&backup, &claude_json)?;
-                println!("==> Restored .claude.json from backup");
-            }
+        if let Some(backup) = orchestrator_core::project_config::find_latest_backup(&backups_dir)? {
+            std::fs::copy(&backup, &claude_json)?;
+            println!("==> Restored .claude.json from backup");
         }
     }
 
@@ -54,50 +52,4 @@ pub fn run_login(cfg: &Config) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn find_latest_backup(dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
-    let mut backups: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".claude.json.backup.")
-        })
-        .map(|e| e.path())
-        .collect();
-    backups.sort();
-    Ok(backups.last().cloned())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn find_latest_backup_returns_newest() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".claude.json.backup.100"), "old").unwrap();
-        std::fs::write(dir.path().join(".claude.json.backup.200"), "new").unwrap();
-        std::fs::write(dir.path().join("other-file"), "ignore").unwrap();
-
-        let result = find_latest_backup(dir.path()).unwrap();
-        assert!(result.is_some());
-        assert!(result.unwrap().to_str().unwrap().contains("200"));
-    }
-
-    #[test]
-    fn find_latest_backup_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = find_latest_backup(dir.path()).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn find_latest_backup_no_matching_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("random.txt"), "data").unwrap();
-        let result = find_latest_backup(dir.path()).unwrap();
-        assert!(result.is_none());
-    }
 }

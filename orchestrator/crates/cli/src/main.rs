@@ -5,6 +5,8 @@ mod services;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use orchestrator_core::project_config;
+use orchestrator_core::types::StartAgentPayload;
 
 #[derive(Parser)]
 #[command(name = "agent", about = "Run LLM agents in containers")]
@@ -66,9 +68,10 @@ fn main() -> Result<()> {
 
             println!("==> Agent: {} (role: {}, {})", agent_name, role, mode);
 
-            config::ensure_credentials(&cfg)?;
+            let pcfg = cfg.to_project_config(None);
+            project_config::ensure_credentials(&pcfg)?;
 
-            let agent_dir = config::setup_agent_dir(&cfg, &agent_name, named)?;
+            let agent_dir = project_config::setup_agent_dir(&pcfg, &agent_name, named)?;
 
             if build || !container::image_exists(&cfg.image_name)? {
                 println!("==> Building container image...");
@@ -79,8 +82,8 @@ fn main() -> Result<()> {
             services::ensure_orchestrator(&cfg)?;
             let dolt_port = services::ensure_dolt(&project_path)?;
 
-            let run_cfg = container::RunConfig {
-                agent_name: agent_name.clone(),
+            let payload = StartAgentPayload {
+                name: agent_name.clone(),
                 project_path: project_path.to_string_lossy().to_string(),
                 agent_dir: agent_dir.to_string_lossy().to_string(),
                 seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
@@ -95,9 +98,9 @@ fn main() -> Result<()> {
             };
 
             if mode == "long-running" {
-                container::launch_long_running(&run_cfg)?;
+                container::launch_long_running(&payload)?;
             } else {
-                container::launch_oneshot(&run_cfg)?;
+                container::launch_oneshot(&payload)?;
             }
 
             if !named {

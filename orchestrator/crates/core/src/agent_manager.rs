@@ -59,32 +59,8 @@ pub struct RealContainerOps;
 
 impl ContainerOps for RealContainerOps {
     fn build_run_command(&self, cfg: &StartAgentPayload) -> String {
-        let mut parts = vec![
-            "podman run -it --rm".to_string(),
-            format!("--name {}", cfg.name),
-            format!("--network {}", cfg.network_name),
-            "--cap-drop=ALL".to_string(),
-            "--cap-add=NET_RAW".to_string(),      // DNS resolution
-            "--cap-add=DAC_OVERRIDE".to_string(),  // Root writes to bind-mounted files
-            format!("-v {}:/workspace:Z", cfg.project_path),
-            format!("-v {}:/root/.claude:Z", cfg.agent_dir),
-            format!("-v {}:/root/.claude/.credentials.json:Z", cfg.seed_credentials),
-            "-e IS_SANDBOX=1".to_string(),
-            format!("-e ORCHESTRATOR_URL=ws://host.containers.internal:{}", cfg.orchestrator_port),
-            format!("-e MCP_PORT={}", cfg.mcp_port),
-            format!("-e AGENT_NAME={}", cfg.name),
-            format!("-e AGENT_ROLE={}", cfg.role),
-            format!("-e AGENT_MODE={}", cfg.mode),
-            format!("-e AGENT_PROMPT={}", cfg.prompt),
-        ];
-
-        if let Some(port) = cfg.dolt_port {
-            parts.push("-e DOLT_HOST=host.containers.internal".to_string());
-            parts.push(format!("-e DOLT_PORT={}", port));
-        }
-
-        parts.push(cfg.image_name.clone());
-        parts.join(" ")
+        let args = cfg.container_run_args();
+        format!("podman run -it {}", args.join(" "))
     }
 
     fn is_running(&self, container_name: &str) -> bool {
@@ -108,6 +84,20 @@ impl ContainerOps for RealContainerOps {
             .args(["network", "create", network_name])
             .output();
     }
+}
+
+/// Generate the shell script that auto-accepts the bypass permissions dialog
+/// and sends an initial prompt to an agent in a tmux pane.
+pub fn auto_accept_script(tmux_target: &str, agent_name: &str, prompt: &str) -> String {
+    let prompt_file = format!("/tmp/agent-prompt-{}.txt", agent_name);
+    if !prompt.is_empty() {
+        let _ = std::fs::write(&prompt_file, prompt);
+    }
+    format!(
+        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
+        t = tmux_target,
+        pf = prompt_file,
+    )
 }
 
 /// Manages agent lifecycles: start, stop, track status.
@@ -148,17 +138,8 @@ impl AgentManager {
         self.tmux.create_window(&self.tmux_session, &cfg.name, &window_cmd)?;
 
         // Spawn background shell to auto-accept the bypass permissions dialog.
-        // Writes the prompt to a temp file to avoid shell injection via special chars.
         let target = format!("{}:{}", self.tmux_session, cfg.name);
-        let prompt_file = format!("/tmp/agent-prompt-{}.txt", cfg.name);
-        if !cfg.prompt.is_empty() {
-            let _ = std::fs::write(&prompt_file, &cfg.prompt);
-        }
-        let script = format!(
-            r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
-            t = target,
-            pf = prompt_file,
-        );
+        let script = auto_accept_script(&target, &cfg.name, &cfg.prompt);
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("({}) &", script)])
             .spawn();

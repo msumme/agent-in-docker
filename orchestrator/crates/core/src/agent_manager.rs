@@ -18,6 +18,13 @@ pub trait ContainerOps: Send + Sync {
     fn ensure_network(&self, network_name: &str);
 }
 
+/// Abstraction over shell/filesystem operations needed by agent startup.
+/// Injectable for testing — prevents tests from writing to /tmp and spawning processes.
+pub trait ShellOps: Send + Sync {
+    fn write_prompt_file(&self, agent_name: &str, prompt: &str) -> Result<(), String>;
+    fn spawn_background_script(&self, script: &str) -> Result<(), String>;
+}
+
 /// Real implementations using std::process::Command.
 pub struct RealTmuxOps;
 
@@ -86,13 +93,27 @@ impl ContainerOps for RealContainerOps {
     }
 }
 
+pub struct RealShellOps;
+
+impl ShellOps for RealShellOps {
+    fn write_prompt_file(&self, agent_name: &str, prompt: &str) -> Result<(), String> {
+        let path = format!("/tmp/agent-prompt-{}.txt", agent_name);
+        std::fs::write(&path, prompt).map_err(|e| format!("write prompt file: {}", e))
+    }
+
+    fn spawn_background_script(&self, script: &str) -> Result<(), String> {
+        std::process::Command::new("sh")
+            .args(["-c", &format!("({}) &", script)])
+            .spawn()
+            .map_err(|e| format!("spawn script: {}", e))?;
+        Ok(())
+    }
+}
+
 /// Generate the shell script that auto-accepts the bypass permissions dialog
 /// and sends an initial prompt to an agent in a tmux pane.
-pub fn auto_accept_script(tmux_target: &str, agent_name: &str, prompt: &str) -> String {
+pub fn auto_accept_script(tmux_target: &str, agent_name: &str) -> String {
     let prompt_file = format!("/tmp/agent-prompt-{}.txt", agent_name);
-    if !prompt.is_empty() {
-        let _ = std::fs::write(&prompt_file, prompt);
-    }
     format!(
         r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
         t = tmux_target,
@@ -106,6 +127,7 @@ pub struct AgentManager {
     tmux_session: String,
     tmux: Box<dyn TmuxOps>,
     container: Box<dyn ContainerOps>,
+    shell: Box<dyn ShellOps>,
 }
 
 impl AgentManager {
@@ -113,12 +135,14 @@ impl AgentManager {
         tmux_session: String,
         tmux: Box<dyn TmuxOps>,
         container: Box<dyn ContainerOps>,
+        shell: Box<dyn ShellOps>,
     ) -> Self {
         Self {
             agents: HashMap::new(),
             tmux_session,
             tmux,
             container,
+            shell,
         }
     }
 
@@ -137,12 +161,13 @@ impl AgentManager {
         // Create window FIRST -- if this fails, don't insert the agent
         self.tmux.create_window(&self.tmux_session, &cfg.name, &window_cmd)?;
 
-        // Spawn background shell to auto-accept the bypass permissions dialog.
+        // Write prompt file and spawn auto-accept script via injected ShellOps.
+        if !cfg.prompt.is_empty() {
+            let _ = self.shell.write_prompt_file(&cfg.name, &cfg.prompt);
+        }
         let target = format!("{}:{}", self.tmux_session, cfg.name);
-        let script = auto_accept_script(&target, &cfg.name, &cfg.prompt);
-        let _ = std::process::Command::new("sh")
-            .args(["-c", &format!("({}) &", script)])
-            .spawn();
+        let script = auto_accept_script(&target, &cfg.name);
+        let _ = self.shell.spawn_background_script(&script);
 
         let agent = ManagedAgent {
             name: cfg.name.clone(),
@@ -247,7 +272,7 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     struct FakeTmux {
         windows: Mutex<Vec<(String, String, String)>>,
@@ -279,11 +304,61 @@ mod tests {
         fn ensure_network(&self, _name: &str) {}
     }
 
+    struct FakeShell {
+        prompt_files: Mutex<Vec<(String, String)>>,
+        scripts: Mutex<Vec<String>>,
+    }
+
+    impl FakeShell {
+        fn new() -> Self {
+            Self {
+                prompt_files: Mutex::new(Vec::new()),
+                scripts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ShellOps for FakeShell {
+        fn write_prompt_file(&self, agent_name: &str, prompt: &str) -> Result<(), String> {
+            self.prompt_files.lock().unwrap().push((agent_name.into(), prompt.into()));
+            Ok(())
+        }
+        fn spawn_background_script(&self, script: &str) -> Result<(), String> {
+            self.scripts.lock().unwrap().push(script.into());
+            Ok(())
+        }
+    }
+
+    fn make_shell() -> Arc<FakeShell> {
+        Arc::new(FakeShell::new())
+    }
+
+    fn make_manager_with_shell(shell: Arc<FakeShell>) -> AgentManager {
+        AgentManager::new(
+            "test-session".into(),
+            Box::new(FakeTmux::new()),
+            Box::new(FakeContainer),
+            Box::new(FakeShellWrapper(shell)),
+        )
+    }
+
+    // Wrapper so Arc<FakeShell> can be shared between test and manager
+    struct FakeShellWrapper(Arc<FakeShell>);
+    impl ShellOps for FakeShellWrapper {
+        fn write_prompt_file(&self, agent_name: &str, prompt: &str) -> Result<(), String> {
+            self.0.write_prompt_file(agent_name, prompt)
+        }
+        fn spawn_background_script(&self, script: &str) -> Result<(), String> {
+            self.0.spawn_background_script(script)
+        }
+    }
+
     fn make_manager() -> AgentManager {
         AgentManager::new(
             "test-session".into(),
             Box::new(FakeTmux::new()),
             Box::new(FakeContainer),
+            Box::new(FakeShell::new()),
         )
     }
 
@@ -398,5 +473,39 @@ mod tests {
     fn reattach_unknown_agent_fails() {
         let mut mgr = make_manager();
         assert!(mgr.reattach_agent("Nobody").is_err());
+    }
+
+    #[test]
+    fn start_agent_writes_prompt_file() {
+        let shell = make_shell();
+        let mut mgr = make_manager_with_shell(shell.clone());
+        mgr.start_agent(&make_payload("Alice")).unwrap();
+
+        let files = shell.prompt_files.lock().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], ("Alice".into(), "hello".into()));
+    }
+
+    #[test]
+    fn start_agent_spawns_accept_script() {
+        let shell = make_shell();
+        let mut mgr = make_manager_with_shell(shell.clone());
+        mgr.start_agent(&make_payload("Bob")).unwrap();
+
+        let scripts = shell.scripts.lock().unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("test-session:Bob"));
+    }
+
+    #[test]
+    fn start_agent_skips_prompt_file_when_empty() {
+        let shell = make_shell();
+        let mut mgr = make_manager_with_shell(shell.clone());
+        let mut payload = make_payload("Eve");
+        payload.prompt = String::new();
+        mgr.start_agent(&payload).unwrap();
+
+        let files = shell.prompt_files.lock().unwrap();
+        assert!(files.is_empty());
     }
 }

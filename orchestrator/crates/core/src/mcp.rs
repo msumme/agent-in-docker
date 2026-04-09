@@ -111,22 +111,21 @@ pub struct McpState {
 }
 
 impl McpState {
-    pub fn new(event_tx: mpsc::UnboundedSender<OrchestratorEvent>) -> Self {
+    pub fn new(
+        event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+        permissions: Box<dyn PermissionCheck>,
+    ) -> Self {
         Self {
             event_tx,
             pending: Mutex::new(std::collections::HashMap::new()),
             tools: default_tools(),
             registry: Mutex::new(Box::new(NoOpRegistry)),
-            permissions: Mutex::new(Box::new(AllowAllPermissions)),
+            permissions: Mutex::new(permissions),
         }
     }
 
     pub fn set_registry(&self, registry: Box<dyn AgentRegistry>) {
         *self.registry.lock().unwrap() = registry;
-    }
-
-    pub fn set_permissions(&self, checker: Box<dyn PermissionCheck>) {
-        *self.permissions.lock().unwrap() = checker;
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
@@ -476,7 +475,7 @@ mod tests {
     #[test]
     fn tools_list_returns_all_tools() {
         let (event_tx, _) = mpsc::unbounded_channel();
-        let state = McpState::new(event_tx);
+        let state = McpState::new(event_tx, Box::new(AllowAllPermissions));
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -491,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_state_resolve_pending() {
         let (event_tx, _) = mpsc::unbounded_channel();
-        let state = McpState::new(event_tx);
+        let state = McpState::new(event_tx, Box::new(AllowAllPermissions));
 
         let (tx, rx) = oneshot::channel();
         {
@@ -509,14 +508,14 @@ mod tests {
     #[tokio::test]
     async fn mcp_state_resolve_nonexistent_returns_false() {
         let (event_tx, _) = mpsc::unbounded_channel();
-        let state = McpState::new(event_tx);
+        let state = McpState::new(event_tx, Box::new(AllowAllPermissions));
         assert!(!        state.resolve("nonexistent", json!({})));
     }
 
     #[tokio::test]
     async fn integration_http_initialize() {
         let (event_tx, _) = mpsc::unbounded_channel();
-        let state = Arc::new(McpState::new(event_tx));
+        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
         let app = mcp_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -545,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn integration_tools_call_with_resolution() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let state = Arc::new(McpState::new(event_tx));
+        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
         let app = mcp_router(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

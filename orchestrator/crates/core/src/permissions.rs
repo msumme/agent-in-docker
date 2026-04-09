@@ -201,6 +201,15 @@ impl PermissionChecker {
     }
 }
 
+impl crate::mcp::PermissionCheck for PermissionChecker {
+    fn check_file_read(&self, role: &str, path: &str) -> PermissionResult {
+        PermissionChecker::check_file_read(self, role, path)
+    }
+    fn check_git_push(&self, role: &str, remote: &str) -> PermissionResult {
+        PermissionChecker::check_git_push(self, role, remote)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

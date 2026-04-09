@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use std::process::Command;
 
 use crate::config::Config;
+use orchestrator_core::agent_manager::ShellOps;
 use orchestrator_core::types::StartAgentPayload;
 
 pub fn image_exists(name: &str) -> Result<bool> {
@@ -115,11 +116,13 @@ pub fn launch_long_running(cfg: &StartAgentPayload) -> Result<()> {
     println!("    Detach:      Ctrl-b d");
 
     // Auto-accept bypass permissions dialog and send initial prompt.
+    let shell = orchestrator_core::agent_manager::RealShellOps;
+    if !cfg.prompt.is_empty() {
+        let _ = shell.write_prompt_file(&cfg.name, &cfg.prompt);
+    }
     let target = format!("orchestrator:{}", cfg.name);
-    let script = orchestrator_core::agent_manager::auto_accept_script(&target, &cfg.name, &cfg.prompt);
-    let _ = Command::new("sh")
-        .args(["-c", &format!("({}) &", script)])
-        .spawn();
+    let script = orchestrator_core::agent_manager::auto_accept_script(&target, &cfg.name);
+    let _ = shell.spawn_background_script(&script);
 
     Ok(())
 }

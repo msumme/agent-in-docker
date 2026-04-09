@@ -56,7 +56,7 @@ async fn start_orchestrator() -> (
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-    let mcp_state = Arc::new(McpState::new(event_tx.clone()));
+    let mcp_state = Arc::new(McpState::new(event_tx.clone(), Box::new(orchestrator_core::mcp::AllowAllPermissions)));
 
     // WS server on random port
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

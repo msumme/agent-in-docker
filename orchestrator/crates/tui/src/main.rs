@@ -36,13 +36,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<OrchestratorEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
-    let mcp_state = Arc::new(McpState::new(event_tx.clone()));
+    let permissions: Box<dyn orchestrator_core::mcp::PermissionCheck> = {
+        let mut checker = orchestrator_core::permissions::PermissionChecker::new(
+            Box::new(orchestrator_core::permissions::RealEnvResolver),
+        );
+        let roles_dir = project_config.project_root.join("roles");
+        let _ = checker.load_roles_from_dir(&roles_dir);
+        Box::new(checker)
+    };
+    let mcp_state = Arc::new(McpState::new(event_tx.clone(), permissions));
 
     let agent_mgr = Arc::new(std::sync::Mutex::new(
         orchestrator_core::agent_manager::AgentManager::new(
             "orchestrator".into(),
             Box::new(orchestrator_core::agent_manager::RealTmuxOps),
             Box::new(orchestrator_core::agent_manager::RealContainerOps),
+            Box::new(orchestrator_core::agent_manager::RealShellOps),
         ),
     ));
 
@@ -86,10 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                     app::KeyEffect::AttachAgent(name) => {
-                        let target = format!("orchestrator:{}", name);
-                        let _ = std::process::Command::new("tmux")
-                            .args(["select-window", "-t", &target])
-                            .status();
+                        let mgr = agent_mgr.lock().unwrap();
+                        let _ = mgr.attach_to_agent(&name);
                     }
                     app::KeyEffect::None => {}
                 }

@@ -41,7 +41,7 @@ impl Config {
 
         Ok(Self {
             seed_dir: dir.join(".claude-container"),
-            agents_dir: dir.join(".claude-agents"),
+            agents_dir: dir.join(".agents"),
             orchestrator_bin: dir.join("orchestrator/target/debug/orchestrator"),
             containerfile: dir.join("Containerfile"),
             entrypoint: dir.join("scripts/entrypoint.sh"),

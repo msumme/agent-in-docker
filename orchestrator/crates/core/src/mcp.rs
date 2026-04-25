@@ -101,6 +101,23 @@ impl AgentRegistry for NoOpRegistry {
     }
 }
 
+/// Delivers cross-agent messages into the target agent's interactive session
+/// (typically via tmux send-keys), respecting the target's working state.
+pub trait MessageDispatcher: Send + Sync {
+    /// Deliver an agent-to-agent message. Queued when the target is Working,
+    /// sent immediately otherwise.
+    fn deliver_agent_message(&self, to: &str, from: &str, content: &str) -> Result<(), String>;
+}
+
+/// Default dispatcher — drops messages. Used in tests and when no agent
+/// manager is wired.
+pub struct NoOpDispatcher;
+impl MessageDispatcher for NoOpDispatcher {
+    fn deliver_agent_message(&self, _to: &str, _from: &str, _content: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Shared state for the MCP HTTP server.
 pub struct McpState {
     pub event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
@@ -108,6 +125,7 @@ pub struct McpState {
     pub tools: Vec<ToolDef>,
     pub registry: Mutex<Box<dyn AgentRegistry>>,
     pub permissions: Mutex<Box<dyn PermissionCheck>>,
+    pub dispatcher: Mutex<Box<dyn MessageDispatcher>>,
 }
 
 impl McpState {
@@ -121,11 +139,16 @@ impl McpState {
             tools: default_tools(),
             registry: Mutex::new(Box::new(NoOpRegistry)),
             permissions: Mutex::new(permissions),
+            dispatcher: Mutex::new(Box::new(NoOpDispatcher)),
         }
     }
 
     pub fn set_registry(&self, registry: Box<dyn AgentRegistry>) {
         *self.registry.lock().unwrap() = registry;
+    }
+
+    pub fn set_dispatcher(&self, dispatcher: Box<dyn MessageDispatcher>) {
+        *self.dispatcher.lock().unwrap() = dispatcher;
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
@@ -311,10 +334,19 @@ fn handle_tools_call_streaming(
         "message_agent" => {
             let agent_id = args.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
             let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let result = state.registry.lock().unwrap().route_message("mcp-client", agent_id, message);
-            let text = match result {
-                Ok(()) => format!("Message delivered to {}", agent_id),
-                Err(e) => format!("Failed: {}", e),
+            let ws_result = state.registry.lock().unwrap().route_message("mcp-client", agent_id, message);
+            // Also push the message into the target agent's interactive session
+            // (queued if target is Working). The sender's agent_name comes from
+            // the x-agent-name header.
+            let dispatch_result = state
+                .dispatcher
+                .lock()
+                .unwrap()
+                .deliver_agent_message(agent_id, &agent_name, message);
+            let text = match (ws_result, dispatch_result) {
+                (Ok(()), Ok(())) => format!("Message delivered to {}", agent_id),
+                (Err(e), _) => format!("Failed: {}", e),
+                (_, Err(e)) => format!("Routed over WS but tmux delivery failed: {}", e),
             };
             let resp = JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}));
             Some(serde_json::to_string(&resp).unwrap())

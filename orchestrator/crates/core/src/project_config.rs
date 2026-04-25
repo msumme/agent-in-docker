@@ -2,6 +2,18 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Config persisted for a named agent so re-launches inherit its setup.
+/// Lives at `<agents_dir>/<name>.json` (sibling to the agent_dir, so it is
+/// not mounted into the container).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedAgentConfig {
+    pub role: String,
+    /// What the user originally passed for `--role-prompt` (name or path).
+    /// Re-resolved on each launch so edits to bundled/global files take effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_prompt_spec: Option<String>,
+}
+
 /// Project configuration -- shared between CLI and orchestrator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -20,7 +32,7 @@ impl ProjectConfig {
     pub fn from_root(root: PathBuf) -> Self {
         Self {
             seed_dir: root.join(".claude-container"),
-            agents_dir: root.join(".claude-agents"),
+            agents_dir: root.join(".agents"),
             orchestrator_port: std::env::var("ORCHESTRATOR_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9800),
             mcp_port: std::env::var("MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9801),
             image_name: std::env::var("AGENT_IMAGE").unwrap_or_else(|_| "agent-in-docker".to_string()),
@@ -103,6 +115,113 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Set up a role-scoped memory directory. All agents sharing a role share this
+/// Claude Code `projects/` tree, so memory accumulated by one agent under that
+/// role is available to future agents of the same role — while remaining
+/// isolated from other roles' memory.
+pub fn setup_role_memory_dir(cfg: &ProjectConfig, role: &str) -> Result<PathBuf> {
+    let dir = cfg
+        .agents_dir
+        .join("_role-memory")
+        .join(role)
+        .join("projects");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Path where a named agent's persisted config lives. Sibling to agent_dir
+/// so it isn't mounted into the container.
+pub fn persisted_config_path(cfg: &ProjectConfig, name: &str) -> PathBuf {
+    cfg.agents_dir.join(format!("{}.json", name))
+}
+
+/// Load persisted config for a named agent, if any.
+pub fn load_persisted_config(cfg: &ProjectConfig, name: &str) -> Result<Option<PersistedAgentConfig>> {
+    let path = persisted_config_path(cfg, name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read persisted agent config {}", path.display()))?;
+    let parsed: PersistedAgentConfig = serde_json::from_str(&contents)
+        .with_context(|| format!("parse persisted agent config {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+/// Save persisted config for a named agent.
+pub fn save_persisted_config(
+    cfg: &ProjectConfig,
+    name: &str,
+    persisted: &PersistedAgentConfig,
+) -> Result<()> {
+    std::fs::create_dir_all(&cfg.agents_dir)?;
+    let path = persisted_config_path(cfg, name);
+    let json = serde_json::to_string_pretty(persisted)?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("write persisted agent config {}", path.display()))?;
+    Ok(())
+}
+
+/// Resolve a role-prompt spec to an absolute path.
+///
+/// `spec` may be:
+///   - absolute path
+///   - relative path (starts with `./` or `../`, or contains `/`, or ends with `.md`)
+///   - bare name — looked up through three tiers, first match wins:
+///     1. `<target_project>/.agents/roles/<name>.md`
+///     2. `~/.agents/roles/<name>.md`
+///     3. `<bundled_roles_dir>/<name>.md`
+///
+/// Returns `None` if no file is found. `bundled_roles_dir` is the `roles/`
+/// directory shipped with agent-in-docker itself.
+pub fn resolve_role_prompt(
+    spec: &str,
+    target_project: &Path,
+    bundled_roles_dir: &Path,
+) -> Option<PathBuf> {
+    if looks_like_path(spec) {
+        let p = if Path::new(spec).is_absolute() {
+            PathBuf::from(spec)
+        } else {
+            target_project.join(spec)
+        };
+        return if p.is_file() { Some(p) } else { None };
+    }
+
+    let filename = format!("{}.md", spec);
+
+    let project_local = target_project.join(".agents/roles").join(&filename);
+    if project_local.is_file() {
+        return Some(project_local);
+    }
+
+    if let Some(home) = home_dir() {
+        let user_global = home.join(".agents/roles").join(&filename);
+        if user_global.is_file() {
+            return Some(user_global);
+        }
+    }
+
+    let bundled = bundled_roles_dir.join(&filename);
+    if bundled.is_file() {
+        return Some(bundled);
+    }
+
+    None
+}
+
+fn looks_like_path(spec: &str) -> bool {
+    Path::new(spec).is_absolute()
+        || spec.starts_with("./")
+        || spec.starts_with("../")
+        || spec.contains('/')
+        || spec.ends_with(".md")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Find the latest .claude.json backup file in a directory.
@@ -194,6 +313,84 @@ mod tests {
     #[test]
     fn find_latest_backup_missing_dir() {
         assert!(find_latest_backup(Path::new("/nonexistent")).unwrap().is_none());
+    }
+
+    fn test_cfg(root: &Path) -> ProjectConfig {
+        ProjectConfig {
+            project_root: root.to_path_buf(),
+            seed_dir: root.join("seed"),
+            agents_dir: root.join("agents"),
+            orchestrator_port: 9800,
+            mcp_port: 9801,
+            image_name: String::new(),
+            network_name: String::new(),
+            dolt_port: None,
+        }
+    }
+
+    #[test]
+    fn resolve_role_prompt_prefers_project_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let bundled = tmp.path().join("bundled");
+        fs::create_dir_all(project.join(".agents/roles")).unwrap();
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(project.join(".agents/roles/architect.md"), "project").unwrap();
+        fs::write(bundled.join("architect.md"), "bundled").unwrap();
+
+        let resolved = resolve_role_prompt("architect", &project, &bundled).unwrap();
+        assert_eq!(fs::read_to_string(resolved).unwrap(), "project");
+    }
+
+    #[test]
+    fn resolve_role_prompt_falls_back_to_bundled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let bundled = tmp.path().join("bundled");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&bundled).unwrap();
+        fs::write(bundled.join("cleaner.md"), "bundled").unwrap();
+
+        let resolved = resolve_role_prompt("cleaner", &project, &bundled).unwrap();
+        assert_eq!(fs::read_to_string(resolved).unwrap(), "bundled");
+    }
+
+    #[test]
+    fn resolve_role_prompt_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prompt = tmp.path().join("custom.md");
+        fs::write(&prompt, "custom").unwrap();
+
+        let resolved =
+            resolve_role_prompt(prompt.to_str().unwrap(), tmp.path(), tmp.path()).unwrap();
+        assert_eq!(resolved, prompt);
+    }
+
+    #[test]
+    fn resolve_role_prompt_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_role_prompt("nope", tmp.path(), tmp.path()).is_none());
+    }
+
+    #[test]
+    fn persisted_config_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let original = PersistedAgentConfig {
+            role: "architect".into(),
+            role_prompt_spec: Some("/abs/path.md".into()),
+        };
+        save_persisted_config(&cfg, "alice", &original).unwrap();
+        let loaded = load_persisted_config(&cfg, "alice").unwrap().unwrap();
+        assert_eq!(loaded.role, "architect");
+        assert_eq!(loaded.role_prompt_spec.as_deref(), Some("/abs/path.md"));
+    }
+
+    #[test]
+    fn load_persisted_config_missing_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        assert!(load_persisted_config(&cfg, "missing").unwrap().is_none());
     }
 
     #[test]

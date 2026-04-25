@@ -1,6 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::types::*;
+
+/// A message waiting to be delivered to an agent that is currently working.
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub from_label: String,
+    pub content: String,
+}
 
 /// Abstraction over tmux operations. Injectable for testing.
 pub trait TmuxOps: Send + Sync {
@@ -121,9 +128,12 @@ pub fn auto_accept_script(tmux_target: &str, agent_name: &str) -> String {
     )
 }
 
-/// Manages agent lifecycles: start, stop, track status.
+/// Manages agent lifecycles: start, stop, track status, route messages.
 pub struct AgentManager {
     agents: HashMap<String, ManagedAgent>,
+    /// Per-agent queues of messages received while the agent was Working.
+    /// Flushed to tmux when the agent next goes Idle.
+    mailboxes: HashMap<String, VecDeque<QueuedMessage>>,
     tmux_session: String,
     tmux: Box<dyn TmuxOps>,
     container: Box<dyn ContainerOps>,
@@ -139,6 +149,7 @@ impl AgentManager {
     ) -> Self {
         Self {
             agents: HashMap::new(),
+            mailboxes: HashMap::new(),
             tmux_session,
             tmux,
             container,
@@ -191,7 +202,28 @@ impl AgentManager {
             agent.ws_agent_id = Some(ws_agent_id.to_string());
             agent.status = AgentStatus::Connected;
             agent.last_activity = "connected".into();
+            return;
         }
+        // CLI-spawned agents bypass start_agent, so the manager has no entry.
+        // Without one, deliver_agent_message would fail with "agent not found"
+        // and inter-agent messaging would silently break. Synthesize a minimal
+        // entry using conventions the CLI already follows: tmux window name and
+        // container name both equal the agent name.
+        self.agents.insert(
+            agent_name.to_string(),
+            ManagedAgent {
+                name: agent_name.to_string(),
+                role: String::new(),
+                mode: "long-running".into(),
+                status: AgentStatus::Connected,
+                tmux_window: agent_name.to_string(),
+                container_name: agent_name.to_string(),
+                project_path: String::new(),
+                prompt: String::new(),
+                ws_agent_id: Some(ws_agent_id.to_string()),
+                last_activity: "connected".into(),
+            },
+        );
     }
 
     pub fn agent_disconnected(&mut self, ws_agent_id: &str) {
@@ -212,11 +244,108 @@ impl AgentManager {
     }
 
     pub fn agent_idle(&mut self, agent_name: &str) {
-        if let Some(agent) = self.agents.get_mut(agent_name) {
+        let transitioned = if let Some(agent) = self.agents.get_mut(agent_name) {
             if agent.status == AgentStatus::Working {
                 agent.status = AgentStatus::Idle;
+                true
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if transitioned {
+            self.flush_mailbox(agent_name);
         }
+    }
+
+    /// Deliver an agent-to-agent message. If the recipient is Working, queue
+    /// it; it will be flushed when the recipient next goes Idle. Otherwise
+    /// deliver immediately via tmux.
+    ///
+    /// `to_ref` accepts either the agent's name or its WS id — callers
+    /// (the MCP `message_agent` tool) pass whatever the LLM produces, which
+    /// is usually the id surfaced by `list_agents`.
+    pub fn deliver_agent_message(
+        &mut self,
+        to_ref: &str,
+        from_label: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let agent = self
+            .agents
+            .get(to_ref)
+            .or_else(|| {
+                self.agents
+                    .values()
+                    .find(|a| a.ws_agent_id.as_deref() == Some(to_ref))
+            })
+            .ok_or_else(|| format!("Agent '{}' not found", to_ref))?;
+        let to_name = agent.name.clone();
+        let status = agent.status.clone();
+        let window = agent.tmux_window.clone();
+        let deliverable_now = matches!(
+            status,
+            AgentStatus::Idle | AgentStatus::Connected | AgentStatus::Starting
+        );
+        if deliverable_now {
+            self.send_message_to_window(&window, from_label, content)
+        } else {
+            self.mailboxes
+                .entry(to_name.to_string())
+                .or_default()
+                .push_back(QueuedMessage {
+                    from_label: from_label.to_string(),
+                    content: content.to_string(),
+                });
+            Ok(())
+        }
+    }
+
+    /// Deliver a user (TUI) message immediately, bypassing the working-state
+    /// check. User intent trumps agent working state.
+    pub fn deliver_user_message(&mut self, to_name: &str, content: &str) -> Result<(), String> {
+        let agent = self
+            .agents
+            .get(to_name)
+            .ok_or_else(|| format!("Agent '{}' not found", to_name))?;
+        let window = agent.tmux_window.clone();
+        self.send_message_to_window(&window, "user", content)
+    }
+
+    /// Number of queued messages for an agent. Exposed for observability/tests.
+    pub fn mailbox_len(&self, agent_name: &str) -> usize {
+        self.mailboxes
+            .get(agent_name)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    fn flush_mailbox(&mut self, agent_name: &str) {
+        let window = match self.agents.get(agent_name) {
+            Some(a) => a.tmux_window.clone(),
+            None => return,
+        };
+        let drained: Vec<QueuedMessage> = match self.mailboxes.get_mut(agent_name) {
+            Some(mb) => mb.drain(..).collect(),
+            None => return,
+        };
+        for msg in drained {
+            let _ = self.send_message_to_window(&window, &msg.from_label, &msg.content);
+        }
+    }
+
+    fn send_message_to_window(
+        &self,
+        window: &str,
+        from_label: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let target = format!("{}:{}", self.tmux_session, window);
+        let formatted = format!("[from {}]: {}", from_label, content);
+        self.tmux.send_keys(&target, &formatted)?;
+        self.tmux.send_keys(&target, "Enter")?;
+        Ok(())
     }
 
     /// Reattach an orphaned container to a new tmux window.
@@ -276,11 +405,15 @@ mod tests {
 
     struct FakeTmux {
         windows: Mutex<Vec<(String, String, String)>>,
+        sent_keys: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeTmux {
         fn new() -> Self {
-            Self { windows: Mutex::new(Vec::new()) }
+            Self {
+                windows: Mutex::new(Vec::new()),
+                sent_keys: Mutex::new(Vec::new()),
+            }
         }
     }
 
@@ -290,8 +423,27 @@ mod tests {
             Ok(())
         }
         fn select_window(&self, _session: &str, _name: &str) -> Result<(), String> { Ok(()) }
-        fn send_keys(&self, _target: &str, _keys: &str) -> Result<(), String> { Ok(()) }
+        fn send_keys(&self, target: &str, keys: &str) -> Result<(), String> {
+            self.sent_keys.lock().unwrap().push((target.into(), keys.into()));
+            Ok(())
+        }
         fn capture_pane(&self, _target: &str) -> Result<String, String> { Ok(String::new()) }
+    }
+
+    struct FakeTmuxWrapper(Arc<FakeTmux>);
+    impl TmuxOps for FakeTmuxWrapper {
+        fn create_window(&self, session: &str, name: &str, cmd: &str) -> Result<(), String> {
+            self.0.create_window(session, name, cmd)
+        }
+        fn select_window(&self, session: &str, name: &str) -> Result<(), String> {
+            self.0.select_window(session, name)
+        }
+        fn send_keys(&self, target: &str, keys: &str) -> Result<(), String> {
+            self.0.send_keys(target, keys)
+        }
+        fn capture_pane(&self, target: &str) -> Result<String, String> {
+            self.0.capture_pane(target)
+        }
     }
 
     struct FakeContainer;
@@ -370,6 +522,8 @@ mod tests {
             project_path: "/tmp/project".into(),
             prompt: "hello".into(),
             agent_dir: "/tmp/agent".into(),
+            role_memory_dir: "/tmp/role-memory".into(),
+            role_prompt: String::new(),
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
@@ -426,6 +580,25 @@ mod tests {
 
         mgr.agent_disconnected("ws-1");
         assert_eq!(mgr.get_agent("Bob").unwrap().status, AgentStatus::Exited);
+    }
+
+    #[test]
+    fn agent_registered_creates_entry_for_cli_spawned_agent() {
+        // CLI-spawned agents bypass start_agent. Without auto-creation here,
+        // deliver_agent_message would fail with "agent not found" and
+        // inter-agent messaging would silently break.
+        let mut mgr = make_manager();
+        mgr.agent_registered("cli-spawned", "ws-7");
+
+        let found = mgr.get_agent("cli-spawned").expect("entry must be created");
+        assert_eq!(found.status, AgentStatus::Connected);
+        assert_eq!(found.ws_agent_id.as_deref(), Some("ws-7"));
+        assert_eq!(found.tmux_window, "cli-spawned");
+        assert_eq!(found.container_name, "cli-spawned");
+
+        // And messages routed by name now reach tmux instead of erroring.
+        mgr.deliver_agent_message("cli-spawned", "max", "hello")
+            .expect("delivery should succeed");
     }
 
     #[test]
@@ -495,6 +668,119 @@ mod tests {
         let scripts = shell.scripts.lock().unwrap();
         assert_eq!(scripts.len(), 1);
         assert!(scripts[0].contains("test-session:Bob"));
+    }
+
+    fn make_manager_with_tmux(tmux: Arc<FakeTmux>) -> AgentManager {
+        AgentManager::new(
+            "test-session".into(),
+            Box::new(FakeTmuxWrapper(tmux)),
+            Box::new(FakeContainer),
+            Box::new(FakeShell::new()),
+        )
+    }
+
+    #[test]
+    fn agent_message_delivers_immediately_when_idle() {
+        let tmux = Arc::new(FakeTmux::new());
+        let mut mgr = make_manager_with_tmux(tmux.clone());
+        mgr.start_agent(&make_payload("alice")).unwrap();
+        mgr.agent_registered("alice", "ws-1");
+        mgr.agent_working("alice", "");
+        mgr.agent_idle("alice");
+
+        mgr.deliver_agent_message("alice", "producer", "pass 1 ready sha=abc")
+            .unwrap();
+        assert_eq!(mgr.mailbox_len("alice"), 0);
+
+        let sent = tmux.sent_keys.lock().unwrap();
+        assert!(sent
+            .iter()
+            .any(|(t, k)| t == "test-session:alice" && k == "[from producer]: pass 1 ready sha=abc"));
+        assert!(sent.iter().any(|(t, k)| t == "test-session:alice" && k == "Enter"));
+    }
+
+    #[test]
+    fn agent_message_queues_when_working() {
+        let tmux = Arc::new(FakeTmux::new());
+        let mut mgr = make_manager_with_tmux(tmux.clone());
+        mgr.start_agent(&make_payload("alice")).unwrap();
+        mgr.agent_registered("alice", "ws-1");
+        mgr.agent_working("alice", "thinking");
+
+        mgr.deliver_agent_message("alice", "producer", "msg1").unwrap();
+        mgr.deliver_agent_message("alice", "cleaner", "msg2").unwrap();
+
+        assert_eq!(mgr.mailbox_len("alice"), 2);
+        // Nothing sent to tmux while working.
+        let sent_before = tmux.sent_keys.lock().unwrap().len();
+        assert_eq!(sent_before, 0);
+    }
+
+    #[test]
+    fn idle_transition_flushes_mailbox_in_order() {
+        let tmux = Arc::new(FakeTmux::new());
+        let mut mgr = make_manager_with_tmux(tmux.clone());
+        mgr.start_agent(&make_payload("alice")).unwrap();
+        mgr.agent_registered("alice", "ws-1");
+        mgr.agent_working("alice", "thinking");
+        mgr.deliver_agent_message("alice", "producer", "first").unwrap();
+        mgr.deliver_agent_message("alice", "cleaner", "second").unwrap();
+
+        mgr.agent_idle("alice");
+
+        assert_eq!(mgr.mailbox_len("alice"), 0);
+        let sent = tmux.sent_keys.lock().unwrap();
+        let bodies: Vec<&String> = sent
+            .iter()
+            .filter(|(_, k)| k != "Enter")
+            .map(|(_, k)| k)
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                &"[from producer]: first".to_string(),
+                &"[from cleaner]: second".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_message_bypasses_working_state() {
+        let tmux = Arc::new(FakeTmux::new());
+        let mut mgr = make_manager_with_tmux(tmux.clone());
+        mgr.start_agent(&make_payload("alice")).unwrap();
+        mgr.agent_registered("alice", "ws-1");
+        mgr.agent_working("alice", "thinking");
+
+        mgr.deliver_user_message("alice", "stop and do this").unwrap();
+
+        assert_eq!(mgr.mailbox_len("alice"), 0);
+        let sent = tmux.sent_keys.lock().unwrap();
+        assert!(sent
+            .iter()
+            .any(|(_, k)| k == "[from user]: stop and do this"));
+    }
+
+    #[test]
+    fn deliver_to_unknown_agent_errors() {
+        let mut mgr = make_manager();
+        assert!(mgr.deliver_agent_message("ghost", "producer", "hi").is_err());
+        assert!(mgr.deliver_user_message("ghost", "hi").is_err());
+    }
+
+    #[test]
+    fn agent_idle_when_already_idle_does_not_double_flush() {
+        let tmux = Arc::new(FakeTmux::new());
+        let mut mgr = make_manager_with_tmux(tmux.clone());
+        mgr.start_agent(&make_payload("alice")).unwrap();
+        mgr.agent_registered("alice", "ws-1");
+        mgr.agent_working("alice", "");
+        mgr.deliver_agent_message("alice", "producer", "msg").unwrap();
+        mgr.agent_idle("alice");
+        let after_first = tmux.sent_keys.lock().unwrap().len();
+        // Calling agent_idle again with status already Idle must be a no-op.
+        mgr.agent_idle("alice");
+        assert_eq!(tmux.sent_keys.lock().unwrap().len(), after_first);
     }
 
     #[test]

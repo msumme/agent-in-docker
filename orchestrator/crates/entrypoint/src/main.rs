@@ -10,6 +10,7 @@ async fn main() -> Result<()> {
     let agent_role = std::env::var("AGENT_ROLE").unwrap_or_else(|_| "code-agent".into());
     let agent_mode = std::env::var("AGENT_MODE").unwrap_or_else(|_| "oneshot".into());
     let agent_prompt = std::env::var("AGENT_PROMPT").unwrap_or_default();
+    let agent_role_prompt = std::env::var("AGENT_ROLE_PROMPT").unwrap_or_default();
     let orchestrator_url = std::env::var("ORCHESTRATOR_URL").unwrap_or_else(|_| "ws://host.containers.internal:9800".into());
     let mcp_port = std::env::var("MCP_PORT").unwrap_or_else(|_| "9801".into());
 
@@ -38,6 +39,18 @@ async fn main() -> Result<()> {
         "--mcp-config".to_string(),
         "/tmp/mcp-config.json".to_string(),
     ];
+
+    if !agent_role_prompt.is_empty() {
+        eprintln!(
+            "[entrypoint] Appending system prompt ({} chars, first line: {:?})",
+            agent_role_prompt.len(),
+            agent_role_prompt.lines().next().unwrap_or("")
+        );
+        claude_args.push("--append-system-prompt".to_string());
+        claude_args.push(agent_role_prompt);
+    } else {
+        eprintln!("[entrypoint] No AGENT_ROLE_PROMPT set — starting without --append-system-prompt");
+    }
 
     if agent_mode == "oneshot" && !agent_prompt.is_empty() {
         claude_args.push("-p".to_string());

@@ -1,4 +1,14 @@
-# Single-stage: bridge runs on host, container just needs Claude Code
+# Stage 1: build the Rust entrypoint inside a Linux Rust image so we don't
+# need a cross-compile toolchain on the host.
+FROM rust:1-alpine AS entrypoint-builder
+RUN apk add --no-cache musl-dev
+WORKDIR /build
+COPY orchestrator/Cargo.toml orchestrator/Cargo.lock ./
+COPY orchestrator/crates ./crates
+RUN cargo build --release -p agent-entrypoint --bin entrypoint \
+    && cp target/release/entrypoint /entrypoint
+
+# Stage 2: runtime image
 FROM node:22-alpine
 
 # Install packages + glibc compat + Chromium for Playwright
@@ -30,8 +40,8 @@ RUN ARCH=$(uname -m | sed 's/aarch64/arm64/;s/x86_64/amd64/') && \
 # Workspace
 RUN mkdir -p /workspace && chown node:node /workspace
 
-# Copy Rust entrypoint binary (cross-compiled for musl)
-COPY orchestrator/target/release/entrypoint /opt/entrypoint
+# Copy Rust entrypoint binary built in stage 1
+COPY --from=entrypoint-builder /entrypoint /opt/entrypoint
 RUN chmod +x /opt/entrypoint
 
 WORKDIR /workspace

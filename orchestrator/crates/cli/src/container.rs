@@ -152,6 +152,8 @@ mod tests {
             name: "test".into(),
             project_path: "/tmp/project".into(),
             agent_dir: "/tmp/agent".into(),
+            role_memory_dir: "/tmp/role-memory".into(),
+            role_prompt: String::new(),
             role: "code-agent".into(),
             mode: "oneshot".into(),
             prompt: "hello".into(),

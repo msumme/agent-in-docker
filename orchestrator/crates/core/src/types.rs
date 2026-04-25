@@ -121,6 +121,11 @@ pub struct StartAgentPayload {
     pub project_path: String,
     pub prompt: String,
     pub agent_dir: String,
+    pub role_memory_dir: String,
+    /// Full text of the role system prompt (appended via `--append-system-prompt`).
+    /// Empty string means no role prompt.
+    #[serde(default)]
+    pub role_prompt: String,
     pub seed_credentials: String,
     pub image_name: String,
     pub network_name: String,
@@ -147,6 +152,8 @@ impl StartAgentPayload {
             "-v".to_string(),
             format!("{}:/root/.claude:Z", self.agent_dir),
             "-v".to_string(),
+            format!("{}:/root/.claude/projects:Z", self.role_memory_dir),
+            "-v".to_string(),
             format!("{}:/root/.claude/.credentials.json:Z", self.seed_credentials),
             "-e".to_string(),
             format!(
@@ -166,6 +173,13 @@ impl StartAgentPayload {
             "-e".to_string(),
             "IS_SANDBOX=1".to_string(),
         ];
+
+        if !self.role_prompt.is_empty() {
+            args.extend_from_slice(&[
+                "-e".to_string(),
+                format!("AGENT_ROLE_PROMPT={}", self.role_prompt),
+            ]);
+        }
 
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
             if !key.is_empty() {
@@ -318,6 +332,8 @@ mod tests {
             project_path: "/tmp".into(),
             prompt: "hi".into(),
             agent_dir: "/a".into(),
+            role_memory_dir: "/mem".into(),
+            role_prompt: String::new(),
             seed_credentials: "/creds".into(),
             image_name: "img".into(),
             network_name: "net".into(),
@@ -339,6 +355,8 @@ mod tests {
             project_path: "/tmp/project".into(),
             prompt: "hi".into(),
             agent_dir: "/tmp/agent".into(),
+            role_memory_dir: "/tmp/role-memory".into(),
+            role_prompt: String::new(),
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-img".into(),
             network_name: "agent-net".into(),
@@ -353,6 +371,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "IS_SANDBOX=1"));
         assert!(args.iter().any(|a| a == "agent-img"));
         assert!(args.iter().any(|a| a.contains("/workspace:Z")));
+        assert!(args
+            .iter()
+            .any(|a| a == "/tmp/role-memory:/root/.claude/projects:Z"));
     }
 
     #[test]
@@ -364,6 +385,8 @@ mod tests {
             project_path: "/tmp".into(),
             prompt: String::new(),
             agent_dir: "/tmp/a".into(),
+            role_memory_dir: "/tmp/mem".into(),
+            role_prompt: "hello".into(),
             seed_credentials: "/tmp/c.json".into(),
             image_name: "img".into(),
             network_name: "net".into(),
@@ -372,6 +395,7 @@ mod tests {
             dolt_port: Some(3307),
         };
         let args = p.container_run_args();
+        assert!(args.iter().any(|a| a == "AGENT_ROLE_PROMPT=hello"));
         assert!(args.iter().any(|a| a == "DOLT_PORT=3307"));
         assert!(args.iter().any(|a| a == "DOLT_HOST=host.containers.internal"));
     }

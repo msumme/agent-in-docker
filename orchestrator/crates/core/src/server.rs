@@ -119,6 +119,19 @@ impl ServerState {
             .unwrap_or_default()
     }
 
+    /// Resolve an agent reference (either a WS id or a human-readable name) to
+    /// the WS id used as the key in `self.agents`. Returns `None` if neither
+    /// matches a connected agent.
+    fn resolve_agent_ref(&self, name_or_id: &str) -> Option<String> {
+        if self.agents.contains_key(name_or_id) {
+            return Some(name_or_id.to_string());
+        }
+        self.agents
+            .values()
+            .find(|a| a.info.name == name_or_id)
+            .map(|a| a.info.id.clone())
+    }
+
     fn peer_list(&self, exclude: &str) -> Vec<PeerInfo> {
         self.agents
             .values()
@@ -380,6 +393,16 @@ impl ServerStateRegistry {
     }
 }
 
+/// Bridges the MCP `message_agent` tool to the AgentManager, which owns
+/// tmux delivery and the idle-gated mailbox.
+pub struct AgentManagerDispatcher(pub Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>);
+
+impl crate::mcp::MessageDispatcher for AgentManagerDispatcher {
+    fn deliver_agent_message(&self, to: &str, from: &str, content: &str) -> Result<(), String> {
+        self.0.lock().unwrap().deliver_agent_message(to, from, content)
+    }
+}
+
 impl AgentRegistry for ServerStateRegistry {
     fn list_agents(&self) -> Vec<PeerInfo> {
         self.agents.lock().unwrap().clone()
@@ -390,7 +413,12 @@ impl AgentRegistry for ServerStateRegistry {
         // Use try_lock to avoid blocking; if contended, return error.
         match self.state.try_lock() {
             Ok(s) => {
-                if s.route_agent_message(from, "", to, content) {
+                // The MCP tool passes the recipient by name; route_agent_message
+                // expects a WS id. Resolve here so either form works.
+                let to_id = s
+                    .resolve_agent_ref(to)
+                    .ok_or_else(|| format!("Agent {} not found", to))?;
+                if s.route_agent_message(from, "", &to_id, content) {
                     Ok(())
                 } else {
                     Err(format!("Agent {} not found", to))
@@ -437,6 +465,9 @@ pub async fn run_with_id_gen(
             agents: registry_snapshot.clone(),
             state: state.clone(),
         }));
+        if let Some(ref mgr) = agent_mgr {
+            mcp.set_dispatcher(Box::new(AgentManagerDispatcher(mgr.clone())));
+        }
     }
 
     let state_for_cmds = state.clone();
@@ -480,9 +511,16 @@ pub async fn run_with_id_gen(
                         msg_type: "send_task".into(),
                         from: "orchestrator".into(),
                         to: Some(agent_id.clone()),
-                        payload: serde_json::json!({"prompt": prompt}),
+                        payload: serde_json::json!({"prompt": prompt.clone()}),
                     };
                     s.send_to_agent(&agent_id, &msg);
+                    // User intent is immediate: push to tmux regardless of
+                    // whether the target is Working.
+                    if let Some(ref mgr) = agent_mgr_for_cmds {
+                        if let Err(e) = mgr.lock().unwrap().deliver_user_message(&agent_id, &prompt) {
+                            warn!("User message to '{}' failed: {}", agent_id, e);
+                        }
+                    }
                 }
                 TuiCommand::StartNewAgent { name, role } => {
                     if let (Some(ref mgr), Some(ref cfg)) = (&agent_mgr_for_cmds, &cfg_for_cmds) {
@@ -494,6 +532,36 @@ pub async fn run_with_id_gen(
                                 continue;
                             }
                         };
+                        let role_memory_dir = match crate::project_config::setup_role_memory_dir(cfg, &role) {
+                            Ok(dir) => dir.to_string_lossy().to_string(),
+                            Err(e) => {
+                                warn!("Failed to set up role memory dir for '{}': {}", role, e);
+                                continue;
+                            }
+                        };
+                        // Load persisted config (may override role) and resolve the role prompt.
+                        let prior = crate::project_config::load_persisted_config(cfg, &name)
+                            .ok()
+                            .flatten();
+                        let role = prior.as_ref().map(|p| p.role.clone()).unwrap_or(role);
+                        let role_prompt_spec = prior
+                            .as_ref()
+                            .and_then(|p| p.role_prompt_spec.clone())
+                            .unwrap_or_else(|| role.clone());
+                        let bundled_roles = cfg.project_root.join("roles");
+                        let role_prompt = match crate::project_config::resolve_role_prompt(
+                            &role_prompt_spec,
+                            &cfg.project_root,
+                            &bundled_roles,
+                        ) {
+                            Some(p) => std::fs::read_to_string(&p).unwrap_or_default(),
+                            None => String::new(),
+                        };
+                        let persisted = crate::project_config::PersistedAgentConfig {
+                            role: role.clone(),
+                            role_prompt_spec: prior.and_then(|p| p.role_prompt_spec),
+                        };
+                        let _ = crate::project_config::save_persisted_config(cfg, &name, &persisted);
                         let payload = StartAgentPayload {
                             name: name.clone(),
                             role,
@@ -501,6 +569,8 @@ pub async fn run_with_id_gen(
                             project_path: cfg.project_root.to_string_lossy().to_string(),
                             prompt: String::new(),
                             agent_dir,
+                            role_memory_dir,
+                            role_prompt,
                             seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
                             image_name: cfg.image_name.clone(),
                             network_name: cfg.network_name.clone(),

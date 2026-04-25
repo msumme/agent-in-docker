@@ -36,7 +36,7 @@ Host-side launcher. Subcommands:
 
 Responsibilities:
 - Reads credentials from `.claude-container/`
-- Copies credentials into per-agent config dirs (`.claude-agents/<name>/`)
+- Copies credentials into per-agent config dirs (`.agents/<name>/`)
 - Ensures orchestrator is running (starts in tmux if needed)
 - Ensures project's dolt server is running (for beads)
 - Launches containers via podman, manages tmux sessions for named agents
@@ -86,8 +86,8 @@ User attaches to agent via `tmux attach -t agents`, or interacts via TUI.
   → credentials saved to .claude-container/.credentials.json
 
 ./run-agent.sh . "prompt" --name X
-  → CLI copies .claude-container/ → .claude-agents/X/
-  → container mounts .claude-agents/X/ at /root/.claude
+  → CLI copies .claude-container/ → .agents/X/
+  → container mounts .agents/X/ at /root/.claude
   → entrypoint symlinks .claude.json, creates uid-matched user
   → Claude Code reads credentials from /home/agent/.claude/
 ```

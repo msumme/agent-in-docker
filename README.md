@@ -197,4 +197,4 @@ Agents use your Claude Max/Pro subscription (not API keys). Login once:
 # Use /login inside Claude Code, complete OAuth in browser
 ```
 
-Credentials are stored in `.claude-container/` and copied to each agent's config directory. Named agents get persistent dirs under `.claude-agents/<name>/`.
+Credentials are stored in `.claude-container/` and copied to each agent's config directory. Named agents get persistent dirs under `.agents/<name>/`. Role-scoped memory lives at `.agents/_role-memory/<role>/projects/` so agents that share a role share memory.

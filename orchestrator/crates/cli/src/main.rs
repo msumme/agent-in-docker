@@ -72,6 +72,18 @@ fn main() -> Result<()> {
             let project_path = std::fs::canonicalize(&project_path)
                 .map_err(|e| anyhow::anyhow!("Invalid project path '{}': {}", project_path, e))?;
 
+            // Coordination layer is bd. Refuse to launch against a project that
+            // hasn't been initialized — agents would have nowhere to file
+            // tickets, claim work, or coordinate edits.
+            let bd_marker = project_path.join(".beads").join("config.yaml");
+            if !bd_marker.is_file() {
+                anyhow::bail!(
+                    "Project '{}' is not bd-enabled (no .beads/config.yaml found). \
+                     Initialize it with `bd init` from the project root, then retry.",
+                    project_path.display()
+                );
+            }
+
             let pcfg = cfg.to_project_config(None);
             project_config::ensure_credentials(&pcfg)?;
 
@@ -128,6 +140,28 @@ fn main() -> Result<()> {
                     );
                     String::new()
                 }
+            };
+
+            // Prepend the shared meta-prompt (coordination + coding standards)
+            // so every role inherits the same baseline. Resolved through the
+            // same 3-tier search as roles, under the bare name "_meta".
+            let meta_prompt_text = project_config::resolve_role_prompt(
+                "_meta",
+                &project_path,
+                &bundled_roles,
+            )
+            .and_then(|p| {
+                println!("==> Meta prompt: {}", p.display());
+                std::fs::read_to_string(&p).ok()
+            })
+            .unwrap_or_default();
+
+            let role_prompt_text = if meta_prompt_text.is_empty() {
+                role_prompt_text
+            } else if role_prompt_text.is_empty() {
+                meta_prompt_text
+            } else {
+                format!("{}\n\n---\n\n{}", meta_prompt_text, role_prompt_text)
             };
 
             if named {

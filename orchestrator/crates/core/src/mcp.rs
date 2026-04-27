@@ -118,6 +118,35 @@ impl MessageDispatcher for NoOpDispatcher {
     }
 }
 
+/// Manages team lifecycle: spawn, suspend, resume, complete, kill.
+pub trait TeamOps: Send + Sync {
+    fn spawn(&self, ticket_id: &str, roles: Option<Vec<String>>) -> Result<String, String>;
+    fn suspend(&self, team_id: &str) -> Result<String, String>;
+    fn resume(&self, team_id: &str) -> Result<String, String>;
+    fn complete(&self, team_id: &str) -> Result<String, String>;
+    fn kill(&self, team_id: &str) -> Result<String, String>;
+}
+
+/// Default TeamOps — every call fails until a real TeamManager is wired.
+pub struct NoOpTeamOps;
+impl TeamOps for NoOpTeamOps {
+    fn spawn(&self, _ticket_id: &str, _roles: Option<Vec<String>>) -> Result<String, String> {
+        Err("team manager not wired".into())
+    }
+    fn suspend(&self, _team_id: &str) -> Result<String, String> {
+        Err("team manager not wired".into())
+    }
+    fn resume(&self, _team_id: &str) -> Result<String, String> {
+        Err("team manager not wired".into())
+    }
+    fn complete(&self, _team_id: &str) -> Result<String, String> {
+        Err("team manager not wired".into())
+    }
+    fn kill(&self, _team_id: &str) -> Result<String, String> {
+        Err("team manager not wired".into())
+    }
+}
+
 /// Shared state for the MCP HTTP server.
 pub struct McpState {
     pub event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
@@ -126,6 +155,7 @@ pub struct McpState {
     pub registry: Mutex<Box<dyn AgentRegistry>>,
     pub permissions: Mutex<Box<dyn PermissionCheck>>,
     pub dispatcher: Mutex<Box<dyn MessageDispatcher>>,
+    pub team_ops: Mutex<Box<dyn TeamOps>>,
 }
 
 impl McpState {
@@ -140,6 +170,7 @@ impl McpState {
             registry: Mutex::new(Box::new(NoOpRegistry)),
             permissions: Mutex::new(permissions),
             dispatcher: Mutex::new(Box::new(NoOpDispatcher)),
+            team_ops: Mutex::new(Box::new(NoOpTeamOps)),
         }
     }
 
@@ -149,6 +180,10 @@ impl McpState {
 
     pub fn set_dispatcher(&self, dispatcher: Box<dyn MessageDispatcher>) {
         *self.dispatcher.lock().unwrap() = dispatcher;
+    }
+
+    pub fn set_team_ops(&self, team_ops: Box<dyn TeamOps>) {
+        *self.team_ops.lock().unwrap() = team_ops;
     }
 
     /// Resolve a pending MCP request. Returns true if a pending request was found.
@@ -202,6 +237,62 @@ fn default_tools() -> Vec<ToolDef> {
                     "message": {"type": "string", "description": "Message content"}
                 },
                 "required": ["agentId", "message"]
+            }),
+        },
+        ToolDef {
+            name: "team_spawn".into(),
+            description: "Spawn a new agent team for a given ticket.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "string", "description": "The ticket ID to create a team for"},
+                    "roles": {"type": "array", "items": {"type": "string"}, "description": "Optional list of roles to assign"}
+                },
+                "required": ["ticket_id"]
+            }),
+        },
+        ToolDef {
+            name: "team_suspend".into(),
+            description: "Suspend a running agent team.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "ID of the team to suspend"}
+                },
+                "required": ["team_id"]
+            }),
+        },
+        ToolDef {
+            name: "team_resume".into(),
+            description: "Resume a suspended agent team.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "ID of the team to resume"}
+                },
+                "required": ["team_id"]
+            }),
+        },
+        ToolDef {
+            name: "team_complete".into(),
+            description: "Mark an agent team as complete.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "ID of the team to complete"}
+                },
+                "required": ["team_id"]
+            }),
+        },
+        ToolDef {
+            name: "team_kill".into(),
+            description: "Forcibly terminate an agent team.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string", "description": "ID of the team to kill"}
+                },
+                "required": ["team_id"]
             }),
         },
     ]
@@ -349,6 +440,54 @@ fn handle_tools_call_streaming(
                 (_, Err(e)) => format!("Routed over WS but tmux delivery failed: {}", e),
             };
             let resp = JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}));
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "team_spawn" => {
+            let ticket_id = args.get("ticket_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let roles = args.get("roles").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+            });
+            let result = state.team_ops.lock().unwrap().spawn(&ticket_id, roles);
+            let resp = match result {
+                Ok(text) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]})),
+                Err(msg) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": msg}], "isError": true})),
+            };
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "team_suspend" => {
+            let team_id = args.get("team_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let result = state.team_ops.lock().unwrap().suspend(&team_id);
+            let resp = match result {
+                Ok(text) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]})),
+                Err(msg) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": msg}], "isError": true})),
+            };
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "team_resume" => {
+            let team_id = args.get("team_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let result = state.team_ops.lock().unwrap().resume(&team_id);
+            let resp = match result {
+                Ok(text) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]})),
+                Err(msg) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": msg}], "isError": true})),
+            };
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "team_complete" => {
+            let team_id = args.get("team_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let result = state.team_ops.lock().unwrap().complete(&team_id);
+            let resp = match result {
+                Ok(text) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]})),
+                Err(msg) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": msg}], "isError": true})),
+            };
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "team_kill" => {
+            let team_id = args.get("team_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let result = state.team_ops.lock().unwrap().kill(&team_id);
+            let resp = match result {
+                Ok(text) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]})),
+                Err(msg) => JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": msg}], "isError": true})),
+            };
             Some(serde_json::to_string(&resp).unwrap())
         }
         _ => None,
@@ -511,12 +650,17 @@ mod tests {
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"read_host_file"));
         assert!(names.contains(&"git_push"));
         assert!(names.contains(&"list_agents"));
         assert!(names.contains(&"message_agent"));
+        assert!(names.contains(&"team_spawn"));
+        assert!(names.contains(&"team_suspend"));
+        assert!(names.contains(&"team_resume"));
+        assert!(names.contains(&"team_complete"));
+        assert!(names.contains(&"team_kill"));
     }
 
     #[tokio::test]
@@ -614,5 +758,230 @@ mod tests {
         let resp = resp_future.await.unwrap();
         let body = resp.text().await.unwrap();
         assert!(body.contains("file data here"));
+    }
+
+    struct FakeTeamOps {
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+        spawn_result: Result<String, String>,
+        op_result: Result<String, String>,
+    }
+
+    impl TeamOps for FakeTeamOps {
+        fn spawn(&self, ticket_id: &str, _roles: Option<Vec<String>>) -> Result<String, String> {
+            self.calls.lock().unwrap().push(("spawn".into(), ticket_id.to_string()));
+            self.spawn_result.clone()
+        }
+        fn suspend(&self, team_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(("suspend".into(), team_id.to_string()));
+            match &self.op_result {
+                Ok(_) => Ok(format!("Suspended {}", team_id)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+        fn resume(&self, team_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(("resume".into(), team_id.to_string()));
+            match &self.op_result {
+                Ok(_) => Ok(format!("Resumed {}", team_id)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+        fn complete(&self, team_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(("complete".into(), team_id.to_string()));
+            match &self.op_result {
+                Ok(_) => Ok(format!("Completed {}", team_id)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+        fn kill(&self, team_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(("kill".into(), team_id.to_string()));
+            match &self.op_result {
+                Ok(_) => Ok(format!("Killed {}", team_id)),
+                Err(e) => Err(e.clone()),
+            }
+        }
+    }
+
+    async fn make_team_server(team_ops: Box<dyn TeamOps>) -> (reqwest::Client, String) {
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
+        state.set_team_ops(team_ops);
+        let app = mcp_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (reqwest::Client::new(), format!("http://{}/mcp", addr))
+    }
+
+    #[tokio::test]
+    async fn team_spawn_dispatches_and_returns_id() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Ok("team-abc".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_spawn","arguments":{"ticket_id":"X"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("team-abc"), "body: {body}");
+        assert!(!body.contains("isError"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn team_suspend_dispatches() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Ok("ok".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_suspend","arguments":{"team_id":"team-abc"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Suspended"), "body: {body}");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], ("suspend".to_string(), "team-abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn team_resume_dispatches() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Ok("ok".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_resume","arguments":{"team_id":"team-abc"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Resumed"), "body: {body}");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], ("resume".to_string(), "team-abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn team_complete_dispatches() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Ok("ok".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_complete","arguments":{"team_id":"team-abc"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Completed"), "body: {body}");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], ("complete".to_string(), "team-abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn team_kill_dispatches() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Ok("ok".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_kill","arguments":{"team_id":"team-abc"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Killed"), "body: {body}");
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], ("kill".to_string(), "team-abc".to_string()));
+    }
+
+    #[tokio::test]
+    async fn team_op_error_sets_iserror() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let fake = FakeTeamOps {
+            calls: calls.clone(),
+            spawn_result: Err("not found".into()),
+            op_result: Ok("ok".into()),
+        };
+        let (client, url) = make_team_server(Box::new(fake)).await;
+
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_spawn","arguments":{"ticket_id":"X"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("isError"), "body: {body}");
+        assert!(body.contains("not found"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn noop_team_ops_returns_unwired_error() {
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
+        let app = mcp_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{}/mcp", addr))
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"team_spawn","arguments":{"ticket_id":"X"}}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("isError"), "body: {body}");
+        assert!(body.contains("team manager not wired"), "body: {body}");
     }
 }

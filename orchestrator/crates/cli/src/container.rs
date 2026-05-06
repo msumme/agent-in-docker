@@ -163,6 +163,9 @@ mod tests {
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),
             network_name: "agent-net".into(),
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
         }
     }
 

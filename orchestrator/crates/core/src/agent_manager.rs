@@ -530,6 +530,9 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: None,
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
         }
     }
 

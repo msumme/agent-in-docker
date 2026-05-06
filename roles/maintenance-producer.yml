@@ -1,4 +1,4 @@
-name: code-agent
+name: maintenance-producer
 image: agent-in-docker
 capabilities:
   file_read: true
@@ -23,5 +23,7 @@ git_push_remotes:
   - "origin"
 
 message_agents_roles:
+  - "planner"
   - "review-agent"
-  - "code-agent"
+  - "feature-producer"
+  - "maintenance-producer"

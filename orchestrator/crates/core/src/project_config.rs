@@ -83,6 +83,22 @@ pub fn setup_agent_dir(cfg: &ProjectConfig, name: &str, persistent: bool) -> Res
     Ok(agent_dir)
 }
 
+/// Seed an agent state directory with a fresh copy of the host's claude
+/// container config (theme settings, accepted dialogs, MCP config, etc.) plus
+/// a refreshed credentials file. Without this, Claude Code in the container
+/// runs first-time setup (theme picker, etc.) and the agent hangs.
+///
+/// Used by both single-agent setup (`setup_agent_dir`) and team-agent setup
+/// (each team role's `.claude/` dir).
+pub fn seed_agent_state_dir(seed: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)?;
+    copy_seed_to_agent_dir(seed, target)?;
+    let creds_dest = target.join(".credentials.json");
+    let _ = std::fs::remove_file(&creds_dest);
+    std::fs::copy(seed.join(".credentials.json"), &creds_dest)?;
+    Ok(())
+}
+
 fn copy_seed_to_agent_dir(seed: &Path, dest: &Path) -> Result<()> {
     for entry in std::fs::read_dir(seed)? {
         let entry = entry?;

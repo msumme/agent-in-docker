@@ -132,6 +132,20 @@ pub struct StartAgentPayload {
     pub orchestrator_port: u16,
     pub mcp_port: u16,
     pub dolt_port: Option<u16>,
+    /// Additional `-v <host>:<container>:Z` mounts beyond the standard set.
+    /// Used by team agents that mount the project root at its host path so
+    /// git worktree pointers resolve inside the container.
+    #[serde(default)]
+    pub extra_mounts: Vec<(String, String)>,
+    /// Override Claude Code's `--model`. Empty = inherit project settings.
+    /// Team agents set this per role (e.g. "claude-opus-4-7" for planner
+    /// and reviewer; "claude-sonnet-4-6" for producer).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Override Claude Code's `--effort` (low|medium|high|xhigh|max).
+    /// Empty = inherit project settings. Team agents set this per role.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl StartAgentPayload {
@@ -171,6 +185,12 @@ impl StartAgentPayload {
             "-e".to_string(),
             format!("AGENT_PROMPT={}", self.prompt),
             "-e".to_string(),
+            // bd identifies whoever runs the command via --actor → $BD_ACTOR
+            // → git user.name → $USER. Pinning BD_ACTOR per agent gives every
+            // bd action a correct assignee/audit trail, and prevents an agent
+            // from spoofing identity by passing --actor explicitly.
+            format!("BD_ACTOR={}", self.name),
+            "-e".to_string(),
             "IS_SANDBOX=1".to_string(),
         ];
 
@@ -192,6 +212,20 @@ impl StartAgentPayload {
                 "-e".to_string(), "DOLT_HOST=host.containers.internal".to_string(),
                 "-e".to_string(), format!("DOLT_PORT={}", port),
             ]);
+        }
+
+        for (host, ctr) in &self.extra_mounts {
+            args.extend_from_slice(&[
+                "-v".to_string(),
+                format!("{}:{}:Z", host, ctr),
+            ]);
+        }
+
+        if let Some(model) = self.model.as_ref().filter(|s| !s.is_empty()) {
+            args.extend_from_slice(&["-e".to_string(), format!("AGENT_MODEL={}", model)]);
+        }
+        if let Some(effort) = self.effort.as_ref().filter(|s| !s.is_empty()) {
+            args.extend_from_slice(&["-e".to_string(), format!("AGENT_EFFORT={}", effort)]);
         }
 
         args.push(self.image_name.clone());
@@ -340,6 +374,9 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: Some(3307),
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let parsed: StartAgentPayload = serde_json::from_str(&json).unwrap();
@@ -363,6 +400,9 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: None,
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
         };
         let args = p.container_run_args();
         assert!(args.iter().any(|a| a == "AGENT_NAME=test"));
@@ -393,6 +433,9 @@ mod tests {
             orchestrator_port: 9800,
             mcp_port: 9801,
             dolt_port: Some(3307),
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
         };
         let args = p.container_run_args();
         assert!(args.iter().any(|a| a == "AGENT_ROLE_PROMPT=hello"));

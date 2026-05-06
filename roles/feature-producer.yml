@@ -1,7 +1,8 @@
-name: review-agent
+name: feature-producer
+image: agent-in-docker
 capabilities:
   file_read: true
-  git_push: false
+  git_push: true
   user_prompt: true
   discover_agents: true
   message_agents: true
@@ -18,10 +19,11 @@ file_read_deny_paths:
   - "**/credentials*"
   - "**/.env*"
 
-git_push_remotes: []
+git_push_remotes:
+  - "origin"
 
 message_agents_roles:
   - "planner"
+  - "review-agent"
   - "feature-producer"
   - "maintenance-producer"
-  - "review-agent"

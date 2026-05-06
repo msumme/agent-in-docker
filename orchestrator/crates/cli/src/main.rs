@@ -1,7 +1,9 @@
+mod auth;
 mod config;
 mod container;
 mod login;
 mod services;
+mod team_cmd;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -24,8 +26,11 @@ enum Commands {
         /// Prompt or task for the agent
         prompt: String,
         /// Agent role. Determines permissions, memory bucket, and (by default)
-        /// which role-prompt file is looked up.
-        #[arg(long, default_value = "code-agent")]
+        /// which role-prompt file is looked up. Defaults to maintenance-producer
+        /// — the safer producer that addresses existing tickets rather than
+        /// inventing new features. Pick `feature-producer` for new capability,
+        /// or one of the reviewers (`architect`, `cleaner`, `review-agent`).
+        #[arg(long, default_value = "maintenance-producer")]
         role: String,
         /// Role-prompt spec: a bare name (looked up in project/user/bundled
         /// roles dirs) or a file path. Defaults to the role name.
@@ -43,6 +48,51 @@ enum Commands {
     },
     /// Authenticate with Claude (opens browser)
     Login,
+    /// Manage agent teams (PR-scoped groups of planner/producer/reviewer)
+    Team {
+        #[command(subcommand)]
+        action: TeamAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamAction {
+    /// Spawn a team for a bd ticket (provisions worktree + 3 agents)
+    Spawn {
+        /// bd ticket id (e.g. agent-in-docker-0fw.2)
+        ticket_id: String,
+        /// Base branch the team's worktree branches from
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Use maintenance-producer instead of feature-producer
+        #[arg(long)]
+        maintenance: bool,
+    },
+    /// Suspend a team (kill containers; state preserved on disk)
+    Suspend {
+        team_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a suspended team (restart containers; primer injected)
+    Resume {
+        team_id: String,
+        /// Resume only the named role (planner | feature-producer |
+        /// maintenance-producer | review-agent). Default: all roles.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// List all known teams (active and suspended)
+    List,
+    /// Show one team's manifest details
+    Status { team_id: String },
+    /// Force-teardown a team (containers gone, worktree removed, manifest archived/deleted)
+    Kill {
+        team_id: String,
+        /// Skip archive — delete the team dir entirely
+        #[arg(long)]
+        no_archive: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -51,6 +101,22 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Login => login::run_login(&cfg),
+        Commands::Team { action } => match action {
+            TeamAction::Spawn {
+                ticket_id,
+                base,
+                maintenance,
+            } => team_cmd::cmd_spawn(&cfg, &ticket_id, &base, maintenance),
+            TeamAction::Suspend { team_id, reason } => {
+                team_cmd::cmd_suspend(&cfg, &team_id, reason)
+            }
+            TeamAction::Resume { team_id, role } => team_cmd::cmd_resume(&cfg, &team_id, role),
+            TeamAction::List => team_cmd::cmd_list(&cfg),
+            TeamAction::Status { team_id } => team_cmd::cmd_status(&cfg, &team_id),
+            TeamAction::Kill { team_id, no_archive } => {
+                team_cmd::cmd_kill(&cfg, &team_id, !no_archive)
+            }
+        },
         Commands::Run {
             project_path,
             prompt,
@@ -196,6 +262,9 @@ fn main() -> Result<()> {
                 dolt_port,
                 image_name: cfg.image_name.clone(),
                 network_name: cfg.network_name.clone(),
+                extra_mounts: vec![],
+                model: None,
+                effort: None,
             };
 
             if mode == "long-running" {

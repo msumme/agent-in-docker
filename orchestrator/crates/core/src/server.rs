@@ -577,6 +577,9 @@ pub async fn run_with_id_gen(
                             orchestrator_port: cfg.orchestrator_port,
                             mcp_port: cfg.mcp_port,
                             dolt_port: cfg.dolt_port,
+                            extra_mounts: vec![],
+                            model: None,
+                            effort: None,
                         };
                         let mut m = mgr.lock().unwrap();
                         match m.start_agent(&payload) {

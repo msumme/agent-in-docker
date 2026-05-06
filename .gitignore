@@ -21,3 +21,10 @@ dist/
 .claude-container/
 .agents/*
 !.agents/roles/
+
+# Teams
+.teams/
+.teams-worktrees/
+
+# Stale per-agent state from earlier prefix
+.claude-agents/

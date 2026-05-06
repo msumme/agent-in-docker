@@ -6,13 +6,31 @@ use crate::config::Config;
 pub fn run_login(cfg: &Config) -> Result<()> {
     println!("==> Starting Claude Code login flow...");
 
-    // Ensure container image exists
+    std::fs::create_dir_all(&cfg.seed_dir)?;
+
+    // Try keychain extraction first — if the host's Claude Code is logged
+    // in, this completes with zero browser interaction (after a one-time
+    // "Always Allow" on the macOS keychain prompt).
+    match crate::auth::refresh_credentials_from_keychain(&cfg.seed_dir) {
+        Ok(true) => {
+            println!(
+                "==> Credentials refreshed from macOS keychain. No browser flow needed.\n\
+                 ==> Wrote {}",
+                cfg.seed_dir.join(".credentials.json").display()
+            );
+            return Ok(());
+        }
+        Ok(false) => println!(
+            "==> Keychain entry not accessible — falling back to interactive login."
+        ),
+        Err(e) => eprintln!("==> Warning: keychain extraction failed ({}); falling back.", e),
+    }
+
+    // Ensure container image exists for interactive fallback
     if !crate::container::image_exists(&cfg.image_name)? {
         println!("==> Building container image first...");
         crate::container::build_image(cfg)?;
     }
-
-    std::fs::create_dir_all(&cfg.seed_dir)?;
 
     // Restore .claude.json from backup if missing
     let claude_json = cfg.seed_dir.join(".claude.json");

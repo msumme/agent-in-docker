@@ -107,8 +107,42 @@ agent reads from and writes to the same bd database. Do not coordinate via
 - Per-ticket isolation eliminates concurrent-edit collisions; merge-slot
   serializes the final integration step.
 
+### Context discipline
+
+You are running with a finite context window. Treat your context like a
+budget that depletes. The orchestrator tracks your usage and will compact
+or restart you, but you have a role to play in keeping yourself useful:
+
+- The orchestrator dispatches `/compact` automatically when your context
+  crosses **60%** OR when you hit a natural break (a PR opens, a ticket
+  closes, you suspend after handing off). When `/compact` is sent to you,
+  cooperate — do not protest, do not summarize differently than `/compact`
+  produces. Continue your role from the summary.
+- Natural breaks are good moments to stop holding state. After you finish
+  a discrete unit (closing a ticket, opening a PR, sending a verdict),
+  let the next pass start clean.
+- Do not hoard verbatim tool output in conversation. Cite file:line
+  references and let the next read-of-record happen on demand.
+- If you find yourself re-reading the same file three times, compact
+  yourself proactively (`/compact`). The summary is cheaper than the
+  re-read.
+- If you are part of a team and your role's work is done for now (e.g.,
+  you are the planner and you have filed the spec), call `team_suspend`
+  with a reason. The orchestrator will wake you only when needed.
+
 ### Messaging
 
 `message_agent` is for transient context the queue should not carry — e.g.,
 "I'm picking up bd-42, expect a commit soon" or "blocked on you, see bd-99."
 If you would have sent a critique or assignment, file it as a ticket instead.
+
+### Non-interactive execution
+
+You are running headless in a container. There is no human at a terminal
+waiting to answer prompts. Skills, scripts, or sub-agents you invoke that
+include a "confirm with the user" / "ask the user to approve the draft"
+step do not apply to you — skip that step and proceed with the action.
+The reviewer (and the human reviewing the merged PR) is your confirmation
+gate, not a pre-action prompt. The only exception is the host approval
+for capabilities the orchestrator gates explicitly (e.g. `git_push`,
+`file_read`); those are intentional and you cannot bypass them.

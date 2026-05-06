@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
     setup::verify_credentials()?;
     setup::pre_accept_workspace_trust()?;
     setup::configure_beads()?;
+    setup::configure_git_identity(&agent_name)?;
     setup::write_mcp_config(&mcp_port, &agent_name, &agent_role)?;
 
     // Register with orchestrator via WebSocket (background task)
@@ -50,6 +51,23 @@ async fn main() -> Result<()> {
         claude_args.push(agent_role_prompt);
     } else {
         eprintln!("[entrypoint] No AGENT_ROLE_PROMPT set — starting without --append-system-prompt");
+    }
+
+    // Per-role model/effort overrides. Empty values mean "inherit project
+    // .claude/settings.json", which is the right default for non-team agents.
+    if let Ok(model) = std::env::var("AGENT_MODEL") {
+        if !model.is_empty() {
+            eprintln!("[entrypoint] --model {}", model);
+            claude_args.push("--model".to_string());
+            claude_args.push(model);
+        }
+    }
+    if let Ok(effort) = std::env::var("AGENT_EFFORT") {
+        if !effort.is_empty() {
+            eprintln!("[entrypoint] --effort {}", effort);
+            claude_args.push("--effort".to_string());
+            claude_args.push(effort);
+        }
     }
 
     if agent_mode == "oneshot" && !agent_prompt.is_empty() {

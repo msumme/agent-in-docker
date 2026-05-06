@@ -86,6 +86,31 @@ pub fn configure_beads() -> Result<()> {
     Ok(())
 }
 
+/// Configure git identity to match the agent's name. Every commit the agent
+/// authors will be attributed to its agent name; every bd action defaults to
+/// the agent name as actor (BD_ACTOR is also set explicitly by the host CLI).
+///
+/// Also marks every directory as safe — the worktree is owned by the host
+/// UID, which differs from root inside the container, so git refuses by
+/// default. Inside an isolated container this is the right trade-off.
+pub fn configure_git_identity(agent_name: &str) -> Result<()> {
+    let _ = std::process::Command::new("git")
+        .args(["config", "--global", "user.name", agent_name])
+        .status();
+    let _ = std::process::Command::new("git")
+        .args([
+            "config",
+            "--global",
+            "user.email",
+            &format!("{}@agents.local", agent_name),
+        ])
+        .status();
+    let _ = std::process::Command::new("git")
+        .args(["config", "--global", "--add", "safe.directory", "*"])
+        .status();
+    Ok(())
+}
+
 /// Write MCP config file pointing to the orchestrator's HTTP MCP server.
 pub fn write_mcp_config(mcp_port: &str, agent_name: &str, agent_role: &str) -> Result<()> {
     write_mcp_config_to("/tmp/mcp-config.json", mcp_port, agent_name, agent_role)

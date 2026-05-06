@@ -11,11 +11,21 @@ use tracing::{error, info, warn};
 use crate::mcp::AgentRegistry;
 use crate::types::*;
 
-/// Executes approved requests (file reads, git pushes). Injectable for testing.
+/// Executes approved requests (file reads, git pushes, PR creation). Injectable for testing.
 pub trait RequestExecutor: Send + Sync {
     fn execute_file_read(&self, path: &str) -> Result<String, String>;
     fn execute_git_push(&self, workspace: &str, remote: &str, branch: &str) -> Result<String, String>;
     fn current_branch(&self, workspace: &str) -> Result<String, String>;
+    fn execute_gh_pr_create(
+        &self,
+        workspace: &str,
+        base: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<serde_json::Value, String>;
+    fn execute_gh_pr_view(&self, workspace: &str, ref_: &str) -> Result<serde_json::Value, String>;
 }
 
 /// Real executor using file I/O and git commands.
@@ -30,6 +40,22 @@ impl RequestExecutor for RealRequestExecutor {
     }
     fn current_branch(&self, workspace: &str) -> Result<String, String> {
         crate::handlers::git_push::current_branch(workspace)
+    }
+    fn execute_gh_pr_create(
+        &self,
+        workspace: &str,
+        base: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<serde_json::Value, String> {
+        let (url, number) =
+            crate::handlers::gh_pr::pr_create(workspace, base, head, title, body, draft)?;
+        Ok(serde_json::json!({"url": url, "number": number}))
+    }
+    fn execute_gh_pr_view(&self, workspace: &str, ref_: &str) -> Result<serde_json::Value, String> {
+        crate::handlers::gh_pr::pr_view(workspace, ref_)
     }
 }
 
@@ -331,6 +357,26 @@ impl ServerState {
                 match self.executor.execute_git_push(&workspace, remote, &branch) {
                     Ok(output) => ("git_push_response", serde_json::json!({"success": true, "output": output})),
                     Err(e) => ("error", serde_json::json!({"code": "PUSH_FAILED", "message": e})),
+                }
+            }
+            "gh_pr_create" => {
+                let base = pending.payload.get("base").and_then(|v| v.as_str()).unwrap_or("main");
+                let head = pending.payload.get("head").and_then(|v| v.as_str()).unwrap_or("");
+                let title = pending.payload.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                let body = pending.payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                let draft = pending.payload.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+                let workspace = self.agent_workspace(&pending.agent_id).unwrap_or_default();
+                match self.executor.execute_gh_pr_create(&workspace, base, head, title, body, draft) {
+                    Ok(v) => ("gh_pr_create_response", v),
+                    Err(e) => ("error", serde_json::json!({"code": "PR_CREATE_FAILED", "message": e})),
+                }
+            }
+            "gh_pr_view" => {
+                let ref_ = pending.payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                let workspace = self.agent_workspace(&pending.agent_id).unwrap_or_default();
+                match self.executor.execute_gh_pr_view(&workspace, ref_) {
+                    Ok(v) => ("gh_pr_view_response", v),
+                    Err(e) => ("error", serde_json::json!({"code": "PR_VIEW_FAILED", "message": e})),
                 }
             }
             _ => ("error", serde_json::json!({"code": "UNKNOWN_REQUEST", "message": "Cannot execute this request type"})),
@@ -699,7 +745,7 @@ async fn handle_connection(
                 info!("Agent registered: {} ({})", payload.name, id);
             }
 
-            "user_prompt" | "file_read" | "git_push" => {
+            "user_prompt" | "file_read" | "git_push" | "gh_pr_create" | "gh_pr_view" => {
                 if let Some(ref aid) = agent_id {
                     let mut s = state.lock().await;
                     s.handle_request(aid, message.id.clone(), &message.msg_type, message.payload);
@@ -1289,6 +1335,20 @@ mod tests {
         fn current_branch(&self, _ws: &str) -> Result<String, String> {
             Ok("main".into())
         }
+        fn execute_gh_pr_create(
+            &self,
+            _ws: &str,
+            _base: &str,
+            _head: &str,
+            _title: &str,
+            _body: &str,
+            _draft: bool,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"url": "https://github.com/owner/repo/pull/99", "number": 99}))
+        }
+        fn execute_gh_pr_view(&self, _ws: &str, _ref_: &str) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"number": 99, "url": "https://github.com/owner/repo/pull/99", "title": "Fake PR"}))
+        }
     }
 
     #[test]
@@ -1332,5 +1392,96 @@ mod tests {
         assert_eq!(msg.msg_type, "git_push_response");
         assert!(msg.payload["success"].as_bool().unwrap());
         assert_eq!(msg.payload["output"], "fake push ok");
+    }
+
+    #[test]
+    fn execute_gh_pr_create_with_fake_executor() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent(
+            "producer".into(),
+            "code-agent".into(),
+            Some("/ws".into()),
+            sender,
+        );
+        let _ = event_rx.try_recv();
+
+        state.handle_request(
+            &id,
+            "pc-1".into(),
+            "gh_pr_create",
+            json!({"base": "main", "head": "feature/x", "title": "My PR", "body": "desc", "draft": false}),
+        );
+        let _ = event_rx.try_recv();
+
+        state.execute_approved_request("pc-1");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "gh_pr_create_response");
+        assert_eq!(msg.payload["url"], "https://github.com/owner/repo/pull/99");
+        assert_eq!(msg.payload["number"], 99);
+    }
+
+    #[test]
+    fn execute_gh_pr_create_err_produces_error_code() {
+        struct FailExecutor;
+        impl RequestExecutor for FailExecutor {
+            fn execute_file_read(&self, _: &str) -> Result<String, String> { Ok("".into()) }
+            fn execute_git_push(&self, _: &str, _: &str, _: &str) -> Result<String, String> { Ok("".into()) }
+            fn current_branch(&self, _: &str) -> Result<String, String> { Ok("main".into()) }
+            fn execute_gh_pr_create(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: bool) -> Result<serde_json::Value, String> {
+                Err("gh auth failed".into())
+            }
+            fn execute_gh_pr_view(&self, _: &str, _: &str) -> Result<serde_json::Value, String> { Ok(json!({})) }
+        }
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FailExecutor));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent("test".into(), "code-agent".into(), Some("/ws".into()), sender);
+        let _ = event_rx.try_recv();
+
+        state.handle_request(&id, "pc-2".into(), "gh_pr_create", json!({}));
+        let _ = event_rx.try_recv();
+
+        state.execute_approved_request("pc-2");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "error");
+        assert_eq!(msg.payload["code"], "PR_CREATE_FAILED");
+    }
+
+    #[test]
+    fn execute_gh_pr_view_with_fake_executor() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+
+        let (id, _) = state.register_agent(
+            "reviewer".into(),
+            "review-agent".into(),
+            Some("/ws".into()),
+            sender,
+        );
+        let _ = event_rx.try_recv();
+
+        state.handle_request(&id, "pv-1".into(), "gh_pr_view", json!({"ref": "99"}));
+        let _ = event_rx.try_recv();
+
+        state.execute_approved_request("pv-1");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "gh_pr_view_response");
+        assert_eq!(msg.payload["number"], 99);
+        assert_eq!(msg.payload["title"], "Fake PR");
     }
 }

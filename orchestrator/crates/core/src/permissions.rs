@@ -155,6 +155,10 @@ impl PermissionChecker {
         }
     }
 
+    pub fn check_gh_pr_create(&self, role_name: &str, _base: &str) -> PermissionResult {
+        self.check_capability(role_name, "gh_pr_create")
+    }
+
     fn resolve_path(&self, path: &str) -> String {
         let expanded = self.expand_env(path);
         // Resolve .. components to prevent traversal
@@ -207,6 +211,9 @@ impl crate::mcp::PermissionCheck for PermissionChecker {
     }
     fn check_git_push(&self, role: &str, remote: &str) -> PermissionResult {
         PermissionChecker::check_git_push(self, role, remote)
+    }
+    fn check_gh_pr_create(&self, role: &str, base: &str) -> PermissionResult {
+        PermissionChecker::check_gh_pr_create(self, role, base)
     }
 }
 
@@ -390,6 +397,45 @@ mod tests {
         let checker = make_checker();
         assert!(matches!(
             checker.check_git_push("review-agent", "origin"),
+            PermissionResult::Deny(_)
+        ));
+    }
+
+    fn pr_agent_role() -> Role {
+        Role {
+            name: "pr-agent".into(),
+            capabilities: [("gh_pr_create".into(), true)].into(),
+            file_read_paths: vec![],
+            file_read_deny_paths: vec![],
+            git_push_remotes: vec![],
+            message_agents_roles: vec![],
+        }
+    }
+
+    #[test]
+    fn check_gh_pr_create_needs_approval_with_capability() {
+        let mut checker = PermissionChecker::new(Box::new(FakeEnv::new("/home/test")));
+        checker.add_role(pr_agent_role());
+        assert_eq!(
+            checker.check_gh_pr_create("pr-agent", "main"),
+            PermissionResult::NeedsApproval
+        );
+    }
+
+    #[test]
+    fn check_gh_pr_create_denies_without_capability() {
+        let checker = make_checker();
+        assert!(matches!(
+            checker.check_gh_pr_create("code-agent", "main"),
+            PermissionResult::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn check_gh_pr_create_denies_unknown_role() {
+        let checker = make_checker();
+        assert!(matches!(
+            checker.check_gh_pr_create("nonexistent", "main"),
             PermissionResult::Deny(_)
         ));
     }

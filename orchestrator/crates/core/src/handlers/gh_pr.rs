@@ -1,0 +1,199 @@
+use std::io::Write;
+use std::process::Command;
+
+use serde_json::Value;
+
+/// Create a GitHub pull request using the host's gh credentials.
+/// Writes the body to a tempfile to avoid shell-escape and arg-length issues.
+/// The tempfile is cleaned up when this function returns.
+pub fn pr_create(
+    workspace: &str,
+    base: &str,
+    head: &str,
+    title: &str,
+    body: &str,
+    draft: bool,
+) -> Result<(String, u64), String> {
+    let mut tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("Failed to create tempfile: {}", e))?;
+    tmp.write_all(body.as_bytes())
+        .map_err(|e| format!("Failed to write body to tempfile: {}", e))?;
+    tmp.flush()
+        .map_err(|e| format!("Failed to flush tempfile: {}", e))?;
+    let tmp_path = tmp.path().to_str().unwrap().to_string();
+
+    let mut cmd = Command::new("gh");
+    if !workspace.is_empty() {
+        cmd.args(["-C", workspace]);
+    }
+    cmd.args([
+        "pr",
+        "create",
+        "--base",
+        base,
+        "--head",
+        head,
+        "--title",
+        title,
+        "--body-file",
+        &tmp_path,
+    ]);
+    if draft {
+        cmd.arg("--draft");
+    }
+    cmd.args(["--json", "number,url"]);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute gh pr create: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // NamedTempFile deletes the file when dropped
+    drop(tmp);
+
+    if output.status.success() {
+        let v: Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| format!("Failed to parse gh pr create output: {} (raw: {})", e, stdout))?;
+        let url = v
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
+        let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+        Ok((url, number))
+    } else {
+        Err(format!("gh pr create failed: {}{}", stdout, stderr))
+    }
+}
+
+/// View details of a GitHub pull request.
+/// Returns the raw JSON value from gh.
+pub fn pr_view(workspace: &str, ref_: &str) -> Result<Value, String> {
+    let mut cmd = Command::new("gh");
+    if !workspace.is_empty() {
+        cmd.args(["-C", workspace]);
+    }
+    cmd.args([
+        "pr",
+        "view",
+        ref_,
+        "--json",
+        "number,url,title,body,state,author,baseRefName,headRefName,createdAt,updatedAt",
+    ]);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute gh pr view: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        serde_json::from_str(stdout.trim()).map_err(|e| {
+            format!(
+                "Failed to parse gh pr view output: {} (raw: {})",
+                e, stdout
+            )
+        })
+    } else {
+        Err(format!("gh pr view failed: {}{}", stdout, stderr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_fake_gh(script: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let gh_path = dir.path().join("gh");
+        std::fs::write(&gh_path, format!("#!/bin/sh\n{}", script)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    fn with_fake_gh<T>(dir: &tempfile::TempDir, f: impl FnOnce() -> T) -> T {
+        let _guard = PATH_MUTEX.lock().unwrap();
+        let dir_path = dir.path().to_str().unwrap();
+        let original = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: single-threaded via PATH_MUTEX
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir_path, original)) };
+        let result = f();
+        unsafe { std::env::set_var("PATH", original) };
+        result
+    }
+
+    #[test]
+    fn pr_create_parses_url_and_number() {
+        let dir = make_fake_gh(
+            r#"printf '{"url":"https://github.com/owner/repo/pull/1","number":1}'"#,
+        );
+        let result = with_fake_gh(&dir, || pr_create("", "main", "feat", "Title", "Body", false));
+        let (url, number) = result.unwrap();
+        assert_eq!(url, "https://github.com/owner/repo/pull/1");
+        assert_eq!(number, 1);
+    }
+
+    #[test]
+    fn pr_create_returns_err_on_nonzero_exit() {
+        let dir = make_fake_gh("echo 'some error' >&2; exit 1");
+        let result = with_fake_gh(&dir, || pr_create("", "main", "feat", "Title", "Body", false));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed"));
+    }
+
+    #[test]
+    fn pr_create_tempfile_cleaned_up_after_call() {
+        let capture = tempfile::NamedTempFile::new().unwrap();
+        let capture_path = capture.path().to_str().unwrap().to_string();
+
+        let script = format!(
+            r#"
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "bf" ]; then
+    printf '%s' "$arg" > {capture}
+  fi
+  if [ "$arg" = "--body-file" ]; then prev="bf"; else prev=""; fi
+done
+printf '{{"url":"https://github.com/owner/repo/pull/1","number":1}}'
+"#,
+            capture = capture_path
+        );
+        let dir = make_fake_gh(&script);
+
+        let result = with_fake_gh(&dir, || pr_create("", "main", "feat", "Title", "Body", false));
+        assert!(result.is_ok());
+
+        let body_file_path = std::fs::read_to_string(&capture_path).unwrap();
+        assert!(!body_file_path.is_empty(), "Should have captured body-file path");
+        assert!(
+            !std::path::Path::new(body_file_path.trim()).exists(),
+            "Body tempfile should be cleaned up after pr_create returns"
+        );
+    }
+
+    #[test]
+    fn pr_view_returns_json_on_success() {
+        let dir = make_fake_gh(
+            r#"printf '{"number":42,"url":"https://github.com/o/r/pull/42","title":"My PR","state":"OPEN"}'"#,
+        );
+        let result = with_fake_gh(&dir, || pr_view("", "42"));
+        let v = result.unwrap();
+        assert_eq!(v["number"], 42);
+        assert_eq!(v["title"], "My PR");
+    }
+
+    #[test]
+    fn pr_view_returns_err_on_nonzero_exit() {
+        let dir = make_fake_gh("echo 'no pr found' >&2; exit 1");
+        let result = with_fake_gh(&dir, || pr_view("", "999"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed"));
+    }
+}

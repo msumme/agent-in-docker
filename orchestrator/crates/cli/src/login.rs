@@ -26,11 +26,9 @@ pub fn run_login(cfg: &Config) -> Result<()> {
         Err(e) => eprintln!("==> Warning: keychain extraction failed ({}); falling back.", e),
     }
 
-    // Ensure container image exists for interactive fallback
-    if !crate::container::image_exists(&cfg.image_name)? {
-        println!("==> Building container image first...");
-        crate::container::build_image(cfg)?;
-    }
+    // Ensure the bundled base image exists — login runs claude inside an
+    // interactive container against the base image, no project layer needed.
+    crate::image_resolver::ensure_base_image(cfg)?;
 
     // Restore .claude.json from backup if missing
     let claude_json = cfg.seed_dir.join(".claude.json");
@@ -55,7 +53,7 @@ pub fn run_login(cfg: &Config) -> Result<()> {
             "-w", "/tmp",
             "-v",
             &format!("{}:/root/.claude:Z", cfg.seed_dir.display()),
-            &cfg.image_name,
+            crate::image_resolver::BASE_IMAGE,
             "--dangerously-skip-permissions",
         ])
         .status()

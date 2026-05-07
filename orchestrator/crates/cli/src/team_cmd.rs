@@ -18,6 +18,7 @@ use orchestrator_core::types::StartAgentPayload;
 
 use crate::config::Config;
 use crate::container;
+use crate::image_resolver;
 use crate::services;
 
 /// Role-specific spawn primer. The team pipeline is sequential — planner first,
@@ -182,6 +183,8 @@ fn build_payload_for_team_agent(
     initial_prompt: String,
 ) -> Result<StartAgentPayload> {
     let (model_override, effort_override) = role_model_effort(agent_role);
+    let resolved = image_resolver::resolve(cfg, agent_role);
+    image_resolver::ensure_image(cfg, &resolved)?;
     let bundled_roles = cfg.project_root.join("roles");
     // Resolve role prompt by name → bundled .md.
     let role_prompt_text = match project_config::resolve_role_prompt(
@@ -222,7 +225,7 @@ fn build_payload_for_team_agent(
         orchestrator_port: cfg.orchestrator_port,
         mcp_port: cfg.mcp_port,
         dolt_port,
-        image_name: cfg.image_name.clone(),
+        image_name: resolved.image_name,
         network_name: cfg.network_name.clone(),
         // Mirror the project root at its host path. The worktree's `.git`
         // file points to `<host-project>/.git/worktrees/<id>` — that path
@@ -265,10 +268,11 @@ pub fn cmd_spawn(
     let pcfg = cfg.to_project_config(None);
     project_config::ensure_credentials(&pcfg)?;
 
-    if !container::image_exists(&cfg.image_name)? {
-        println!("==> Building container image...");
-        container::build_image(cfg)?;
-    }
+    // Per-agent images are built lazily inside build_payload_for_team_agent.
+    // We still ensure the bundled base exists upfront so the first agent's
+    // FROM clause resolves locally without surprising the user with a slow
+    // first build right after the team manifest is written.
+    image_resolver::ensure_base_image(cfg)?;
 
     container::ensure_network(&cfg.network_name)?;
     services::ensure_orchestrator(cfg)?;

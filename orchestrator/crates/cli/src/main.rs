@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod container;
+mod image_resolver;
 mod login;
 mod services;
 mod team_cmd;
@@ -238,10 +239,16 @@ fn main() -> Result<()> {
                 project_config::save_persisted_config(&pcfg, &agent_name, &persisted)?;
             }
 
-            if build || !container::image_exists(&cfg.image_name)? {
-                println!("==> Building container image...");
-                container::build_image(&cfg)?;
+            let resolved = image_resolver::resolve_for(&project_path, &role);
+            if build {
+                image_resolver::ensure_base_image(&cfg)?;
+                // Forced rebuild: blow the per-role tag away so ensure_image
+                // re-runs `podman build` instead of seeing the cached tag.
+                let _ = std::process::Command::new("podman")
+                    .args(["image", "rm", "-f", &resolved.image_name])
+                    .status();
             }
+            image_resolver::ensure_image(&cfg, &resolved)?;
 
             container::ensure_network(&cfg.network_name)?;
             services::ensure_orchestrator(&cfg)?;
@@ -260,7 +267,7 @@ fn main() -> Result<()> {
                 orchestrator_port: cfg.orchestrator_port,
                 mcp_port: cfg.mcp_port,
                 dolt_port,
-                image_name: cfg.image_name.clone(),
+                image_name: resolved.image_name,
                 network_name: cfg.network_name.clone(),
                 extra_mounts: vec![],
                 model: None,

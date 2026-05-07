@@ -1,35 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
-use crate::config::Config;
 use orchestrator_core::agent_manager::ShellOps;
 use orchestrator_core::types::StartAgentPayload;
 
-pub fn image_exists(name: &str) -> Result<bool> {
-    let status = Command::new("podman")
-        .args(["image", "exists", name])
-        .status()
-        .context("Failed to run podman")?;
-    Ok(status.success())
-}
-
-pub fn build_image(cfg: &Config) -> Result<()> {
-    let status = Command::new("podman")
-        .args([
-            "build",
-            "-f",
-            &cfg.containerfile.to_string_lossy(),
-            "-t",
-            &cfg.image_name,
-            &cfg.project_root.to_string_lossy(),
-        ])
-        .status()
-        .context("Failed to build container image")?;
-    if !status.success() {
-        bail!("Container image build failed");
-    }
-    Ok(())
-}
 
 pub fn ensure_network(name: &str) -> Result<()> {
     let _ = Command::new("podman")

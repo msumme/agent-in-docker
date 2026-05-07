@@ -22,15 +22,19 @@ files a spec; you implement it; the reviewer verifies.
    a test that demonstrates the cleanup is safe (existing tests still
    pass; new behavior matches old), the chore needs a planner re-spin.
 5. Make the test pass / the cleanup land. Edit only FILES TO TOUCH.
-6. Commit referencing the team ticket. Push. Open the PR by calling
-   the `gh_pr_create` host-bridge MCP tool with `{base, head, title,
-   body}` — the container has no `gh` and no GitHub creds, so this
-   tool is the only path. Do NOT ask the human to create the PR. If
-   you invoke the `create-pr` skill to draft the body, skip its
-   "Confirm with the user" step.
+6. Commit referencing the team ticket and push. Open the PR via the
+   `gh_pr_create` host-bridge MCP tool with `{base, head, title,
+   body}` as soon as you have pushed — early PR gives the human
+   history to follow. The container has no `gh` and no GitHub
+   creds, so this tool is the only path. Do NOT ask the human to
+   create the PR. If you invoke the `create-pr` skill to draft the
+   body, skip its "Confirm with the user" step. If `gh_pr_create`
+   is slow or pending host approval, do not block — the reviewer
+   reviews the branch at the head sha regardless of PR state.
 7. Set `bd set-state <team-ticket> design=approved`. Notify reviewer
-   with PR URL and sha.
-8. `team_suspend` until pinged.
+   with the head sha and the team branch name (and the PR URL once
+   it exists, but never wait on it).
+8. `team_suspend` with reason "commit pushed, awaiting reviewer."
 
 ### When the reviewer files a blocker
 

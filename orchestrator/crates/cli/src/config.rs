@@ -19,21 +19,22 @@ pub struct Config {
 }
 
 impl Config {
-    /// Discover config by finding the project root (where Containerfile is).
+    /// Discover config by finding the agent-in-docker repo root (where
+    /// `Containerfile.base` lives — the bundled base image source).
     pub fn discover() -> Result<Self> {
         let exe = std::env::current_exe().context("Cannot determine executable path")?;
         // The binary lives at orchestrator/target/debug/agent or similar.
-        // Walk up to find the project root (contains Containerfile).
+        // Walk up to find the repo root (contains Containerfile.base).
         let mut dir = exe.parent().context("Cannot determine executable parent directory")?.to_path_buf();
         loop {
-            if dir.join("Containerfile").exists() {
+            if dir.join("Containerfile.base").exists() {
                 break;
             }
             if !dir.pop() {
                 // Fallback: try current directory
                 dir = std::env::current_dir()?;
-                if !dir.join("Containerfile").exists() {
-                    bail!("Cannot find project root (no Containerfile found)");
+                if !dir.join("Containerfile.base").exists() {
+                    bail!("Cannot find agent-in-docker repo root (no Containerfile.base found)");
                 }
                 break;
             }
@@ -43,7 +44,7 @@ impl Config {
             seed_dir: dir.join(".claude-container"),
             agents_dir: dir.join(".agents"),
             orchestrator_bin: dir.join("orchestrator/target/debug/orchestrator"),
-            containerfile: dir.join("Containerfile"),
+            containerfile: dir.join("Containerfile.base"),
             entrypoint: dir.join("scripts/entrypoint.sh"),
             orchestrator_port: std::env::var("ORCHESTRATOR_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9800),
             mcp_port: std::env::var("MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9801),

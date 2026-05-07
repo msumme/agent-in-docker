@@ -250,6 +250,16 @@ pub enum OrchestratorEvent {
         text: String,
     },
     ManagedAgentUpdated(ManagedAgent),
+    /// Outcome of an approved request after execution. Distinct from
+    /// approval intent — approval means "go", this means "ran, here's
+    /// what happened." Surfaces silent handler failures to the operator.
+    RequestExecuted {
+        agent_id: String,
+        agent_name: String,
+        request_type: String,
+        success: bool,
+        summary: String,
+    },
 }
 
 /// Commands sent from the frontend (TUI) to the core server.

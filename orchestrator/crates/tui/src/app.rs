@@ -95,6 +95,18 @@ impl App {
             OrchestratorEvent::AgentOutput { agent_id: _, text } => {
                 self.completed_log.push(text);
             }
+            OrchestratorEvent::RequestExecuted {
+                agent_id: _,
+                agent_name,
+                request_type,
+                success: _,
+                summary,
+            } => {
+                self.completed_log.push(format!(
+                    "[{}] {} -> {}",
+                    agent_name, request_type, summary
+                ));
+            }
             OrchestratorEvent::ManagedAgentUpdated(agent) => {
                 self.completed_log.push(format!(
                     "[{}] status: {} - {}",
@@ -169,7 +181,7 @@ impl App {
         let req = self.pending_requests.remove(idx);
 
         self.completed_log.push(format!(
-            "[{}] {} {} -> APPROVED",
+            "[{}] {} {} approval sent…",
             req.agent_name, req.request_type, req.question
         ));
 

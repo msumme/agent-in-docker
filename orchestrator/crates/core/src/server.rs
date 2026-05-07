@@ -93,6 +93,30 @@ pub struct ServerState {
     registry_snapshot: Option<Arc<std::sync::Mutex<Vec<PeerInfo>>>>,
 }
 
+fn execution_summary(request_type: &str, payload: &Value, success: bool) -> String {
+    if !success {
+        let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        return format!("FAILED: {}", msg);
+    }
+    match request_type {
+        "git_push" => {
+            let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
+            let first_useful = output
+                .lines()
+                .find(|l| !l.trim().is_empty() && !l.contains("remote:"))
+                .unwrap_or("ok");
+            format!("OK ({})", first_useful.trim())
+        }
+        "gh_pr_create" => {
+            let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("OK ({})", url)
+        }
+        "gh_pr_view" => "OK".into(),
+        "file_read" => "OK".into(),
+        _ => "OK".into(),
+    }
+}
+
 impl ServerState {
     pub fn new(
         event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
@@ -327,6 +351,16 @@ impl ServerState {
                 payload: payload.clone(),
             };
             self.send_to_agent(&pending.agent_id, &response);
+            let success = msg_type != "error";
+            let summary = execution_summary(&pending.request_type, &payload, success);
+            let agent_name = self.agent_name(&pending.agent_id);
+            let _ = self.event_tx.send(OrchestratorEvent::RequestExecuted {
+                agent_id: pending.agent_id.clone(),
+                agent_name,
+                request_type: pending.request_type.clone(),
+                success,
+                summary,
+            });
             Some(payload)
         } else {
             None

@@ -49,7 +49,12 @@ fn build_initial_prompt(team_id: &str, ticket_id: &str, role: &str) -> String {
              spec ticket parented to {ticket}, then ping you.\n\n\
              Do NOT start work yet. The spec is not ready. Acknowledge with \
              one short line (e.g. \"producer ready, waiting on spec\") and stop. \
-             You will be pinged via message_agent when the spec is filed.",
+             You will be pinged via message_agent when the spec is filed.\n\n\
+             Available host-bridge MCP tools (call them by name): \
+             `git_push`, `gh_pr_create` (open a PR — required when spec is \
+             complete and reviewer approves), `gh_pr_view`, `read_host_file`, \
+             `list_agents`, `message_agent`. If a tool errors, report the \
+             verbatim error — do NOT conclude the tool is unavailable.",
             team = team_id,
             ticket = ticket_id,
         ),

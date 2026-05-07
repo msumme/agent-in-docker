@@ -389,5 +389,80 @@ async fn mcp_initialize_returns_tool_list() {
     assert!(names.contains(&"git_push"));
     assert!(names.contains(&"list_agents"));
     assert!(names.contains(&"message_agent"));
+    assert!(names.contains(&"gh_pr_create"));
+    assert!(names.contains(&"gh_pr_view"));
     assert!(!names.contains(&"ask_user"), "ask_user should have been removed");
+}
+
+#[tokio::test]
+async fn mcp_gh_pr_create_approval_round_trip() {
+    let (ws_addr, http_addr, mut event_rx, _cmd_tx, mcp_state) = start_orchestrator().await;
+
+    // Connect an agent so the orchestrator has context
+    let (_sender, _receiver, _agent_id) =
+        connect_mock_agent(&ws_addr, "ProdBot", "code-agent").await;
+    let _ = event_rx.recv().await; // AgentConnected
+
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "id": 77,
+        "method": "tools/call",
+        "params": {
+            "name": "gh_pr_create",
+            "arguments": {
+                "base": "main",
+                "head": "feature/my-branch",
+                "title": "My PR",
+                "body": "Description here",
+                "draft": false
+            }
+        }
+    });
+
+    let mcp_url = format!("http://{}/mcp", http_addr);
+    let resp_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&mcp_url)
+            .header("Content-Type", "application/json")
+            .header("X-Agent-Name", "ProdBot")
+            .body(serde_json::to_string(&tool_call).unwrap())
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Wait for the RequestReceived event
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let event = event_rx.recv().await.unwrap();
+    let request_id = match &event {
+        OrchestratorEvent::RequestReceived {
+            request_id,
+            request_type,
+            payload,
+            ..
+        } => {
+            assert_eq!(request_type, "gh_pr_create");
+            assert_eq!(payload["base"], "main");
+            assert_eq!(payload["head"], "feature/my-branch");
+            request_id.clone()
+        }
+        _ => panic!("Expected RequestReceived, got {:?}", event),
+    };
+
+    // Resolve with the PR URL (simulating TUI approval after host runs gh pr create)
+    let resolved = mcp_state.resolve(
+        &request_id,
+        json!({"url": "https://github.com/owner/repo/pull/42", "number": 42}),
+    );
+    assert!(resolved, "Should have found the pending MCP request");
+
+    // Verify the SSE response contains the URL as plain text
+    let resp = resp_handle.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    let result = parse_sse_data(&body);
+    assert_eq!(result["jsonrpc"], "2.0");
+    assert_eq!(result["id"], 77);
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "https://github.com/owner/repo/pull/42");
 }

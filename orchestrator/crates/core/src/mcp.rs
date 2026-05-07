@@ -77,6 +77,7 @@ pub struct ToolDef {
 pub trait PermissionCheck: Send + Sync {
     fn check_file_read(&self, role: &str, path: &str) -> PermissionResult;
     fn check_git_push(&self, role: &str, remote: &str) -> PermissionResult;
+    fn check_gh_pr_create(&self, role: &str, base: &str) -> PermissionResult;
 }
 
 /// No-op permission checker that allows everything (needs TUI approval anyway).
@@ -84,6 +85,7 @@ pub struct AllowAllPermissions;
 impl PermissionCheck for AllowAllPermissions {
     fn check_file_read(&self, _role: &str, _path: &str) -> PermissionResult { PermissionResult::NeedsApproval }
     fn check_git_push(&self, _role: &str, _remote: &str) -> PermissionResult { PermissionResult::NeedsApproval }
+    fn check_gh_pr_create(&self, _role: &str, _base: &str) -> PermissionResult { PermissionResult::NeedsApproval }
 }
 
 /// Injectable registry for querying connected agents.
@@ -155,6 +157,7 @@ pub struct McpState {
     pub registry: Mutex<Box<dyn AgentRegistry>>,
     pub permissions: Mutex<Box<dyn PermissionCheck>>,
     pub dispatcher: Mutex<Box<dyn MessageDispatcher>>,
+    pub executor: std::sync::Arc<dyn crate::server::RequestExecutor>,
     pub team_ops: Mutex<Box<dyn TeamOps>>,
 }
 
@@ -163,6 +166,18 @@ impl McpState {
         event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
         permissions: Box<dyn PermissionCheck>,
     ) -> Self {
+        Self::with_executor(
+            event_tx,
+            permissions,
+            std::sync::Arc::new(crate::server::RealRequestExecutor),
+        )
+    }
+
+    pub fn with_executor(
+        event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+        permissions: Box<dyn PermissionCheck>,
+        executor: std::sync::Arc<dyn crate::server::RequestExecutor>,
+    ) -> Self {
         Self {
             event_tx,
             pending: Mutex::new(std::collections::HashMap::new()),
@@ -170,6 +185,7 @@ impl McpState {
             registry: Mutex::new(Box::new(NoOpRegistry)),
             permissions: Mutex::new(permissions),
             dispatcher: Mutex::new(Box::new(NoOpDispatcher)),
+            executor,
             team_ops: Mutex::new(Box::new(NoOpTeamOps)),
         }
     }
@@ -237,6 +253,33 @@ fn default_tools() -> Vec<ToolDef> {
                     "message": {"type": "string", "description": "Message content"}
                 },
                 "required": ["agentId", "message"]
+            }),
+        },
+        ToolDef {
+            name: "gh_pr_create".into(),
+            description: "Create a GitHub pull request using the host's gh credentials. Requires human approval.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "Base branch to merge into (default: main)"},
+                    "head": {"type": "string", "description": "Head branch to create PR from"},
+                    "title": {"type": "string", "description": "PR title"},
+                    "body": {"type": "string", "description": "PR body text"},
+                    "draft": {"type": "boolean", "description": "Create as draft PR (default: false)"}
+                },
+                "required": ["head", "title"]
+            }),
+        },
+        ToolDef {
+            name: "gh_pr_view".into(),
+            description: "View details of a GitHub pull request. Returns JSON with PR metadata.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string", "description": "PR number, URL, or branch name"},
+                    "workspace": {"type": "string", "description": "Workspace path (optional)"}
+                },
+                "required": ["ref"]
             }),
         },
         ToolDef {
@@ -410,6 +453,13 @@ fn handle_tools_call_streaming(
                     _ => None,
                 }
             }
+            "gh_pr_create" => {
+                let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("main");
+                match perms.check_gh_pr_create(agent_role, base) {
+                    PermissionResult::Deny(reason) => Some(reason),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     };
@@ -440,6 +490,22 @@ fn handle_tools_call_streaming(
                 (_, Err(e)) => format!("Routed over WS but tmux delivery failed: {}", e),
             };
             let resp = JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}));
+            Some(serde_json::to_string(&resp).unwrap())
+        }
+        "gh_pr_view" => {
+            let workspace = args.get("workspace").and_then(|v| v.as_str()).unwrap_or("");
+            let ref_ = args.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let result = state.executor.execute_gh_pr_view(workspace, ref_);
+            let resp = match result {
+                Ok(v) => {
+                    let text = serde_json::to_string(&v).unwrap_or_default();
+                    JsonRpcResponse::success(id.clone(), json!({"content": [{"type": "text", "text": text}]}))
+                }
+                Err(e) => JsonRpcResponse::success(
+                    id.clone(),
+                    json!({"content": [{"type": "text", "text": format!("Error: {}", e)}], "isError": true}),
+                ),
+            };
             Some(serde_json::to_string(&resp).unwrap())
         }
         "team_spawn" => {
@@ -505,6 +571,14 @@ fn handle_tools_call_streaming(
                 let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 ("git_push".to_string(), json!({"remote": remote, "branch": branch}))
             }
+            "gh_pr_create" => {
+                let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("main").to_string();
+                let head = args.get("head").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let draft = args.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
+                ("gh_pr_create".to_string(), json!({"base": base, "head": head, "title": title, "body": body, "draft": draft}))
+            }
             _ => ("unknown".to_string(), json!({})),
         };
 
@@ -566,6 +640,7 @@ fn handle_tools_call_streaming(
                                     let text = match tool.as_str() {
                                         "read_host_file" => response_payload.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         "git_push" => response_payload.get("output").and_then(|v| v.as_str()).unwrap_or("Push completed").to_string(),
+                                        "gh_pr_create" => response_payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         _ => serde_json::to_string(&response_payload).unwrap_or_default(),
                                     };
                                     let resp = JsonRpcResponse::success(id, json!({"content": [{"type": "text", "text": text}]}));
@@ -650,17 +725,76 @@ mod tests {
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"read_host_file"));
         assert!(names.contains(&"git_push"));
         assert!(names.contains(&"list_agents"));
         assert!(names.contains(&"message_agent"));
+        assert!(names.contains(&"gh_pr_create"));
+        assert!(names.contains(&"gh_pr_view"));
         assert!(names.contains(&"team_spawn"));
         assert!(names.contains(&"team_suspend"));
         assert!(names.contains(&"team_resume"));
         assert!(names.contains(&"team_complete"));
         assert!(names.contains(&"team_kill"));
+    }
+
+    #[tokio::test]
+    async fn mcp_gh_pr_view_dispatches_via_executor() {
+        use std::sync::Arc;
+
+        struct FakeExec;
+        impl crate::server::RequestExecutor for FakeExec {
+            fn execute_file_read(&self, _: &str) -> Result<String, String> { Ok("".into()) }
+            fn execute_git_push(&self, _: &str, _: &str, _: &str) -> Result<String, String> { Ok("".into()) }
+            fn current_branch(&self, _: &str) -> Result<String, String> { Ok("main".into()) }
+            fn execute_gh_pr_create(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: bool) -> Result<Value, String> {
+                Ok(json!({"url": "https://github.com/o/r/pull/1", "number": 1}))
+            }
+            fn execute_gh_pr_view(&self, _: &str, _: &str) -> Result<Value, String> {
+                Ok(json!({"number": 42, "url": "https://github.com/o/r/pull/42", "title": "Fake View PR"}))
+            }
+        }
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(McpState::with_executor(
+            event_tx,
+            Box::new(AllowAllPermissions),
+            Arc::new(FakeExec),
+        ));
+        let app = mcp_router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tool_call = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "gh_pr_view",
+                "arguments": {"ref": "42"}
+            }
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{}/mcp", addr))
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&tool_call).unwrap())
+            .send()
+            .await
+            .unwrap();
+
+        // gh_pr_view is immediate — no RequestReceived event
+        assert!(event_rx.try_recv().is_err(), "gh_pr_view must not emit a RequestReceived event");
+
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Fake View PR"), "Response should contain PR title: {}", body);
+        assert!(body.contains("42"), "Response should contain PR number: {}", body);
     }
 
     #[tokio::test]

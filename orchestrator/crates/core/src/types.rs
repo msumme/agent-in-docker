@@ -250,6 +250,16 @@ pub enum OrchestratorEvent {
         text: String,
     },
     ManagedAgentUpdated(ManagedAgent),
+    /// A git_push was auto-approved because the requesting agent belongs to a
+    /// team and is pushing to that team's own work branch.
+    RequestAutoApproved {
+        agent_id: String,
+        agent_name: String,
+        request_id: String,
+        request_type: String,
+        branch: String,
+        team_id: String,
+    },
     /// Outcome of an approved request after execution. Distinct from
     /// approval intent — approval means "go", this means "ran, here's
     /// what happened." Surfaces silent handler failures to the operator.

@@ -55,12 +55,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ));
 
+    let team_lookup: std::sync::Arc<dyn orchestrator_core::team_manager::TeamLookup> =
+        std::sync::Arc::new(orchestrator_core::team_manager::ManifestDirTeamLookup::new(
+            &project_config.project_root,
+        ));
+
     let server_addr = addr.clone();
     let mcp_for_server = mcp_state.clone();
     let mgr_for_server = agent_mgr.clone();
     let cfg_for_server = project_config.clone();
     tokio::spawn(async move {
-        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server), Some(cfg_for_server)).await {
+        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server), Some(cfg_for_server), Some(team_lookup)).await {
             tracing::error!("Server error: {}", e);
         }
     });

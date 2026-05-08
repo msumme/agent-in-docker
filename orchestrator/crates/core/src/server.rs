@@ -372,6 +372,34 @@ impl ServerState {
         self.execute_approved_request_with_result(request_id);
     }
 
+    /// Run the handler for an MCP-originated approved request and emit the
+    /// outcome event. Returns the response payload that the SSE stream
+    /// should send back to the agent.
+    pub fn execute_for_mcp(
+        &self,
+        agent_id: &str,
+        request_type: &str,
+        payload: &Value,
+    ) -> Value {
+        let synthetic = PendingRequest {
+            agent_id: agent_id.to_string(),
+            request_type: request_type.to_string(),
+            payload: payload.clone(),
+        };
+        let (msg_type, response_payload) = self.execute_request(&synthetic);
+        let success = msg_type != "error";
+        let summary = execution_summary(request_type, &response_payload, success);
+        let agent_name = self.agent_name(agent_id);
+        let _ = self.event_tx.send(OrchestratorEvent::RequestExecuted {
+            agent_id: agent_id.to_string(),
+            agent_name,
+            request_type: request_type.to_string(),
+            success,
+            summary,
+        });
+        response_payload
+    }
+
     fn execute_request(&self, pending: &PendingRequest) -> (&'static str, serde_json::Value) {
         match pending.request_type.as_str() {
             "file_read" => {
@@ -568,11 +596,18 @@ pub async fn run_with_id_gen(
                     }
                 }
                 TuiCommand::ApproveRequest { request_id } => {
-                    // Execute and get the result payload
+                    // WS path first: request was registered via server.handle_request.
                     let result = s.execute_approved_request_with_result(&request_id);
-                    // Also resolve MCP pending request
                     if let (Some(ref mcp), Some(payload)) = (&mcp_for_cmds, result) {
                         mcp.resolve(&request_id, payload);
+                    } else if let Some(ref mcp) = mcp_for_cmds {
+                        // MCP path: request is in mcp.pending (not server.pending_requests).
+                        // Take it, run the same execute machinery, and respond
+                        // via the oneshot the SSE stream is awaiting.
+                        if let Some(mp) = mcp.take_pending(&request_id) {
+                            let payload = s.execute_for_mcp(&mp.agent_id, &mp.request_type, &mp.payload);
+                            let _ = mp.tx.send(payload);
+                        }
                     }
                 }
                 TuiCommand::DenyRequest {

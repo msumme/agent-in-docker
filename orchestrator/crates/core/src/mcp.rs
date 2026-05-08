@@ -149,10 +149,22 @@ impl TeamOps for NoOpTeamOps {
     }
 }
 
+/// A pending MCP request awaiting human approval. Stores enough metadata
+/// for the TUI-approval path to actually execute the handler — without
+/// this, MCP-originated approvals were silently timing out because the
+/// approval flow only knew how to operate on `ServerState.pending_requests`.
+pub struct McpPendingRequest {
+    pub tx: oneshot::Sender<Value>,
+    pub request_type: String,
+    pub payload: Value,
+    pub agent_id: String,
+    pub agent_name: String,
+}
+
 /// Shared state for the MCP HTTP server.
 pub struct McpState {
     pub event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
-    pub pending: Mutex<std::collections::HashMap<String, oneshot::Sender<Value>>>,
+    pub pending: Mutex<std::collections::HashMap<String, McpPendingRequest>>,
     pub tools: Vec<ToolDef>,
     pub registry: Mutex<Box<dyn AgentRegistry>>,
     pub permissions: Mutex<Box<dyn PermissionCheck>>,
@@ -202,11 +214,19 @@ impl McpState {
         *self.team_ops.lock().unwrap() = team_ops;
     }
 
+    /// Take a pending MCP request out of the map (for the TUI-approval path
+    /// to execute and respond). Used by `ServerState`'s approval handler so
+    /// MCP-originated requests are routed through the same execute machinery
+    /// as WS-originated ones.
+    pub fn take_pending(&self, request_id: &str) -> Option<McpPendingRequest> {
+        self.pending.lock().unwrap().remove(request_id)
+    }
+
     /// Resolve a pending MCP request. Returns true if a pending request was found.
     pub fn resolve(&self, request_id: &str, payload: Value) -> bool {
         let mut pending = self.pending.lock().unwrap();
-        if let Some(sender) = pending.remove(request_id) {
-            let _ = sender.send(payload);
+        if let Some(req) = pending.remove(request_id) {
+            let _ = req.tx.send(payload);
             true
         } else {
             false
@@ -584,12 +604,34 @@ fn handle_tools_call_streaming(
 
         let request_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
+        // Resolve to the real agent_id from the registry so the execute path
+        // can look up the agent's workspace. Falls back to "mcp-{name}" only
+        // if the agent isn't registered (which means workspace lookup will
+        // fail downstream — that's the right failure: no agent, no workspace).
+        let agent_id = state
+            .registry
+            .lock()
+            .unwrap()
+            .list_agents()
+            .into_iter()
+            .find(|p| p.name == agent_name)
+            .map(|p| p.id)
+            .unwrap_or_else(|| format!("mcp-{}", agent_name));
         {
             let mut pending = state.pending.lock().unwrap();
-            pending.insert(request_id.clone(), tx);
+            pending.insert(
+                request_id.clone(),
+                McpPendingRequest {
+                    tx,
+                    request_type: request_type.clone(),
+                    payload: payload.clone(),
+                    agent_id: agent_id.clone(),
+                    agent_name: agent_name.clone(),
+                },
+            );
         }
         let _ = state.event_tx.send(OrchestratorEvent::RequestReceived {
-            agent_id: format!("mcp-{}", agent_name),
+            agent_id: agent_id.clone(),
             agent_name: agent_name.clone(),
             request_id: request_id.clone(),
             request_type,
@@ -805,7 +847,16 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = state.pending.lock().unwrap();
-            pending.insert("req-1".into(), tx);
+            pending.insert(
+                "req-1".into(),
+                McpPendingRequest {
+                    tx,
+                    request_type: "user_prompt".into(),
+                    payload: json!({}),
+                    agent_id: "agent-1".into(),
+                    agent_name: "alice".into(),
+                },
+            );
         }
 
         let resolved =         state.resolve("req-1", json!({"answer": "blue"}));

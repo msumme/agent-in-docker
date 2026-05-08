@@ -41,7 +41,6 @@ pub fn pr_create(
     if draft {
         cmd.arg("--draft");
     }
-    cmd.args(["--json", "number,url"]);
 
     let output = cmd
         .output()
@@ -54,14 +53,20 @@ pub fn pr_create(
     drop(tmp);
 
     if output.status.success() {
-        let v: Value = serde_json::from_str(stdout.trim())
-            .map_err(|e| format!("Failed to parse gh pr create output: {} (raw: {})", e, stdout))?;
-        let url = v
-            .get("url")
-            .and_then(|u| u.as_str())
+        // gh pr create prints the PR URL on its own line (typically the last
+        // non-empty line of stdout). It does not support --json.
+        let url = stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| l.starts_with("http"))
             .unwrap_or("")
             .to_string();
-        let number = v.get("number").and_then(|n| n.as_u64()).unwrap_or(0);
+        let number = url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         Ok((url, number))
     } else {
         Err(format!("gh pr create failed: {}{}", stdout, stderr))
@@ -131,7 +136,7 @@ mod tests {
     #[test]
     fn pr_create_parses_url_and_number() {
         let dir = make_fake_gh(
-            r#"printf '{"url":"https://github.com/owner/repo/pull/1","number":1}'"#,
+            r#"printf 'https://github.com/owner/repo/pull/1\n'"#,
         );
         let result = with_fake_gh(&dir, || pr_create("", "main", "feat", "Title", "Body", false));
         let (url, number) = result.unwrap();
@@ -161,7 +166,7 @@ for arg in "$@"; do
   fi
   if [ "$arg" = "--body-file" ]; then prev="bf"; else prev=""; fi
 done
-printf '{{"url":"https://github.com/owner/repo/pull/1","number":1}}'
+printf 'https://github.com/owner/repo/pull/1\n'
 "#,
             capture = capture_path
         );

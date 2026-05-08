@@ -6,6 +6,8 @@ capabilities:
   user_prompt: true
   discover_agents: true
   message_agents: true
+  gh_pr_create: true
+  gh_pr_view: true
 
 file_read_paths:
   - "${HOME}/.gitconfig"

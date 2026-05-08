@@ -260,6 +260,16 @@ pub enum OrchestratorEvent {
         success: bool,
         summary: String,
     },
+    /// A git_push was automatically approved because the requesting agent
+    /// is a member of a team and the target branch is that team's work_branch.
+    RequestAutoApproved {
+        agent_id: String,
+        agent_name: String,
+        request_id: String,
+        request_type: String,
+        branch: String,
+        team_id: String,
+    },
 }
 
 /// Commands sent from the frontend (TUI) to the core server.

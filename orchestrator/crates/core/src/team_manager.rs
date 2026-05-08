@@ -155,6 +155,86 @@ pub struct SpawnSpec {
     pub roles: Vec<(String, String)>, // (role, role_short)
 }
 
+/// Carries the resolved team information for a single agent lookup.
+pub struct TeamLookupHit {
+    pub team_id: String,
+    pub work_branch: String,
+}
+
+/// DI seam: lets ServerState consult team membership without depending on a
+/// live TeamManager instance. Implementors may read disk on every call — that
+/// is intentional; git_push is infrequent and fresh reads are correct across
+/// team state transitions.
+pub trait TeamLookup: Send + Sync {
+    fn team_for_agent(&self, agent_name: &str) -> Option<TeamLookupHit>;
+}
+
+/// No-op implementation. Default for every caller that does not wire a real
+/// lookup; preserves today's behaviour for all existing tests and non-team
+/// agents.
+pub struct NoTeamLookup;
+
+impl TeamLookup for NoTeamLookup {
+    fn team_for_agent(&self, _agent_name: &str) -> Option<TeamLookupHit> {
+        None
+    }
+}
+
+/// Reads `.teams/*/manifest.json` on every call to resolve an agent name to
+/// its team's work_branch. No in-memory cache: git_push is infrequent and
+/// disk reads keep the lookup correct after team state changes.
+pub struct ManifestDirTeamLookup {
+    teams_dir: PathBuf,
+}
+
+impl ManifestDirTeamLookup {
+    pub fn new(project_root: &Path) -> Self {
+        Self {
+            teams_dir: project_root.join(".teams"),
+        }
+    }
+}
+
+impl TeamLookup for ManifestDirTeamLookup {
+    fn team_for_agent(&self, agent_name: &str) -> Option<TeamLookupHit> {
+        let read_dir = std::fs::read_dir(&self.teams_dir).ok()?;
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("manifest.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            if let Some(hit) = parse_manifest_for_agent(&manifest_path, agent_name) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+}
+
+fn load_manifest(manifest_path: &Path) -> Result<Team, String> {
+    let content = std::fs::read_to_string(manifest_path)
+        .map_err(|e| format!("read manifest {}: {}", manifest_path.display(), e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("parse manifest {}: {}", manifest_path.display(), e))
+}
+
+fn parse_manifest_for_agent(manifest_path: &Path, agent_name: &str) -> Option<TeamLookupHit> {
+    let content = std::fs::read_to_string(manifest_path).ok()?;
+    let team: Team = serde_json::from_str(&content).ok()?;
+    if team.agents.iter().any(|a| a.name == agent_name) {
+        Some(TeamLookupHit {
+            team_id: team.id,
+            work_branch: team.work_branch,
+        })
+    } else {
+        None
+    }
+}
+
 /// Owns the on-disk teams directory and worktree directory; is the single
 /// authority for team lifecycle. Stateless w.r.t. ticket data — bd is still
 /// the source of truth — but holds the manifest cache in memory and persists
@@ -198,10 +278,7 @@ impl TeamManager {
             if !manifest_path.is_file() {
                 continue;
             }
-            let content = std::fs::read_to_string(&manifest_path)
-                .map_err(|e| format!("read manifest {}: {}", manifest_path.display(), e))?;
-            let team: Team = serde_json::from_str(&content)
-                .map_err(|e| format!("parse manifest {}: {}", manifest_path.display(), e))?;
+            let team = load_manifest(&manifest_path)?;
             self.teams.insert(team.id.clone(), team);
         }
         Ok(())
@@ -572,6 +649,63 @@ mod tests {
         let team = mgr2.get(&id).unwrap();
         assert_eq!(team.state, TeamState::Suspended);
         assert_eq!(team.suspend_reason.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn manifest_dir_lookup_finds_agent_and_returns_none_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        mgr.create_team(SpawnSpec {
+            ticket_id: "foo".into(),
+            base_branch: "main".into(),
+            roles: vec![("planner".into(), "plan".into())],
+        })
+        .unwrap();
+
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        let agent_name = format!("t-foo-plan");
+
+        let hit = lookup.team_for_agent(&agent_name);
+        assert!(hit.is_some(), "should find agent in manifest");
+        let hit = hit.unwrap();
+        assert_eq!(hit.team_id, "t-foo");
+        assert_eq!(hit.work_branch, "t-foo/code");
+
+        assert!(lookup.team_for_agent("nobody").is_none());
+    }
+
+    #[test]
+    fn manifest_dir_lookup_fresh_read_finds_second_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+
+        // Nothing yet
+        assert!(lookup.team_for_agent("t-one-plan").is_none());
+
+        // Write first team
+        {
+            let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+            mgr.create_team(SpawnSpec {
+                ticket_id: "one".into(),
+                base_branch: "main".into(),
+                roles: vec![("planner".into(), "plan".into())],
+            })
+            .unwrap();
+        }
+        assert!(lookup.team_for_agent("t-one-plan").is_some());
+
+        // Write second team — no re-init of lookup
+        {
+            let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+            mgr.load_from_disk().unwrap();
+            mgr.create_team(SpawnSpec {
+                ticket_id: "two".into(),
+                base_branch: "main".into(),
+                roles: vec![("planner".into(), "plan".into())],
+            })
+            .unwrap();
+        }
+        assert!(lookup.team_for_agent("t-two-plan").is_some());
     }
 
     #[test]

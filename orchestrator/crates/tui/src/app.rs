@@ -119,17 +119,7 @@ impl App {
                     self.managed_agents.push(agent);
                 }
             }
-            OrchestratorEvent::RequestAutoApproved {
-                agent_name,
-                request_type,
-                branch,
-                ..
-            } => {
-                self.completed_log.push(format!(
-                    "[{}] auto-approved {} → {}",
-                    agent_name, request_type, branch
-                ));
-            }
+            OrchestratorEvent::RequestAutoApproved { .. } => {}
         }
     }
 

@@ -119,6 +119,7 @@ impl App {
                     self.managed_agents.push(agent);
                 }
             }
+            OrchestratorEvent::RequestAutoApproved { .. } => {}
         }
     }
 

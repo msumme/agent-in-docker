@@ -146,6 +146,71 @@ impl GitOps for RealGitOps {
     }
 }
 
+/// Hit returned by TeamLookup when an agent belongs to a team.
+#[derive(Debug, Clone)]
+pub struct TeamLookupHit {
+    pub team_id: String,
+    pub work_branch: String,
+}
+
+/// Looks up which team (if any) a given agent name belongs to.
+/// Injectable for testing; see `NoTeamLookup` and `ManifestDirTeamLookup`.
+pub trait TeamLookup: Send + Sync {
+    fn team_for_agent(&self, agent_name: &str) -> Option<TeamLookupHit>;
+}
+
+/// No-op lookup — always returns None. Default when no real lookup is wired.
+pub struct NoTeamLookup;
+
+impl TeamLookup for NoTeamLookup {
+    fn team_for_agent(&self, _agent_name: &str) -> Option<TeamLookupHit> {
+        None
+    }
+}
+
+/// Reads `.teams/<id>/manifest.json` on every call to find which team an
+/// agent belongs to. No cache: git_push is infrequent and a fresh read stays
+/// correct across team state transitions.
+pub struct ManifestDirTeamLookup {
+    teams_dir: PathBuf,
+}
+
+impl ManifestDirTeamLookup {
+    pub fn new(project_root: &Path) -> Self {
+        Self {
+            teams_dir: project_root.join(".teams"),
+        }
+    }
+}
+
+impl TeamLookup for ManifestDirTeamLookup {
+    fn team_for_agent(&self, agent_name: &str) -> Option<TeamLookupHit> {
+        if !self.teams_dir.exists() {
+            return None;
+        }
+        let entries = std::fs::read_dir(&self.teams_dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let manifest_path = path.join("manifest.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            if let Ok(team) = parse_manifest_file(&manifest_path) {
+                if team.agents.iter().any(|a| a.name == agent_name) {
+                    return Some(TeamLookupHit {
+                        team_id: team.id,
+                        work_branch: team.work_branch,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
 /// What's needed to create a team. The CLI builds this from a bd ticket id.
 pub struct SpawnSpec {
     pub ticket_id: String,
@@ -198,10 +263,8 @@ impl TeamManager {
             if !manifest_path.is_file() {
                 continue;
             }
-            let content = std::fs::read_to_string(&manifest_path)
-                .map_err(|e| format!("read manifest {}: {}", manifest_path.display(), e))?;
-            let team: Team = serde_json::from_str(&content)
-                .map_err(|e| format!("parse manifest {}: {}", manifest_path.display(), e))?;
+            let team = parse_manifest_file(&manifest_path)
+                .map_err(|e| format!("load manifest {}: {}", manifest_path.display(), e))?;
             self.teams.insert(team.id.clone(), team);
         }
         Ok(())
@@ -372,6 +435,13 @@ pub fn team_id(ticket_id: &str) -> String {
     s
 }
 
+fn parse_manifest_file(path: &Path) -> Result<Team, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))
+}
+
 fn now_iso() -> String {
     // Avoid pulling in chrono; SystemTime → seconds since epoch is enough for
     // an audit timestamp. The format is sortable and stable.
@@ -454,6 +524,60 @@ mod tests {
             ("feature-producer".into(), "prod".into()),
             ("review-agent".into(), "rev".into()),
         ]
+    }
+
+    fn write_minimal_manifest(dir: &std::path::Path, team_id: &str, work_branch: &str, agent_name: &str) {
+        let team_dir = dir.join(".teams").join(team_id);
+        std::fs::create_dir_all(&team_dir).unwrap();
+        let manifest = serde_json::json!({
+            "id": team_id,
+            "ticket_id": "ticket-1",
+            "base_branch": "main",
+            "work_branch": work_branch,
+            "worktree_path": "/tmp/fake",
+            "state": "active",
+            "agents": [{"role": "feature-producer", "name": agent_name}],
+            "pr_url": null,
+            "created_at": "ts:0",
+            "last_active": "ts:0",
+            "suspend_reason": null
+        });
+        std::fs::write(
+            team_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn manifest_dir_lookup_finds_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        let hit = lookup.team_for_agent("X").expect("X must be found");
+        assert_eq!(hit.team_id, "foo");
+        assert_eq!(hit.work_branch, "feat/x");
+        assert!(lookup.team_for_agent("Y").is_none());
+    }
+
+    #[test]
+    fn manifest_dir_lookup_fresh_read_across_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        assert!(lookup.team_for_agent("Y").is_none());
+        // Add a second manifest and confirm it's visible on the next call.
+        write_minimal_manifest(tmp.path(), "bar", "feat/y", "Y");
+        let hit = lookup.team_for_agent("Y").expect("Y must be found after second manifest");
+        assert_eq!(hit.team_id, "bar");
+        assert_eq!(hit.work_branch, "feat/y");
+    }
+
+    #[test]
+    fn manifest_dir_lookup_missing_dir_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        assert!(lookup.team_for_agent("X").is_none());
     }
 
     #[test]

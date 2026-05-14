@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,14 +11,18 @@ use crate::types::OrchestratorEvent;
 
 /// Spawn a background task that polls every `interval` for PR state changes on
 /// all Active teams with an open PR number. Emits `TeamPrMerged` or
-/// `TeamPrClosed` events when a transition is detected. Errors from `gh` are
-/// logged and skipped — transient failures do not stop the watcher.
+/// `TeamPrClosed` events only on Open→{Merged,Closed} transitions. Errors from
+/// `gh` are logged and skipped — transient failures do not stop the watcher.
 pub fn spawn(
     state: Arc<Mutex<ServerState>>,
     gh: Arc<dyn GhClient>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Tracks the last successfully observed state per (team_id, pr_number).
+        // Only populated after a non-error response; absent == assumed Open.
+        let mut last_seen: HashMap<(String, u64), PrLifecycle> = HashMap::new();
+
         loop {
             tokio::time::sleep(interval).await;
 
@@ -28,24 +33,38 @@ pub fn spawn(
 
             for (team_id, ticket_id, _work_branch, pr_number) in teams {
                 match gh.pr_state("", pr_number) {
-                    Ok(pr_state) => match pr_state.state {
-                        PrLifecycle::Merged => {
-                            let _ = event_tx.send(OrchestratorEvent::TeamPrMerged {
-                                team_id,
-                                ticket_id,
-                                pr_number,
-                                merge_commit: pr_state.merge_commit,
-                            });
+                    Ok(pr_state) => {
+                        let key = (team_id.clone(), pr_number);
+                        let prev = last_seen.get(&key);
+                        let already_terminal = matches!(
+                            prev,
+                            Some(PrLifecycle::Merged) | Some(PrLifecycle::Closed)
+                        );
+                        if !already_terminal {
+                            match pr_state.state {
+                                PrLifecycle::Merged => {
+                                    last_seen.insert(key, PrLifecycle::Merged);
+                                    let _ = event_tx.send(OrchestratorEvent::TeamPrMerged {
+                                        team_id,
+                                        ticket_id,
+                                        pr_number,
+                                        merge_commit: pr_state.merge_commit,
+                                    });
+                                }
+                                PrLifecycle::Closed => {
+                                    last_seen.insert(key, PrLifecycle::Closed);
+                                    let _ = event_tx.send(OrchestratorEvent::TeamPrClosed {
+                                        team_id,
+                                        ticket_id,
+                                        pr_number,
+                                    });
+                                }
+                                PrLifecycle::Open => {
+                                    last_seen.insert(key, PrLifecycle::Open);
+                                }
+                            }
                         }
-                        PrLifecycle::Closed => {
-                            let _ = event_tx.send(OrchestratorEvent::TeamPrClosed {
-                                team_id,
-                                ticket_id,
-                                pr_number,
-                            });
-                        }
-                        PrLifecycle::Open => {}
-                    },
+                    }
                     Err(e) => {
                         warn!(
                             "pr_watcher: PR #{} for team {}: {}",
@@ -246,6 +265,49 @@ mod tests {
         assert!(
             event_rx.try_recv().is_err(),
             "no event expected when PR is still Open"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_emits_team_pr_closed_exactly_once_across_multiple_ticks() {
+        // Regression: if the team stays Active (TeamManager not updated between ticks),
+        // the watcher must not re-emit TeamPrClosed on subsequent ticks.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 5);
+
+        // FakeGhClient exhausts its list and then returns Open; configure it to
+        // return Closed on every call so the team stays in teams_with_open_pr.
+        let gh = Arc::new(FakeGhClient::new(vec![
+            Ok(PrState {
+                state: PrLifecycle::Closed,
+                merge_commit: None,
+            }),
+            // Second tick: still reports Closed (team not yet removed from manager).
+            Ok(PrState {
+                state: PrLifecycle::Closed,
+                merge_commit: None,
+            }),
+        ]));
+
+        let interval = Duration::from_millis(100);
+        time::pause();
+        let _handle = spawn(state, gh, interval);
+        tokio::task::yield_now().await;
+
+        // Tick 1 — Closed → exactly one TeamPrClosed emitted.
+        tick(interval).await;
+        let event = event_rx.try_recv().expect("TeamPrClosed must be emitted on first Closed tick");
+        assert!(
+            matches!(event, OrchestratorEvent::TeamPrClosed { pr_number: 5, .. }),
+            "got {:?}",
+            event
+        );
+
+        // Tick 2 — still Closed, team still in manager → no second event.
+        tick(interval).await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "TeamPrClosed must not be re-emitted on subsequent ticks"
         );
     }
 

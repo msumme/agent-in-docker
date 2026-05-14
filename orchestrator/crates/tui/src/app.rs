@@ -191,25 +191,6 @@ impl App {
         }
     }
 
-    /// Resubmit the closed-PR entry at `idx` — respawn the team.
-    pub fn resubmit_pr_review(&mut self, idx: usize) {
-        if idx >= self.pending_pr_review.len() {
-            return;
-        }
-        let entry = self.pending_pr_review.remove(idx);
-        self.completed_log.push(format!(
-            "[team:{}] resubmit requested for ticket {}",
-            entry.team_id, entry.ticket_id
-        ));
-        let _ = self.cmd_tx.send(TuiCommand::RespawnTeam {
-            team_id: entry.team_id,
-            ticket_id: entry.ticket_id,
-        });
-        if self.selected_pr_review >= self.pending_pr_review.len() && self.selected_pr_review > 0 {
-            self.selected_pr_review -= 1;
-        }
-    }
-
     pub fn submit_answer(&mut self) {
         // If no pending requests, send the input as a task to the selected agent
         if self.pending_requests.is_empty() {
@@ -405,10 +386,6 @@ impl App {
                     self.completed_log.push(format!("Reattaching {}...", name));
                 }
             }
-            KeyCode::Char('r') if pr_review_mode => {
-                let idx = self.selected_pr_review.min(self.pending_pr_review.len() - 1);
-                self.resubmit_pr_review(idx);
-            }
             KeyCode::Char('f') if pr_review_mode => {
                 let idx = self.selected_pr_review.min(self.pending_pr_review.len() - 1);
                 self.forget_pr_review(idx);
@@ -579,6 +556,8 @@ mod tests {
     fn toggle_focus_switches_panels() {
         let (mut app, _rx) = make_app();
         assert_eq!(app.focus, FocusPanel::Requests);
+        app.toggle_focus();
+        assert_eq!(app.focus, FocusPanel::PrReview);
         app.toggle_focus();
         assert_eq!(app.focus, FocusPanel::Agents);
         app.toggle_focus();
@@ -783,23 +762,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn key_r_on_pr_review_pane_sends_respawn_command() {
-        let (mut app, mut rx) = make_app();
-        app.handle_event(team_pr_closed("t-qux", "ticket-4", 9));
-        app.focus = FocusPanel::PrReview;
-
-        use crossterm::event::KeyCode;
-        app.handle_key(KeyCode::Char('r'));
-
-        assert!(app.pending_pr_review.is_empty(), "entry must be removed after resubmit");
-        let cmd = rx.try_recv().unwrap();
-        match cmd {
-            TuiCommand::RespawnTeam { team_id, ticket_id } => {
-                assert_eq!(team_id, "t-qux");
-                assert_eq!(ticket_id, "ticket-4");
-            }
-            _ => panic!("Expected RespawnTeam, got {:?}", cmd),
-        }
-    }
 }

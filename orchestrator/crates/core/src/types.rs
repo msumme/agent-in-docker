@@ -325,11 +325,6 @@ pub enum TuiCommand {
         ticket_id: String,
         pr_number: u64,
     },
-    /// Re-spawn a team whose PR was deleted without merging (resubmit intent).
-    RespawnTeam {
-        team_id: String,
-        ticket_id: String,
-    },
     Shutdown,
 }
 

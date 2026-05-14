@@ -872,15 +872,6 @@ pub async fn run_with_id_gen(
                     }
                     info!("ForgetTeamPr: {} ({})", team_id, ticket_id);
                 }
-                TuiCommand::RespawnTeam { team_id, ticket_id } => {
-                    // Respawn intent recorded; full respawn mechanics (worktree +
-                    // container spawn) go through the CLI team-spawn path and are
-                    // triggered by the operator externally.
-                    warn!(
-                        "RespawnTeam requested for {} ({}); operator action needed",
-                        team_id, ticket_id
-                    );
-                }
                 TuiCommand::Shutdown => break,
             }
         }

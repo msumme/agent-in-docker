@@ -12,6 +12,8 @@ use crate::mcp::AgentRegistry;
 use crate::team_manager::{NoTeamLookup, TeamLookup};
 use crate::types::*;
 
+type TeamManagerArc = std::sync::Arc<std::sync::Mutex<crate::team_manager::TeamManager>>;
+
 /// Executes approved requests (file reads, git pushes, PR creation). Injectable for testing.
 pub trait RequestExecutor: Send + Sync {
     fn execute_file_read(&self, path: &str) -> Result<String, String>;
@@ -93,6 +95,7 @@ pub struct ServerState {
     executor: Arc<dyn RequestExecutor>,
     registry_snapshot: Option<Arc<std::sync::Mutex<Vec<PeerInfo>>>>,
     team_lookup: Arc<dyn TeamLookup>,
+    team_manager: Option<TeamManagerArc>,
 }
 
 fn execution_summary(request_type: &str, payload: &Value, success: bool) -> String {
@@ -140,6 +143,7 @@ impl ServerState {
             executor,
             registry_snapshot: None,
             team_lookup: Arc::new(NoTeamLookup),
+            team_manager: None,
         }
     }
 
@@ -149,6 +153,24 @@ impl ServerState {
 
     pub fn set_team_lookup(&mut self, lookup: Arc<dyn TeamLookup>) {
         self.team_lookup = lookup;
+    }
+
+    pub fn set_team_manager(&mut self, tm: TeamManagerArc) {
+        self.team_manager = Some(tm);
+    }
+
+    /// Return a clone of the event sender (for the pr_watcher task).
+    pub fn event_tx_clone(&self) -> mpsc::UnboundedSender<OrchestratorEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Return teams with an open PR number for the pr_watcher to poll.
+    pub fn teams_with_open_pr(&self) -> Vec<(String, String, String, u64)> {
+        if let Some(ref tm) = self.team_manager {
+            tm.lock().unwrap().teams_with_open_pr()
+        } else {
+            vec![]
+        }
     }
 
     fn sync_registry_snapshot(&self) {
@@ -491,7 +513,20 @@ impl ServerState {
                 let draft = pending.payload.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
                 let workspace = self.agent_workspace(&pending.agent_id).unwrap_or_default();
                 match self.executor.execute_gh_pr_create(&workspace, base, head, title, body, draft) {
-                    Ok(v) => ("gh_pr_create_response", v),
+                    Ok(v) => {
+                        if let (Some(url), Some(number)) = (
+                            v.get("url").and_then(|u| u.as_str()),
+                            v.get("number").and_then(|n| n.as_u64()),
+                        ) {
+                            let agent_name = self.agent_name(&pending.agent_id);
+                            if let Some(hit) = self.team_lookup.team_for_agent(&agent_name) {
+                                if let Some(ref tm) = self.team_manager {
+                                    let _ = tm.lock().unwrap().set_pr(&hit.team_id, url, number);
+                                }
+                            }
+                        }
+                        ("gh_pr_create_response", v)
+                    }
                     Err(e) => ("error", serde_json::json!({"code": "PR_CREATE_FAILED", "message": e})),
                 }
             }
@@ -599,6 +634,8 @@ impl AgentRegistry for ServerStateRegistry {
     }
 }
 
+type WatcherParam = Option<(Arc<dyn crate::gh_client::GhClient>, std::time::Duration)>;
+
 pub async fn run(
     addr: &str,
     event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
@@ -607,8 +644,10 @@ pub async fn run(
     agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
     project_cfg: Option<Arc<crate::project_config::ProjectConfig>>,
     team_lookup: Option<Arc<dyn TeamLookup>>,
+    team_manager: Option<TeamManagerArc>,
+    watcher: WatcherParam,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state, agent_mgr, project_cfg, team_lookup).await
+    run_with_id_gen(addr, event_tx, cmd_rx, Arc::new(UuidIdGenerator), mcp_state, agent_mgr, project_cfg, team_lookup, team_manager, watcher).await
 }
 
 pub async fn run_with_id_gen(
@@ -620,13 +659,26 @@ pub async fn run_with_id_gen(
     agent_mgr: Option<Arc<std::sync::Mutex<crate::agent_manager::AgentManager>>>,
     project_cfg: Option<Arc<crate::project_config::ProjectConfig>>,
     team_lookup: Option<Arc<dyn TeamLookup>>,
+    team_manager: Option<TeamManagerArc>,
+    watcher: WatcherParam,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     info!("WebSocket server listening on {}", addr);
 
     let state = Arc::new(Mutex::new(ServerState::new(event_tx, id_gen)));
-    if let Some(lookup) = team_lookup {
-        state.lock().await.set_team_lookup(lookup);
+    {
+        let mut s = state.lock().await;
+        if let Some(lookup) = team_lookup {
+            s.set_team_lookup(lookup);
+        }
+        if let Some(tm) = team_manager {
+            s.set_team_manager(tm);
+        }
+    }
+
+    // Spawn PR watcher if requested
+    if let Some((gh, interval)) = watcher {
+        crate::pr_watcher::spawn(state.clone(), gh, interval);
     }
 
     // Wire the agent registry into the MCP state
@@ -778,6 +830,56 @@ pub async fn run_with_id_gen(
                             Err(e) => warn!("Failed to reattach {}: {}", name, e),
                         }
                     }
+                }
+                TuiCommand::CloseAndTeardownTeam {
+                    team_id,
+                    ticket_id,
+                    pr_number: _,
+                    merge_commit: _,
+                    reason,
+                } => {
+                    let project_root = cfg_for_cmds.as_ref().map(|c| c.project_root.clone());
+                    let mut bd = std::process::Command::new("bd");
+                    bd.args(["close", &ticket_id, "--reason", &reason]);
+                    if let Some(ref root) = project_root {
+                        bd.current_dir(root);
+                    }
+                    let _ = bd.output(); // best-effort
+                    if let Some(ref tm) = s.team_manager {
+                        let _ = tm.lock().unwrap().teardown(&team_id, true);
+                    }
+                    info!("CloseAndTeardownTeam: {} ({})", team_id, ticket_id);
+                }
+                TuiCommand::ForgetTeamPr {
+                    team_id,
+                    ticket_id,
+                    pr_number: _,
+                } => {
+                    let project_root = cfg_for_cmds.as_ref().map(|c| c.project_root.clone());
+                    let mut bd = std::process::Command::new("bd");
+                    bd.args([
+                        "close",
+                        &ticket_id,
+                        "--reason",
+                        "PR closed without merging (wontfix)",
+                    ]);
+                    if let Some(ref root) = project_root {
+                        bd.current_dir(root);
+                    }
+                    let _ = bd.output();
+                    if let Some(ref tm) = s.team_manager {
+                        let _ = tm.lock().unwrap().teardown(&team_id, true);
+                    }
+                    info!("ForgetTeamPr: {} ({})", team_id, ticket_id);
+                }
+                TuiCommand::RespawnTeam { team_id, ticket_id } => {
+                    // Respawn intent recorded; full respawn mechanics (worktree +
+                    // container spawn) go through the CLI team-spawn path and are
+                    // triggered by the operator externally.
+                    warn!(
+                        "RespawnTeam requested for {} ({}); operator action needed",
+                        team_id, ticket_id
+                    );
                 }
                 TuiCommand::Shutdown => break,
             }
@@ -1227,7 +1329,7 @@ mod tests {
         let id_gen = Arc::new(SequentialIdGenerator::new());
         let addr_str = addr.to_string();
         tokio::spawn(async move {
-            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None, None, None, None).await;
+            let _ = run_with_id_gen(&addr_str, event_tx, cmd_rx, id_gen, None, None, None, None, None, None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1852,5 +1954,112 @@ mod tests {
 
         let non_auto = state.handle_request(&id, "r2".into(), "git_push", json!({"branch": "main"}));
         assert!(non_auto.is_none(), "non-matching branch returns None");
+    }
+
+    // --- gh_pr_create sets pr_number on team ---
+
+    struct FakeGitForServer;
+    impl crate::team_manager::GitOps for FakeGitForServer {
+        fn worktree_add(
+            &self,
+            _repo: &std::path::Path,
+            worktree_path: &std::path::Path,
+            _branch: &str,
+            _base: &str,
+        ) -> Result<(), String> {
+            std::fs::create_dir_all(worktree_path).unwrap();
+            Ok(())
+        }
+        fn worktree_remove(
+            &self,
+            _repo: &std::path::Path,
+            worktree_path: &std::path::Path,
+            _force: bool,
+        ) -> Result<(), String> {
+            let _ = std::fs::remove_dir_all(worktree_path);
+            Ok(())
+        }
+        fn worktree_prune(&self, _repo: &std::path::Path) -> Result<(), String> { Ok(()) }
+        fn branch_delete(&self, _repo: &std::path::Path, _branch: &str) {}
+    }
+
+    #[test]
+    fn gh_pr_create_for_team_agent_records_pr_number() {
+        use crate::team_manager::{SpawnSpec, TeamManager};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = TeamManager::new(tmp.path().to_path_buf(), Box::new(FakeGitForServer));
+        let team = tm
+            .create_team(SpawnSpec {
+                ticket_id: "test-pr".into(),
+                base_branch: "main".into(),
+                roles: vec![("feature-producer".into(), "prod".into())],
+            })
+            .unwrap()
+            .clone();
+        tm.mark_active(&team.id).unwrap();
+        let team_id = team.id.clone();
+        let agent_name = format!("{}-prod", team_id);
+
+        let tm_arc = Arc::new(std::sync::Mutex::new(tm));
+
+        let lookup = FakeTeamLookup::new().with_agent(&agent_name, &team_id, &format!("{}/code", team_id));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        state.set_team_lookup(Arc::new(lookup));
+        state.set_team_manager(tm_arc.clone());
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (id, _) = state.register_agent(
+            agent_name.clone(),
+            "feature-producer".into(),
+            Some("/ws".into()),
+            sender,
+        );
+        let _ = event_rx.try_recv();
+
+        state.handle_request(
+            &id,
+            "pc-team".into(),
+            "gh_pr_create",
+            json!({"base": "main", "head": "feat/x", "title": "PR", "body": "body", "draft": false}),
+        );
+        let _ = event_rx.try_recv();
+        state.execute_approved_request("pc-team");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "gh_pr_create_response");
+
+        // Team manifest must now have pr_number = 99 (from FakeExecutor)
+        let pr_num = tm_arc.lock().unwrap().get(&team_id).unwrap().pr_number;
+        assert_eq!(pr_num, Some(99), "team manifest must record pr_number after gh_pr_create");
+    }
+
+    #[test]
+    fn gh_pr_create_for_non_team_agent_does_not_panic() {
+        // NoTeamLookup — agent not in any team. Should succeed without touching team_manager.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (id, _) = state.register_agent("solo".into(), "code-agent".into(), Some("/ws".into()), sender);
+        let _ = event_rx.try_recv();
+
+        state.handle_request(
+            &id,
+            "pc-solo".into(),
+            "gh_pr_create",
+            json!({"base": "main", "head": "feat/y", "title": "Solo PR", "body": "b", "draft": false}),
+        );
+        let _ = event_rx.try_recv();
+        state.execute_approved_request("pc-solo");
+
+        let sent = receiver.try_recv().unwrap();
+        let msg: Message = serde_json::from_str(&sent).unwrap();
+        assert_eq!(msg.msg_type, "gh_pr_create_response");
+        // Just verifying no panic; no team_manager mutation to assert.
     }
 }

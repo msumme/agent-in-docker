@@ -3,6 +3,65 @@ use std::process::Command;
 
 use serde_json::Value;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrLifecycle {
+    Open,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrState {
+    pub state: PrLifecycle,
+    pub merge_commit: Option<String>,
+}
+
+/// Query the current state of a PR by number. Used by RealGhClient.
+pub fn pr_state(workspace: &str, number: u64) -> Result<PrState, String> {
+    let mut cmd = Command::new("gh");
+    if !workspace.is_empty() {
+        cmd.args(["-C", workspace]);
+    }
+    cmd.args([
+        "pr",
+        "view",
+        &number.to_string(),
+        "--json",
+        "state,mergeCommit",
+    ]);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute gh pr view: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("gh pr view failed: {}{}", stdout, stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("Failed to parse gh pr view output: {} (raw: {})", e, stdout))?;
+
+    let lifecycle = match v.get("state").and_then(|s| s.as_str()) {
+        Some("MERGED") => PrLifecycle::Merged,
+        Some("CLOSED") => PrLifecycle::Closed,
+        _ => PrLifecycle::Open,
+    };
+
+    let merge_commit = v
+        .get("mergeCommit")
+        .and_then(|mc| mc.get("oid"))
+        .and_then(|oid| oid.as_str())
+        .map(|s| s.to_string());
+
+    Ok(PrState {
+        state: lifecycle,
+        merge_commit,
+    })
+}
+
 /// Create a GitHub pull request using the host's gh credentials.
 /// Writes the body to a tempfile to avoid shell-escape and arg-length issues.
 /// The tempfile is cleaned up when this function returns.
@@ -108,12 +167,12 @@ pub fn pr_view(workspace: &str, ref_: &str) -> Result<Value, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn make_fake_gh(script: &str) -> tempfile::TempDir {
+    pub(crate) fn make_fake_gh(script: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let gh_path = dir.path().join("gh");
         std::fs::write(&gh_path, format!("#!/bin/sh\n{}", script)).unwrap();
@@ -122,7 +181,7 @@ mod tests {
         dir
     }
 
-    fn with_fake_gh<T>(dir: &tempfile::TempDir, f: impl FnOnce() -> T) -> T {
+    pub(crate) fn with_fake_gh<T>(dir: &tempfile::TempDir, f: impl FnOnce() -> T) -> T {
         let _guard = PATH_MUTEX.lock().unwrap();
         let dir_path = dir.path().to_str().unwrap();
         let original = std::env::var("PATH").unwrap_or_default();

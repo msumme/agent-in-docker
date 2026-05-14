@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 pub enum FocusPanel {
     Agents,
     Requests,
+    PrReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,14 +23,24 @@ pub struct PendingRequest {
     pub question: String,
 }
 
+/// A PR that was closed without merging — surfaced for human review.
+#[derive(Debug, Clone)]
+pub struct PendingPrReview {
+    pub team_id: String,
+    pub ticket_id: String,
+    pub pr_number: u64,
+}
+
 pub struct App {
     pub agents: Vec<AgentInfo>,
     pub managed_agents: Vec<orchestrator_core::types::ManagedAgent>,
     pub pending_requests: Vec<PendingRequest>,
+    pub pending_pr_review: Vec<PendingPrReview>,
     pub completed_log: Vec<String>,
     pub focus: FocusPanel,
     pub selected_agent: usize,
     pub selected_request: usize,
+    pub selected_pr_review: usize,
     pub input_text: String,
     pub should_quit: bool,
     pub input_mode: InputMode,
@@ -42,10 +53,12 @@ impl App {
             agents: Vec::new(),
             managed_agents: Vec::new(),
             pending_requests: Vec::new(),
+            pending_pr_review: Vec::new(),
             completed_log: Vec::new(),
             focus: FocusPanel::Requests,
             selected_agent: 0,
             selected_request: 0,
+            selected_pr_review: 0,
             input_text: String::new(),
             should_quit: false,
             input_mode: InputMode::Normal,
@@ -120,6 +133,80 @@ impl App {
                 }
             }
             OrchestratorEvent::RequestAutoApproved { .. } => {}
+            OrchestratorEvent::TeamPrMerged {
+                team_id,
+                ticket_id,
+                pr_number,
+                merge_commit,
+            } => {
+                let sha = merge_commit.as_deref().unwrap_or("unknown");
+                let reason = format!("merged in PR #{} ({})", pr_number, sha);
+                self.completed_log.push(format!(
+                    "[team:{}] ticket {} closed: {}",
+                    team_id, ticket_id, reason
+                ));
+                let _ = self.cmd_tx.send(TuiCommand::CloseAndTeardownTeam {
+                    team_id,
+                    ticket_id,
+                    pr_number,
+                    merge_commit,
+                    reason,
+                });
+            }
+            OrchestratorEvent::TeamPrClosed {
+                team_id,
+                ticket_id,
+                pr_number,
+            } => {
+                self.completed_log.push(format!(
+                    "[team:{}] PR #{} closed without merging — pending review",
+                    team_id, pr_number
+                ));
+                self.pending_pr_review.push(PendingPrReview {
+                    team_id,
+                    ticket_id,
+                    pr_number,
+                });
+            }
+        }
+    }
+
+    /// Forget the closed-PR entry at `idx` — close ticket as wontfix and tear down team.
+    pub fn forget_pr_review(&mut self, idx: usize) {
+        if idx >= self.pending_pr_review.len() {
+            return;
+        }
+        let entry = self.pending_pr_review.remove(idx);
+        self.completed_log.push(format!(
+            "[team:{}] PR #{} forgotten (wontfix)",
+            entry.team_id, entry.pr_number
+        ));
+        let _ = self.cmd_tx.send(TuiCommand::ForgetTeamPr {
+            team_id: entry.team_id,
+            ticket_id: entry.ticket_id,
+            pr_number: entry.pr_number,
+        });
+        if self.selected_pr_review >= self.pending_pr_review.len() && self.selected_pr_review > 0 {
+            self.selected_pr_review -= 1;
+        }
+    }
+
+    /// Resubmit the closed-PR entry at `idx` — respawn the team.
+    pub fn resubmit_pr_review(&mut self, idx: usize) {
+        if idx >= self.pending_pr_review.len() {
+            return;
+        }
+        let entry = self.pending_pr_review.remove(idx);
+        self.completed_log.push(format!(
+            "[team:{}] resubmit requested for ticket {}",
+            entry.team_id, entry.ticket_id
+        ));
+        let _ = self.cmd_tx.send(TuiCommand::RespawnTeam {
+            team_id: entry.team_id,
+            ticket_id: entry.ticket_id,
+        });
+        if self.selected_pr_review >= self.pending_pr_review.len() && self.selected_pr_review > 0 {
+            self.selected_pr_review -= 1;
         }
     }
 
@@ -221,7 +308,8 @@ impl App {
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             FocusPanel::Agents => FocusPanel::Requests,
-            FocusPanel::Requests => FocusPanel::Agents,
+            FocusPanel::Requests => FocusPanel::PrReview,
+            FocusPanel::PrReview => FocusPanel::Agents,
         };
     }
 
@@ -235,6 +323,11 @@ impl App {
             FocusPanel::Requests => {
                 if self.selected_request > 0 {
                     self.selected_request -= 1;
+                }
+            }
+            FocusPanel::PrReview => {
+                if self.selected_pr_review > 0 {
+                    self.selected_pr_review -= 1;
                 }
             }
         }
@@ -300,6 +393,9 @@ impl App {
                 [self.selected_request.min(self.pending_requests.len() - 1)]
                 .request_type != "user_prompt";
 
+        let pr_review_mode = self.focus == FocusPanel::PrReview
+            && !self.pending_pr_review.is_empty();
+
         match code {
             KeyCode::Char('q') => { self.input_mode = InputMode::ConfirmQuit; }
             KeyCode::Char('N') => { self.input_mode = InputMode::NewAgent; self.input_text.clear(); }
@@ -308,6 +404,14 @@ impl App {
                     let _ = self.cmd_tx.send(TuiCommand::ReattachAgent { name: name.clone() });
                     self.completed_log.push(format!("Reattaching {}...", name));
                 }
+            }
+            KeyCode::Char('r') if pr_review_mode => {
+                let idx = self.selected_pr_review.min(self.pending_pr_review.len() - 1);
+                self.resubmit_pr_review(idx);
+            }
+            KeyCode::Char('f') if pr_review_mode => {
+                let idx = self.selected_pr_review.min(self.pending_pr_review.len() - 1);
+                self.forget_pr_review(idx);
             }
             KeyCode::Char('a') if self.focus == FocusPanel::Agents => {
                 if let Some(name) = self.selected_agent_name() {
@@ -340,6 +444,13 @@ impl App {
                     && self.selected_request < self.pending_requests.len() - 1
                 {
                     self.selected_request += 1;
+                }
+            }
+            FocusPanel::PrReview => {
+                if !self.pending_pr_review.is_empty()
+                    && self.selected_pr_review < self.pending_pr_review.len() - 1
+                {
+                    self.selected_pr_review += 1;
                 }
             }
         }
@@ -600,5 +711,95 @@ mod tests {
         app.focus = FocusPanel::Agents;
         let effect = app.handle_key(KeyCode::Char('a'));
         assert_eq!(effect, KeyEffect::AttachAgent("Bob".into()));
+    }
+
+    // --- PR review pane tests ---
+
+    fn team_pr_merged(team_id: &str, ticket_id: &str, pr_number: u64) -> OrchestratorEvent {
+        OrchestratorEvent::TeamPrMerged {
+            team_id: team_id.into(),
+            ticket_id: ticket_id.into(),
+            pr_number,
+            merge_commit: Some("abc123".into()),
+        }
+    }
+
+    fn team_pr_closed(team_id: &str, ticket_id: &str, pr_number: u64) -> OrchestratorEvent {
+        OrchestratorEvent::TeamPrClosed {
+            team_id: team_id.into(),
+            ticket_id: ticket_id.into(),
+            pr_number,
+        }
+    }
+
+    #[test]
+    fn team_pr_merged_logs_and_sends_close_command() {
+        let (mut app, mut rx) = make_app();
+        app.handle_event(team_pr_merged("t-foo", "ticket-1", 42));
+
+        assert!(app.completed_log.last().unwrap().contains("ticket-1"));
+        assert!(app.pending_pr_review.is_empty(), "merged PR must not add to pending_pr_review");
+
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            TuiCommand::CloseAndTeardownTeam { team_id, ticket_id, pr_number, .. } => {
+                assert_eq!(team_id, "t-foo");
+                assert_eq!(ticket_id, "ticket-1");
+                assert_eq!(pr_number, 42);
+            }
+            _ => panic!("Expected CloseAndTeardownTeam, got {:?}", cmd),
+        }
+    }
+
+    #[test]
+    fn team_pr_closed_adds_to_pending_pr_review() {
+        let (mut app, mut rx) = make_app();
+        app.handle_event(team_pr_closed("t-bar", "ticket-2", 7));
+
+        assert_eq!(app.pending_pr_review.len(), 1);
+        assert_eq!(app.pending_pr_review[0].team_id, "t-bar");
+        assert_eq!(app.pending_pr_review[0].pr_number, 7);
+        assert!(rx.try_recv().is_err(), "no command sent on TeamPrClosed");
+    }
+
+    #[test]
+    fn key_f_on_pr_review_pane_sends_forget_command() {
+        let (mut app, mut rx) = make_app();
+        app.handle_event(team_pr_closed("t-baz", "ticket-3", 5));
+        app.focus = FocusPanel::PrReview;
+
+        use crossterm::event::KeyCode;
+        app.handle_key(KeyCode::Char('f'));
+
+        assert!(app.pending_pr_review.is_empty(), "entry must be removed after forget");
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            TuiCommand::ForgetTeamPr { team_id, ticket_id, pr_number } => {
+                assert_eq!(team_id, "t-baz");
+                assert_eq!(ticket_id, "ticket-3");
+                assert_eq!(pr_number, 5);
+            }
+            _ => panic!("Expected ForgetTeamPr, got {:?}", cmd),
+        }
+    }
+
+    #[test]
+    fn key_r_on_pr_review_pane_sends_respawn_command() {
+        let (mut app, mut rx) = make_app();
+        app.handle_event(team_pr_closed("t-qux", "ticket-4", 9));
+        app.focus = FocusPanel::PrReview;
+
+        use crossterm::event::KeyCode;
+        app.handle_key(KeyCode::Char('r'));
+
+        assert!(app.pending_pr_review.is_empty(), "entry must be removed after resubmit");
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            TuiCommand::RespawnTeam { team_id, ticket_id } => {
+                assert_eq!(team_id, "t-qux");
+                assert_eq!(ticket_id, "ticket-4");
+            }
+            _ => panic!("Expected RespawnTeam, got {:?}", cmd),
+        }
     }
 }

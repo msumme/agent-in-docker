@@ -1,0 +1,279 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Mutex;
+use tracing::warn;
+
+use crate::gh_client::{GhClient, PrLifecycle};
+use crate::server::ServerState;
+use crate::types::OrchestratorEvent;
+
+/// Spawn a background task that polls every `interval` for PR state changes on
+/// all Active teams with an open PR number. Emits `TeamPrMerged` or
+/// `TeamPrClosed` events when a transition is detected. Errors from `gh` are
+/// logged and skipped — transient failures do not stop the watcher.
+pub fn spawn(
+    state: Arc<Mutex<ServerState>>,
+    gh: Arc<dyn GhClient>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+
+            let (teams, event_tx) = {
+                let s = state.lock().await;
+                (s.teams_with_open_pr(), s.event_tx_clone())
+            };
+
+            for (team_id, ticket_id, _work_branch, pr_number) in teams {
+                match gh.pr_state("", pr_number) {
+                    Ok(pr_state) => match pr_state.state {
+                        PrLifecycle::Merged => {
+                            let _ = event_tx.send(OrchestratorEvent::TeamPrMerged {
+                                team_id,
+                                ticket_id,
+                                pr_number,
+                                merge_commit: pr_state.merge_commit,
+                            });
+                        }
+                        PrLifecycle::Closed => {
+                            let _ = event_tx.send(OrchestratorEvent::TeamPrClosed {
+                                team_id,
+                                ticket_id,
+                                pr_number,
+                            });
+                        }
+                        PrLifecycle::Open => {}
+                    },
+                    Err(e) => {
+                        warn!(
+                            "pr_watcher: PR #{} for team {}: {}",
+                            pr_number, team_id, e
+                        );
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gh_client::{PrLifecycle, PrState};
+    use crate::server::{ServerState, UuidIdGenerator};
+    use crate::team_manager::{SpawnSpec, TeamManager};
+    use crate::types::OrchestratorEvent;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::{mpsc, Mutex};
+    use tokio::time;
+
+    struct FakeGhClient {
+        responses: StdMutex<Vec<Result<PrState, String>>>,
+    }
+
+    impl FakeGhClient {
+        fn new(responses: Vec<Result<PrState, String>>) -> Self {
+            Self {
+                responses: StdMutex::new(responses),
+            }
+        }
+    }
+
+    impl GhClient for FakeGhClient {
+        fn pr_state(&self, _workspace: &str, _number: u64) -> Result<PrState, String> {
+            let mut v = self.responses.lock().unwrap();
+            if v.is_empty() {
+                return Ok(PrState {
+                    state: PrLifecycle::Open,
+                    merge_commit: None,
+                });
+            }
+            v.remove(0)
+        }
+    }
+
+    struct FakeGit;
+    impl crate::team_manager::GitOps for FakeGit {
+        fn worktree_add(
+            &self,
+            _repo: &std::path::Path,
+            worktree_path: &std::path::Path,
+            _branch: &str,
+            _base: &str,
+        ) -> Result<(), String> {
+            std::fs::create_dir_all(worktree_path).unwrap();
+            Ok(())
+        }
+        fn worktree_remove(
+            &self,
+            _repo: &std::path::Path,
+            worktree_path: &std::path::Path,
+            _force: bool,
+        ) -> Result<(), String> {
+            let _ = std::fs::remove_dir_all(worktree_path);
+            Ok(())
+        }
+        fn worktree_prune(&self, _repo: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn branch_delete(&self, _repo: &std::path::Path, _branch: &str) {}
+    }
+
+    fn make_state_with_team(
+        event_tx: mpsc::UnboundedSender<OrchestratorEvent>,
+        pr_number: u64,
+    ) -> Arc<Mutex<ServerState>> {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tm = TeamManager::new(tmp.path().to_path_buf(), Box::new(FakeGit));
+        let team = tm
+            .create_team(SpawnSpec {
+                ticket_id: "ticket-watcher".into(),
+                base_branch: "main".into(),
+                roles: vec![
+                    ("planner".into(), "plan".into()),
+                    ("feature-producer".into(), "prod".into()),
+                    ("review-agent".into(), "rev".into()),
+                ],
+            })
+            .unwrap()
+            .clone();
+        tm.mark_active(&team.id).unwrap();
+        tm.set_pr(&team.id, "https://github.com/o/r/pull/1", pr_number)
+            .unwrap();
+
+        let mut state = ServerState::new(event_tx, Arc::new(UuidIdGenerator));
+        state.set_team_manager(Arc::new(StdMutex::new(tm)));
+        // Keep tmp alive by leaking it — temp dir stays on disk for test duration.
+        std::mem::forget(tmp);
+        Arc::new(Mutex::new(state))
+    }
+
+    async fn tick(interval: Duration) {
+        time::advance(interval + Duration::from_millis(1)).await;
+        // Yield several times to let the watcher task complete its iteration
+        // (it may do a few awaits: state.lock(), then back to sleep).
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_emits_team_pr_merged_on_transition() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 1);
+
+        let gh = Arc::new(FakeGhClient::new(vec![
+            Ok(PrState {
+                state: PrLifecycle::Open,
+                merge_commit: None,
+            }),
+            Ok(PrState {
+                state: PrLifecycle::Merged,
+                merge_commit: Some("abc".into()),
+            }),
+        ]));
+
+        let interval = Duration::from_millis(100);
+        time::pause();
+        let _handle = spawn(state, gh, interval);
+        // Yield so watcher reaches its first sleep() and registers the timer.
+        tokio::task::yield_now().await;
+
+        // Tick 1 — Open, no event
+        tick(interval).await;
+        assert!(event_rx.try_recv().is_err(), "no event on first tick (Open)");
+
+        // Tick 2 — Merged, TeamPrMerged event
+        tick(interval).await;
+        let event = event_rx.try_recv().expect("TeamPrMerged must be emitted");
+        match event {
+            OrchestratorEvent::TeamPrMerged {
+                pr_number,
+                merge_commit,
+                ..
+            } => {
+                assert_eq!(pr_number, 1);
+                assert_eq!(merge_commit.as_deref(), Some("abc"));
+            }
+            other => panic!("expected TeamPrMerged, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn watcher_emits_team_pr_closed() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 2);
+
+        let gh = Arc::new(FakeGhClient::new(vec![Ok(PrState {
+            state: PrLifecycle::Closed,
+            merge_commit: None,
+        })]));
+
+        let interval = Duration::from_millis(100);
+        time::pause();
+        let _handle = spawn(state, gh, interval);
+        tokio::task::yield_now().await;
+
+        tick(interval).await;
+
+        let event = event_rx.try_recv().expect("TeamPrClosed must be emitted");
+        assert!(
+            matches!(event, OrchestratorEvent::TeamPrClosed { pr_number: 2, .. }),
+            "got {:?}",
+            event
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_no_event_on_open() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 3);
+
+        let gh = Arc::new(FakeGhClient::new(vec![Ok(PrState {
+            state: PrLifecycle::Open,
+            merge_commit: None,
+        })]));
+
+        let interval = Duration::from_millis(100);
+        time::pause();
+        let _handle = spawn(state, gh, interval);
+        tokio::task::yield_now().await;
+
+        tick(interval).await;
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no event expected when PR is still Open"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_tolerates_gh_error_and_continues() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 4);
+
+        let gh = Arc::new(FakeGhClient::new(vec![
+            Err("transient gh failure".into()),
+            Ok(PrState {
+                state: PrLifecycle::Merged,
+                merge_commit: Some("def".into()),
+            }),
+        ]));
+
+        let interval = Duration::from_millis(100);
+        time::pause();
+        let _handle = spawn(state, gh, interval);
+        tokio::task::yield_now().await;
+
+        // Tick 1 — Err, no event, watcher does not terminate
+        tick(interval).await;
+        assert!(event_rx.try_recv().is_err(), "no event on error tick");
+
+        // Tick 2 — Merged, watcher still alive
+        tick(interval).await;
+        let event = event_rx.try_recv().expect("watcher must continue after error");
+        assert!(matches!(event, OrchestratorEvent::TeamPrMerged { .. }));
+    }
+}

@@ -60,12 +60,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &project_config.project_root,
         ));
 
+    let team_manager = {
+        let mut tm = orchestrator_core::team_manager::TeamManager::new(
+            project_config.project_root.clone(),
+            Box::new(orchestrator_core::team_manager::RealGitOps),
+        );
+        let _ = tm.load_from_disk();
+        std::sync::Arc::new(std::sync::Mutex::new(tm))
+    };
+
+    let gh_client: Arc<dyn orchestrator_core::gh_client::GhClient> =
+        Arc::new(orchestrator_core::gh_client::RealGhClient);
+
     let server_addr = addr.clone();
     let mcp_for_server = mcp_state.clone();
     let mgr_for_server = agent_mgr.clone();
     let cfg_for_server = project_config.clone();
+    let tm_for_server = team_manager.clone();
     tokio::spawn(async move {
-        if let Err(e) = orchestrator_core::server::run(&server_addr, event_tx, cmd_rx, Some(mcp_for_server), Some(mgr_for_server), Some(cfg_for_server), Some(team_lookup)).await {
+        if let Err(e) = orchestrator_core::server::run(
+            &server_addr,
+            event_tx,
+            cmd_rx,
+            Some(mcp_for_server),
+            Some(mgr_for_server),
+            Some(cfg_for_server),
+            Some(team_lookup),
+            Some(tm_for_server),
+            Some((gh_client, Duration::from_secs(300))),
+        )
+        .await
+        {
             tracing::error!("Server error: {}", e);
         }
     });

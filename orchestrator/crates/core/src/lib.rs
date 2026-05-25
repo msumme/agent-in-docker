@@ -1,8 +1,10 @@
 pub mod agent_manager;
-pub mod team_manager;
+pub mod gh_client;
 pub mod handlers;
 pub mod mcp;
 pub mod permissions;
+pub mod pr_watcher;
 pub mod project_config;
 pub mod server;
+pub mod team_manager;
 pub mod types;

@@ -47,6 +47,7 @@ pub struct Team {
     pub state: TeamState,
     pub agents: Vec<TeamAgent>,
     pub pr_url: Option<String>,
+    pub pr_number: Option<u64>,
     pub created_at: String,
     pub last_active: String,
     pub suspend_reason: Option<String>,
@@ -328,6 +329,7 @@ impl TeamManager {
             state: TeamState::Spawning,
             agents,
             pr_url: None,
+            pr_number: None,
             created_at: now.clone(),
             last_active: now,
             suspend_reason: None,
@@ -395,6 +397,40 @@ impl TeamManager {
             let _ = std::fs::remove_dir_all(&team_dir);
         }
         Ok(())
+    }
+
+    /// Record the open PR on the team manifest (called after gh_pr_create succeeds).
+    pub fn set_pr(&mut self, team_id: &str, url: &str, number: u64) -> Result<(), String> {
+        let team = self
+            .teams
+            .get_mut(team_id)
+            .ok_or_else(|| format!("team '{}' not found", team_id))?;
+        team.pr_url = Some(url.to_string());
+        team.pr_number = Some(number);
+        team.last_active = now_iso();
+        let snapshot = team.clone();
+        self.write_manifest(&snapshot)
+    }
+
+    /// Return `(team_id, ticket_id, work_branch, pr_number)` for every Active
+    /// team that has an open PR number recorded. Results are sorted by team_id
+    /// for deterministic ordering.
+    pub fn teams_with_open_pr(&self) -> Vec<(String, String, String, u64)> {
+        let mut result: Vec<_> = self
+            .teams
+            .values()
+            .filter(|t| t.state == TeamState::Active && t.pr_number.is_some())
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.ticket_id.clone(),
+                    t.work_branch.clone(),
+                    t.pr_number.unwrap(),
+                )
+            })
+            .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
     }
 
     /// Per-role agent state directory; the CLI mounts this into the agent's
@@ -538,6 +574,7 @@ mod tests {
             "state": "active",
             "agents": [{"role": "feature-producer", "name": agent_name}],
             "pr_url": null,
+            "pr_number": null,
             "created_at": "ts:0",
             "last_active": "ts:0",
             "suspend_reason": null
@@ -696,6 +733,114 @@ mod tests {
         let team = mgr2.get(&id).unwrap();
         assert_eq!(team.state, TeamState::Suspended);
         assert_eq!(team.suspend_reason.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn set_pr_persists_to_manifest_and_survives_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_id = {
+            let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+            let team = mgr
+                .create_team(SpawnSpec {
+                    ticket_id: "pr-test".into(),
+                    base_branch: "main".into(),
+                    roles: mvt_roles(),
+                })
+                .unwrap()
+                .clone();
+            mgr.mark_active(&team.id).unwrap();
+            mgr.set_pr(&team.id, "https://github.com/o/r/pull/7", 7).unwrap();
+            assert_eq!(mgr.get(&team.id).unwrap().pr_number, Some(7));
+            assert_eq!(
+                mgr.get(&team.id).unwrap().pr_url.as_deref(),
+                Some("https://github.com/o/r/pull/7")
+            );
+            team.id
+        };
+        let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        mgr2.load_from_disk().unwrap();
+        let team = mgr2.get(&team_id).unwrap();
+        assert_eq!(team.pr_number, Some(7));
+        assert_eq!(
+            team.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/7")
+        );
+    }
+
+    #[test]
+    fn teams_with_open_pr_returns_active_teams_with_pr_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        // Active team with PR
+        let t1 = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "t1".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
+        mgr.mark_active(&t1.id).unwrap();
+        mgr.set_pr(&t1.id, "https://github.com/o/r/pull/1", 1).unwrap();
+
+        // Active team without PR
+        let t2 = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "t2".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
+        mgr.mark_active(&t2.id).unwrap();
+
+        // Suspended team with PR — must NOT appear
+        let t3 = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "t3".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
+        mgr.mark_active(&t3.id).unwrap();
+        mgr.set_pr(&t3.id, "https://github.com/o/r/pull/3", 3).unwrap();
+        mgr.set_state(&t3.id, TeamState::Suspended, None).unwrap();
+
+        let result = mgr.teams_with_open_pr();
+        assert_eq!(result.len(), 1, "only active team with pr_number should appear");
+        let (tid, ticket, _branch, num) = &result[0];
+        assert_eq!(tid, &t1.id);
+        assert_eq!(ticket, "t1");
+        assert_eq!(*num, 1);
+    }
+
+    #[test]
+    fn teams_with_open_pr_ordering_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        for ticket in ["zzz", "aaa", "mmm"] {
+            let t = mgr
+                .create_team(SpawnSpec {
+                    ticket_id: ticket.into(),
+                    base_branch: "main".into(),
+                    roles: mvt_roles(),
+                })
+                .unwrap()
+                .clone();
+            mgr.mark_active(&t.id).unwrap();
+            mgr.set_pr(&t.id, "https://github.com/o/r/pull/1", 1).unwrap();
+        }
+
+        let r1 = mgr.teams_with_open_pr();
+        let r2 = mgr.teams_with_open_pr();
+        let ids1: Vec<_> = r1.iter().map(|(id, _, _, _)| id.clone()).collect();
+        let ids2: Vec<_> = r2.iter().map(|(id, _, _, _)| id.clone()).collect();
+        assert_eq!(ids1, ids2, "ordering must be stable across calls");
+        // must be sorted by team_id
+        assert!(ids1.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]

@@ -270,6 +270,20 @@ pub enum OrchestratorEvent {
         success: bool,
         summary: String,
     },
+    /// PR for a team has been merged; triggers auto-close of the bd ticket and
+    /// team teardown.
+    TeamPrMerged {
+        team_id: String,
+        ticket_id: String,
+        pr_number: u64,
+        merge_commit: Option<String>,
+    },
+    /// PR for a team was closed without merging; surfaced for human review.
+    TeamPrClosed {
+        team_id: String,
+        ticket_id: String,
+        pr_number: u64,
+    },
 }
 
 /// Commands sent from the frontend (TUI) to the core server.
@@ -296,6 +310,20 @@ pub enum TuiCommand {
     StartNewAgent {
         name: String,
         role: String,
+    },
+    /// Auto-close the bd ticket and tear down the team after PR merge.
+    CloseAndTeardownTeam {
+        team_id: String,
+        ticket_id: String,
+        pr_number: u64,
+        merge_commit: Option<String>,
+        reason: String,
+    },
+    /// Close the bd ticket as wontfix and tear down the team for a closed-not-merged PR.
+    ForgetTeamPr {
+        team_id: String,
+        ticket_id: String,
+        pr_number: u64,
     },
     Shutdown,
 }

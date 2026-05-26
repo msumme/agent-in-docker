@@ -119,10 +119,17 @@ impl ShellOps for RealShellOps {
 
 /// Generate the shell script that auto-accepts the bypass permissions dialog
 /// and sends an initial prompt to an agent in a tmux pane.
+///
+/// The prompt text and the submitting Enter are sent as two separate
+/// `send-keys` calls with a pause between them. Claude Code ingests a
+/// multi-line paste asynchronously; an Enter sent in the same burst gets
+/// coalesced into the input as a newline instead of submitting, leaving the
+/// primer typed-but-unsent. Sending text (literal, `-l`) first, then Enter
+/// after the input settles, makes the submit land reliably (bug 83f).
 pub fn auto_accept_script(tmux_target: &str, agent_name: &str) -> String {
     let prompt_file = format!("/tmp/agent-prompt-{}.txt", agent_name);
     format!(
-        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' "$(cat '{pf}')" Enter; rm -f '{pf}'; fi"#,
+        r#"for i in $(seq 1 30); do sleep 2; pane=$(tmux capture-pane -t '{t}' -p 2>/dev/null); if echo "$pane" | grep -q 'Yes, I accept'; then tmux send-keys -t '{t}' Down; sleep 1; tmux send-keys -t '{t}' Enter; break; fi; if echo "$pane" | grep -q '╭─'; then break; fi; done; if [ -f '{pf}' ]; then sleep 3; tmux send-keys -t '{t}' -l "$(cat '{pf}')"; sleep 1; tmux send-keys -t '{t}' Enter; rm -f '{pf}'; fi"#,
         t = tmux_target,
         pf = prompt_file,
     )
@@ -534,6 +541,26 @@ mod tests {
             model: None,
             effort: None,
         }
+    }
+
+    #[test]
+    fn auto_accept_script_sends_enter_separately_from_prompt() {
+        // Regression for 83f: the submitting Enter must be its own send-keys
+        // call, after the prompt text, so it is not coalesced into the paste.
+        let script = auto_accept_script("orchestrator:Alice", "Alice");
+        assert!(
+            script.contains(r#"send-keys -t 'orchestrator:Alice' -l "$(cat"#),
+            "prompt text must be sent literally with -l: {script}"
+        );
+        assert!(
+            !script.contains(r#""$(cat '/tmp/agent-prompt-Alice.txt')" Enter"#),
+            "prompt and Enter must not share one send-keys call: {script}"
+        );
+        let submit = "tmux send-keys -t 'orchestrator:Alice' Enter; rm -f";
+        assert!(
+            script.contains(submit),
+            "Enter must be sent as a separate keystroke before cleanup: {script}"
+        );
     }
 
     #[test]

@@ -521,7 +521,14 @@ impl ServerState {
                             let agent_name = self.agent_name(&pending.agent_id);
                             if let Some(hit) = self.team_lookup.team_for_agent(&agent_name) {
                                 if let Some(ref tm) = self.team_manager {
-                                    let _ = tm.lock().unwrap().set_pr(&hit.team_id, url, number);
+                                    let mut tm = tm.lock().unwrap();
+                                    // The CLI spawns teams in a separate process after the
+                                    // orchestrator has started, so this in-memory manager may
+                                    // not know the team. Refresh from disk before recording the
+                                    // PR, or set_pr no-ops and the PR is never persisted —
+                                    // leaving pr_watcher unable to auto-close on merge.
+                                    let _ = tm.load_from_disk();
+                                    let _ = tm.set_pr(&hit.team_id, url, number);
                                 }
                             }
                         }
@@ -2026,6 +2033,82 @@ mod tests {
         // Team manifest must now have pr_number = 99 (from FakeExecutor)
         let pr_num = tm_arc.lock().unwrap().get(&team_id).unwrap().pr_number;
         assert_eq!(pr_num, Some(99), "team manifest must record pr_number after gh_pr_create");
+    }
+
+    #[test]
+    fn gh_pr_create_records_pr_on_team_spawned_after_orchestrator_start() {
+        // Regression: the CLI provisions a team in its own process, after the
+        // orchestrator started. The orchestrator's in-memory TeamManager never
+        // saw it, so set_pr must refresh from disk first — otherwise the PR is
+        // never persisted and pr_watcher can't auto-close on merge.
+        use crate::team_manager::{SpawnSpec, TeamManager};
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Process A (CLI): create + activate the team on disk.
+        let mut cli_tm = TeamManager::new(tmp.path().to_path_buf(), Box::new(FakeGitForServer));
+        let team = cli_tm
+            .create_team(SpawnSpec {
+                ticket_id: "late-team".into(),
+                base_branch: "main".into(),
+                roles: vec![("feature-producer".into(), "prod".into())],
+            })
+            .unwrap()
+            .clone();
+        cli_tm.mark_active(&team.id).unwrap();
+        let team_id = team.id.clone();
+        let agent_name = format!("{}-prod", team_id);
+
+        // Process B (orchestrator): a SEPARATE manager over the same dir that
+        // never loaded — mirrors starting before the team existed.
+        let orch_tm = Arc::new(std::sync::Mutex::new(TeamManager::new(
+            tmp.path().to_path_buf(),
+            Box::new(FakeGitForServer),
+        )));
+        assert!(
+            orch_tm.lock().unwrap().get(&team_id).is_none(),
+            "precondition: orchestrator manager must not know the team yet"
+        );
+
+        let lookup = FakeTeamLookup::new().with_agent(
+            &agent_name,
+            &team_id,
+            &format!("{}/code", team_id),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let id_gen = Arc::new(SequentialIdGenerator::new());
+        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
+        state.set_team_lookup(Arc::new(lookup));
+        state.set_team_manager(orch_tm.clone());
+
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let (id, _) = state.register_agent(
+            agent_name.clone(),
+            "feature-producer".into(),
+            Some("/ws".into()),
+            sender,
+        );
+        let _ = event_rx.try_recv();
+
+        state.handle_request(
+            &id,
+            "pc-late".into(),
+            "gh_pr_create",
+            json!({"base": "main", "head": "feat/x", "title": "PR", "body": "body", "draft": false}),
+        );
+        let _ = event_rx.try_recv();
+        state.execute_approved_request("pc-late");
+
+        // The PR must be durable on the manifest — a fresh manager loading from
+        // disk must see it, which is what lets a restarted orchestrator (and its
+        // watcher) reconcile the merge.
+        let mut verify = TeamManager::new(tmp.path().to_path_buf(), Box::new(FakeGitForServer));
+        verify.load_from_disk().unwrap();
+        assert_eq!(
+            verify.get(&team_id).unwrap().pr_number,
+            Some(99),
+            "PR number must be persisted to the manifest for a CLI-spawned team"
+        );
     }
 
     #[test]

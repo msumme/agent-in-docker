@@ -9,70 +9,77 @@ use crate::gh_client::{GhClient, PrLifecycle};
 use crate::server::ServerState;
 use crate::types::OrchestratorEvent;
 
-/// Spawn a background task that polls every `interval` for PR state changes on
-/// all Active teams with an open PR number. Emits `TeamPrMerged` or
-/// `TeamPrClosed` events only on Open→{Merged,Closed} transitions. Errors from
+/// One reconciliation pass: poll every Active team with an open PR number and
+/// emit `TeamPrMerged` / `TeamPrClosed` on the Open→{Merged,Closed} transition.
+/// `last_seen` carries observed state across passes so a terminal state is
+/// emitted exactly once. Absent from `last_seen` == assumed Open. Errors from
 /// `gh` are logged and skipped — transient failures do not stop the watcher.
+async fn poll_once(
+    state: &Arc<Mutex<ServerState>>,
+    gh: &Arc<dyn GhClient>,
+    last_seen: &mut HashMap<(String, u64), PrLifecycle>,
+) {
+    let (teams, event_tx) = {
+        let s = state.lock().await;
+        (s.teams_with_open_pr(), s.event_tx_clone())
+    };
+
+    for (team_id, ticket_id, _work_branch, pr_number) in teams {
+        match gh.pr_state("", pr_number) {
+            Ok(pr_state) => {
+                let key = (team_id.clone(), pr_number);
+                let already_terminal = matches!(
+                    last_seen.get(&key),
+                    Some(PrLifecycle::Merged) | Some(PrLifecycle::Closed)
+                );
+                if already_terminal {
+                    continue;
+                }
+                match pr_state.state {
+                    PrLifecycle::Merged => {
+                        last_seen.insert(key, PrLifecycle::Merged);
+                        let _ = event_tx.send(OrchestratorEvent::TeamPrMerged {
+                            team_id,
+                            ticket_id,
+                            pr_number,
+                            merge_commit: pr_state.merge_commit,
+                        });
+                    }
+                    PrLifecycle::Closed => {
+                        last_seen.insert(key, PrLifecycle::Closed);
+                        let _ = event_tx.send(OrchestratorEvent::TeamPrClosed {
+                            team_id,
+                            ticket_id,
+                            pr_number,
+                        });
+                    }
+                    PrLifecycle::Open => {
+                        last_seen.insert(key, PrLifecycle::Open);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("pr_watcher: PR #{} for team {}: {}", pr_number, team_id, e);
+            }
+        }
+    }
+}
+
+/// Spawn a background task that reconciles PR state immediately on startup and
+/// then every `interval`. The startup pass is what lets the orchestrator close
+/// tickets whose PRs merged while it was down — previous runs persist on disk
+/// as team manifests, so a fresh process sees them and acts on their PR fate
+/// without waiting a full interval.
 pub fn spawn(
     state: Arc<Mutex<ServerState>>,
     gh: Arc<dyn GhClient>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Tracks the last successfully observed state per (team_id, pr_number).
-        // Only populated after a non-error response; absent == assumed Open.
         let mut last_seen: HashMap<(String, u64), PrLifecycle> = HashMap::new();
-
         loop {
+            poll_once(&state, &gh, &mut last_seen).await;
             tokio::time::sleep(interval).await;
-
-            let (teams, event_tx) = {
-                let s = state.lock().await;
-                (s.teams_with_open_pr(), s.event_tx_clone())
-            };
-
-            for (team_id, ticket_id, _work_branch, pr_number) in teams {
-                match gh.pr_state("", pr_number) {
-                    Ok(pr_state) => {
-                        let key = (team_id.clone(), pr_number);
-                        let prev = last_seen.get(&key);
-                        let already_terminal = matches!(
-                            prev,
-                            Some(PrLifecycle::Merged) | Some(PrLifecycle::Closed)
-                        );
-                        if !already_terminal {
-                            match pr_state.state {
-                                PrLifecycle::Merged => {
-                                    last_seen.insert(key, PrLifecycle::Merged);
-                                    let _ = event_tx.send(OrchestratorEvent::TeamPrMerged {
-                                        team_id,
-                                        ticket_id,
-                                        pr_number,
-                                        merge_commit: pr_state.merge_commit,
-                                    });
-                                }
-                                PrLifecycle::Closed => {
-                                    last_seen.insert(key, PrLifecycle::Closed);
-                                    let _ = event_tx.send(OrchestratorEvent::TeamPrClosed {
-                                        team_id,
-                                        ticket_id,
-                                        pr_number,
-                                    });
-                                }
-                                PrLifecycle::Open => {
-                                    last_seen.insert(key, PrLifecycle::Open);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "pr_watcher: PR #{} for team {}: {}",
-                            pr_number, team_id, e
-                        );
-                    }
-                }
-            }
         }
     })
 }
@@ -86,7 +93,6 @@ mod tests {
     use crate::types::OrchestratorEvent;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::{mpsc, Mutex};
-    use tokio::time;
 
     struct FakeGhClient {
         responses: StdMutex<Vec<Result<PrState, String>>>,
@@ -169,21 +175,11 @@ mod tests {
         Arc::new(Mutex::new(state))
     }
 
-    async fn tick(interval: Duration) {
-        time::advance(interval + Duration::from_millis(1)).await;
-        // Yield several times to let the watcher task complete its iteration
-        // (it may do a few awaits: state.lock(), then back to sleep).
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-    }
-
     #[tokio::test]
-    async fn watcher_emits_team_pr_merged_on_transition() {
+    async fn poll_emits_team_pr_merged_on_transition() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let state = make_state_with_team(event_tx, 1);
-
-        let gh = Arc::new(FakeGhClient::new(vec![
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![
             Ok(PrState {
                 state: PrLifecycle::Open,
                 merge_commit: None,
@@ -193,19 +189,14 @@ mod tests {
                 merge_commit: Some("abc".into()),
             }),
         ]));
+        let mut last_seen = HashMap::new();
 
-        let interval = Duration::from_millis(100);
-        time::pause();
-        let _handle = spawn(state, gh, interval);
-        // Yield so watcher reaches its first sleep() and registers the timer.
-        tokio::task::yield_now().await;
+        // Pass 1 — Open, no event
+        poll_once(&state, &gh, &mut last_seen).await;
+        assert!(event_rx.try_recv().is_err(), "no event on first pass (Open)");
 
-        // Tick 1 — Open, no event
-        tick(interval).await;
-        assert!(event_rx.try_recv().is_err(), "no event on first tick (Open)");
-
-        // Tick 2 — Merged, TeamPrMerged event
-        tick(interval).await;
+        // Pass 2 — Merged, TeamPrMerged event
+        poll_once(&state, &gh, &mut last_seen).await;
         let event = event_rx.try_recv().expect("TeamPrMerged must be emitted");
         match event {
             OrchestratorEvent::TeamPrMerged {
@@ -221,21 +212,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_emits_team_pr_closed() {
+    async fn poll_emits_team_pr_closed() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let state = make_state_with_team(event_tx, 2);
-
-        let gh = Arc::new(FakeGhClient::new(vec![Ok(PrState {
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![Ok(PrState {
             state: PrLifecycle::Closed,
             merge_commit: None,
         })]));
+        let mut last_seen = HashMap::new();
 
-        let interval = Duration::from_millis(100);
-        time::pause();
-        let _handle = spawn(state, gh, interval);
-        tokio::task::yield_now().await;
-
-        tick(interval).await;
+        poll_once(&state, &gh, &mut last_seen).await;
 
         let event = event_rx.try_recv().expect("TeamPrClosed must be emitted");
         assert!(
@@ -246,21 +232,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_no_event_on_open() {
+    async fn poll_no_event_on_open() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let state = make_state_with_team(event_tx, 3);
-
-        let gh = Arc::new(FakeGhClient::new(vec![Ok(PrState {
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![Ok(PrState {
             state: PrLifecycle::Open,
             merge_commit: None,
         })]));
+        let mut last_seen = HashMap::new();
 
-        let interval = Duration::from_millis(100);
-        time::pause();
-        let _handle = spawn(state, gh, interval);
-        tokio::task::yield_now().await;
-
-        tick(interval).await;
+        poll_once(&state, &gh, &mut last_seen).await;
 
         assert!(
             event_rx.try_recv().is_err(),
@@ -269,73 +250,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_emits_team_pr_closed_exactly_once_across_multiple_ticks() {
-        // Regression: if the team stays Active (TeamManager not updated between ticks),
-        // the watcher must not re-emit TeamPrClosed on subsequent ticks.
+    async fn poll_emits_team_pr_closed_exactly_once_across_multiple_passes() {
+        // Regression: if the team stays Active (TeamManager not updated between
+        // passes), the watcher must not re-emit TeamPrClosed on later passes.
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let state = make_state_with_team(event_tx, 5);
-
-        // FakeGhClient exhausts its list and then returns Open; configure it to
-        // return Closed on every call so the team stays in teams_with_open_pr.
-        let gh = Arc::new(FakeGhClient::new(vec![
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![
             Ok(PrState {
                 state: PrLifecycle::Closed,
                 merge_commit: None,
             }),
-            // Second tick: still reports Closed (team not yet removed from manager).
             Ok(PrState {
                 state: PrLifecycle::Closed,
                 merge_commit: None,
             }),
         ]));
+        let mut last_seen = HashMap::new();
 
-        let interval = Duration::from_millis(100);
-        time::pause();
-        let _handle = spawn(state, gh, interval);
-        tokio::task::yield_now().await;
-
-        // Tick 1 — Closed → exactly one TeamPrClosed emitted.
-        tick(interval).await;
-        let event = event_rx.try_recv().expect("TeamPrClosed must be emitted on first Closed tick");
+        // Pass 1 — Closed → exactly one TeamPrClosed emitted.
+        poll_once(&state, &gh, &mut last_seen).await;
+        let event = event_rx
+            .try_recv()
+            .expect("TeamPrClosed must be emitted on first Closed pass");
         assert!(
             matches!(event, OrchestratorEvent::TeamPrClosed { pr_number: 5, .. }),
             "got {:?}",
             event
         );
 
-        // Tick 2 — still Closed, team still in manager → no second event.
-        tick(interval).await;
+        // Pass 2 — still Closed, team still in manager → no second event.
+        poll_once(&state, &gh, &mut last_seen).await;
         assert!(
             event_rx.try_recv().is_err(),
-            "TeamPrClosed must not be re-emitted on subsequent ticks"
+            "TeamPrClosed must not be re-emitted on subsequent passes"
         );
     }
 
     #[tokio::test]
-    async fn watcher_tolerates_gh_error_and_continues() {
+    async fn poll_tolerates_gh_error_and_continues() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let state = make_state_with_team(event_tx, 4);
-
-        let gh = Arc::new(FakeGhClient::new(vec![
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![
             Err("transient gh failure".into()),
             Ok(PrState {
                 state: PrLifecycle::Merged,
                 merge_commit: Some("def".into()),
             }),
         ]));
+        let mut last_seen = HashMap::new();
 
-        let interval = Duration::from_millis(100);
-        time::pause();
-        let _handle = spawn(state, gh, interval);
-        tokio::task::yield_now().await;
+        // Pass 1 — Err, no event, no state recorded
+        poll_once(&state, &gh, &mut last_seen).await;
+        assert!(event_rx.try_recv().is_err(), "no event on error pass");
 
-        // Tick 1 — Err, no event, watcher does not terminate
-        tick(interval).await;
-        assert!(event_rx.try_recv().is_err(), "no event on error tick");
-
-        // Tick 2 — Merged, watcher still alive
-        tick(interval).await;
-        let event = event_rx.try_recv().expect("watcher must continue after error");
+        // Pass 2 — Merged, recovers
+        poll_once(&state, &gh, &mut last_seen).await;
+        let event = event_rx
+            .try_recv()
+            .expect("watcher must continue after error");
         assert!(matches!(event, OrchestratorEvent::TeamPrMerged { .. }));
+    }
+
+    #[tokio::test]
+    async fn spawn_reconciles_immediately_on_startup() {
+        // The startup pass must run before the first interval elapses — a freshly
+        // launched orchestrator closes a ticket whose PR merged while it was down.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let state = make_state_with_team(event_tx, 7);
+        let gh: Arc<dyn GhClient> = Arc::new(FakeGhClient::new(vec![Ok(PrState {
+            state: PrLifecycle::Merged,
+            merge_commit: Some("sha".into()),
+        })]));
+
+        tokio::time::pause();
+        let _handle = spawn(state, gh, Duration::from_secs(300));
+        // Yield without advancing time past the interval; the startup pass runs
+        // before the watcher parks on its first sleep().
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let event = event_rx
+            .try_recv()
+            .expect("startup pass must emit before first interval");
+        assert!(matches!(
+            event,
+            OrchestratorEvent::TeamPrMerged { pr_number: 7, .. }
+        ));
     }
 }

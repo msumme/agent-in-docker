@@ -75,11 +75,13 @@ teams; fall back to hand-driving only to keep momentum.
   → DONE: `core/src/integration.rs` (`MergeOps` trait + pure `integrate`, 5 unit
   tests) + `agent team integrate <id> [--merge]`. E2E-on-a-real-team deferred to
   P2 (need a team that produces a branch first).
-- [ ] **P2 — Clone-per-agent isolation.** Replace the single shared worktree with
+- [x] **P2 — Clone-per-agent isolation.** Replace the single shared worktree with
   `git clone --local` per role; mount each clone alone; host fetch-on-handoff
   helper. Fixes `crf`. *Test:* spawn a team, confirm each agent has an isolated
   repo with only its branch and can commit; host fetches the branch into
   canonical.
+  → DONE (c1b5849), **built autonomously by team `t-agent-in-docker-6mq-2`** and
+  integrated via the P1 loop. Closed `6mq.2`, spec `loc`, and bug `crf`.
 - [ ] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** The orchestrator
   actively drives the internal (pre-PR) loop instead of hoping agents coordinate:
   - **Observe the `message_agent` handoff** (design choice: intercept the ping,
@@ -153,4 +155,15 @@ teams; fall back to hand-driving only to keep momentum.
   while the in-orchestrator supervisor is built. Sequencing: let `6mq-2` finish
   P2 (clone-per-agent) on the old orchestrator → integrate via P1 loop → build the
   Supervisor (rebuild orchestrator) → next teams run autonomously under it.
+- 2026-06-03 — **First full sealed-loop integration.** Watchdog `b0hzksppd` fired
+  `PRODUCER_DONE_REVIEWER_IDLE`: producer committed `bf5e29a`, the team reviewer
+  had already approved, and both agents were stuck waiting to `git_push`+open a
+  PR with no human at the TUI — the exact egress gate the sealed model removes.
+  Acted as host integrator: `team integrate --check` → independent review
+  subagent **APPROVE** (no blocking issues; all 6 spec tests confirmed) → built &
+  tested the worktree (exit 0) → `team integrate --merge` → `c1b5849` on main.
+  Rebuilt: `main` compiles, 150 core tests green. Closed `6mq.2`/`loc`/`crf`,
+  killed the team. **P2 done.** Net: a containerized team planned, built (TDD),
+  self-reviewed, and shipped a 530-line refactor to main with zero per-action
+  human approval. Next: build the Team Supervisor (`6mq.7`).
 </content>

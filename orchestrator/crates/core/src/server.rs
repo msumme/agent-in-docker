@@ -1958,26 +1958,30 @@ mod tests {
 
     struct FakeGitForServer;
     impl crate::team_manager::GitOps for FakeGitForServer {
-        fn worktree_add(
+        fn clone_local(
+            &self,
+            _src: &std::path::Path,
+            dest: &std::path::Path,
+        ) -> Result<(), String> {
+            std::fs::create_dir_all(dest).unwrap();
+            Ok(())
+        }
+        fn checkout_new_branch(
             &self,
             _repo: &std::path::Path,
-            worktree_path: &std::path::Path,
             _branch: &str,
             _base: &str,
         ) -> Result<(), String> {
-            std::fs::create_dir_all(worktree_path).unwrap();
             Ok(())
         }
-        fn worktree_remove(
+        fn fetch_branch(
             &self,
-            _repo: &std::path::Path,
-            worktree_path: &std::path::Path,
-            _force: bool,
+            _canonical_repo: &std::path::Path,
+            _src_clone: &std::path::Path,
+            _branch: &str,
         ) -> Result<(), String> {
-            let _ = std::fs::remove_dir_all(worktree_path);
             Ok(())
         }
-        fn worktree_prune(&self, _repo: &std::path::Path) -> Result<(), String> { Ok(()) }
         fn branch_delete(&self, _repo: &std::path::Path, _branch: &str) {}
     }
 

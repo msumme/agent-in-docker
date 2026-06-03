@@ -1,19 +1,20 @@
 //! `agent team {spawn,suspend,resume,list,status,kill}` subcommand.
 //!
-//! Teams are provisioned via TeamManager (worktree, manifest, state dirs)
-//! and then 3 containers are launched against the worktree with team-scoped
-//! state directories. Suspend and resume are container lifecycle operations
-//! over the same mounts — the per-agent state is already persisted on disk
-//! by virtue of being mounted from the host, so suspend = `podman rm -f` +
-//! manifest state update, and resume = relaunch with the same mounts.
+//! Teams are provisioned via TeamManager (per-role git clones, manifest, state
+//! dirs) and then 3 containers are launched — each pointed at its own clone —
+//! with team-scoped state directories. Suspend and resume are container
+//! lifecycle operations over the same mounts — the per-agent state is already
+//! persisted on disk by virtue of being mounted from the host, so suspend =
+//! `podman rm -f` + manifest state update, and resume = relaunch with the
+//! same mounts.
 
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use orchestrator_core::integration::{self, IntegrateMode, IntegrateSpec, RealMergeOps};
 use orchestrator_core::project_config;
 use orchestrator_core::team_manager::{
-    RealGitOps, SpawnSpec, Team, TeamManager, TeamState,
+    RealGitOps, SpawnSpec, TeamManager, TeamState,
 };
 use orchestrator_core::types::StartAgentPayload;
 
@@ -129,15 +130,22 @@ pub fn cmd_list(cfg: &Config) -> Result<()> {
     }
     println!(
         "{:<32} {:<10} {:<28} {}",
-        "TEAM", "STATE", "TICKET", "WORKTREE"
+        "TEAM", "STATE", "TICKET", "CLONES DIR"
     );
     for t in teams {
+        let clones_dir = t
+            .clones
+            .values()
+            .next()
+            .and_then(|p| p.parent())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none".to_string());
         println!(
             "{:<32} {:<10} {:<28} {}",
             t.id,
             format!("{:?}", t.state).to_lowercase(),
             t.ticket_id,
-            t.worktree_path.display()
+            clones_dir
         );
     }
     Ok(())
@@ -153,7 +161,6 @@ pub fn cmd_status(cfg: &Config, team_id: &str) -> Result<()> {
     println!("state:        {:?}", team.state);
     println!("base branch:  {}", team.base_branch);
     println!("work branch:  {}", team.work_branch);
-    println!("worktree:     {}", team.worktree_path.display());
     println!("created:      {}", team.created_at);
     println!("last active:  {}", team.last_active);
     if let Some(reason) = &team.suspend_reason {
@@ -162,6 +169,10 @@ pub fn cmd_status(cfg: &Config, team_id: &str) -> Result<()> {
     if let Some(url) = &team.pr_url {
         println!("pr:           {}", url);
     }
+    println!("clones:");
+    for (role, path) in &team.clones {
+        println!("  {:<24} {}", role, path.display());
+    }
     println!("agents:");
     for a in &team.agents {
         println!("  {:<6} {}", a.role, a.name);
@@ -169,18 +180,16 @@ pub fn cmd_status(cfg: &Config, team_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build the StartAgentPayload for one team agent — pointed at the team's
-/// worktree, with a team-scoped agent_dir so each role's state stays under
+/// Build the StartAgentPayload for one team agent — pointed at the role's own
+/// clone, with a team-scoped agent_dir so each role's state stays under
 /// `.teams/<team-id>/<role>/.claude/`. Resolves the role prompt with the
 /// meta-prompt prepended, just like the regular Run flow.
 ///
-/// Also mounts the project root at its host path so git worktree pointers
-/// resolve inside the container (the worktree's `.git` file holds an
-/// absolute host path; without this mirror mount, `git status` and friends
-/// fail with "not a git repository"). This is the option-2 worktree fix.
+/// Each agent gets its own isolated clone as project_path; no mirror-mount of
+/// the canonical repo is needed because the clone is a self-contained git repo.
 fn build_payload_for_team_agent(
     cfg: &Config,
-    team: &Team,
+    clone_path: &Path,
     agent_role: &str,
     agent_name: &str,
     agent_dir: PathBuf,
@@ -192,18 +201,16 @@ fn build_payload_for_team_agent(
     let resolved = image_resolver::resolve(cfg, agent_role);
     image_resolver::ensure_image(cfg, &resolved)?;
     let bundled_roles = cfg.project_root.join("roles");
-    // Resolve role prompt by name → bundled .md.
     let role_prompt_text = match project_config::resolve_role_prompt(
         agent_role,
-        &team.worktree_path,
+        clone_path,
         &bundled_roles,
     ) {
         Some(p) => std::fs::read_to_string(&p)
             .map_err(|e| anyhow::anyhow!("read role prompt {}: {}", p.display(), e))?,
         None => String::new(),
     };
-    // Prepend meta.
-    let meta_text = project_config::resolve_role_prompt("_meta", &team.worktree_path, &bundled_roles)
+    let meta_text = project_config::resolve_role_prompt("_meta", clone_path, &bundled_roles)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
     let role_prompt = if meta_text.is_empty() {
@@ -216,7 +223,7 @@ fn build_payload_for_team_agent(
 
     Ok(StartAgentPayload {
         name: agent_name.to_string(),
-        project_path: team.worktree_path.to_string_lossy().to_string(),
+        project_path: clone_path.to_string_lossy().to_string(),
         agent_dir: agent_dir.to_string_lossy().to_string(),
         role_memory_dir: role_memory_dir.to_string_lossy().to_string(),
         role_prompt,
@@ -233,14 +240,7 @@ fn build_payload_for_team_agent(
         dolt_port,
         image_name: resolved.image_name,
         network_name: cfg.network_name.clone(),
-        // Mirror the project root at its host path. The worktree's `.git`
-        // file points to `<host-project>/.git/worktrees/<id>` — that path
-        // must exist inside the container for `git status`/`commit`/`push`
-        // to resolve the worktree pointer.
-        extra_mounts: vec![(
-            cfg.project_root.to_string_lossy().to_string(),
-            cfg.project_root.to_string_lossy().to_string(),
-        )],
+        extra_mounts: vec![],
         model: model_override,
         effort: effort_override,
     })
@@ -298,7 +298,9 @@ pub fn cmd_spawn(
         .clone();
 
     println!("==> Team {}", team.id);
-    println!("    worktree:  {}", team.worktree_path.display());
+    for (role, path) in &team.clones {
+        println!("    clone[{}]: {}", role, path.display());
+    }
     println!("    branch:    {} (from {})", team.work_branch, team.base_branch);
 
     // Per-agent state under .teams/<id>/<role>/.claude/. Seed each fresh
@@ -320,12 +322,16 @@ pub fn cmd_spawn(
         }
 
         let role_memory_dir = project_config::setup_role_memory_dir(&pcfg, &agent.role)?;
-
         let initial_prompt = build_initial_prompt(&team.id, &team.ticket_id, &agent.role);
+
+        let clone_path = mgr
+            .clone_path(&team.id, &agent.role)
+            .ok_or_else(|| anyhow::anyhow!("no clone for role {}", agent.role))?
+            .to_path_buf();
 
         let payload = build_payload_for_team_agent(
             cfg,
-            &team,
+            &clone_path,
             &agent.role,
             &agent.name,
             agent_dir,
@@ -439,9 +445,14 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
             role = agent.role,
         );
 
+        let clone_path = mgr
+            .clone_path(&team.id, &agent.role)
+            .ok_or_else(|| anyhow::anyhow!("no clone for role {}", agent.role))?
+            .to_path_buf();
+
         let payload = build_payload_for_team_agent(
             cfg,
-            &team,
+            &clone_path,
             &agent.role,
             &agent.name,
             agent_dir,
@@ -465,11 +476,22 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
 /// show the work branch's diff vs base for review (default), or merge it into
 /// base with `--merge`. The merge runs in the canonical repo (project root),
 /// the only place with write access — agents never push here.
+///
+/// Before diff/merge, fetches the producer role's branch from its clone into
+/// the canonical repo so the canonical repo has the latest commits.
 pub fn cmd_integrate(cfg: &Config, team_id: &str, merge: bool) -> Result<()> {
     let mgr = open_manager(cfg)?;
     let team = mgr
         .get(team_id)
         .ok_or_else(|| anyhow::anyhow!("team '{}' not found", team_id))?;
+
+    // Fetch the producer's branch from their clone into the canonical repo.
+    for producer_role in &["feature-producer", "maintenance-producer"] {
+        if team.agents.iter().any(|a| &a.role == producer_role) {
+            mgr.fetch_role_branch(team_id, producer_role)
+                .map_err(|e| anyhow::anyhow!("fetch {} branch: {}", producer_role, e))?;
+        }
+    }
 
     let spec = IntegrateSpec {
         team_id: team.id.clone(),

@@ -80,10 +80,25 @@ teams; fall back to hand-driving only to keep momentum.
   helper. Fixes `crf`. *Test:* spawn a team, confirm each agent has an isolated
   repo with only its branch and can commit; host fetches the branch into
   canonical.
-- [ ] **P3 — Park signal + bd reconcile.** Sentinel-file (inotify) or bd-state
-  "I'm done"; orchestrator reconcile loop derives the next action from bd.
-  Replace exit-as-signal. *Test:* agent parks, orchestrator advances the ticket
-  without the agent exiting.
+- [ ] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** The orchestrator
+  actively drives the internal (pre-PR) loop instead of hoping agents coordinate:
+  - **Observe the `message_agent` handoff** (design choice: intercept the ping,
+    not a separate signal). Hook point: `route_agent_message` (server.rs:281) /
+    the `"agent_message"` handler (server.rs:1003). Producer→reviewer ping ⇒
+    auto-fire review (ensure the reviewer is actually engaged); reviewer→producer
+    ⇒ ensure the producer is woken with the feedback. Feedback is filed as beads
+    blocking the implement work and delivered to the producer — **before any PR.**
+  - **Idle/stall watchdog.** If a producer just goes quiet without handing off,
+    notice it and diagnose: *stalled* (idle, no new commits), *blocked* (waiting
+    on a bd dep), or *silently done* (committed but never pinged ⇒ trigger
+    review). Don't depend on the agent remembering to signal.
+  - Surface all transitions durably so progress is visible in the background
+    (the gap that motivated this: nothing currently sees when a producer
+    finishes).
+  *Test:* producer ping auto-engages reviewer; reviewer feedback round-trips to
+  producer as beads; a stalled producer is detected and diagnosed.
+  *Prototype:* host-side watchdog `/tmp/team_watch_6mq2.sh` (running now) detects
+  done/stalled/review for the live team — informs the productized version.
 - [ ] **P4 — Persistent producer + ephemeral reviewer.** Producer suspends/
   resumes via Claude session resume; review feedback injected into the same
   session. Reviewer spawns fresh each round. *Test:* feedback round-trips into a
@@ -119,4 +134,23 @@ teams; fall back to hand-driving only to keep momentum.
   Next: P2 clone-per-agent — replace the shared worktree + `crf` mirror-mount
   hack with `git clone --local` per role; this is also the first real
   dogfooding candidate (spawn a team, integrate via the P1 loop).
+- 2026-06-03 — Committed README rewrite + P1 to `main` so a spawned team
+  branching from `main` sees them. Specced P2 into `6mq.2` (assigned `team`,
+  in_progress) and **spawned a real team** on it: `t-agent-in-docker-6mq-2`
+  (planner/producer/reviewer containers up in tmux session `orchestrator`,
+  branch `t-agent-in-docker-6mq-2/code`). Planner began working immediately and
+  located `team_manager.rs`/`team_cmd.rs`; `crf` not biting (mirror-mount hack
+  still in place). Dogfooding the build of P2. Integration via the P1 loop:
+  `agent team integrate t-agent-in-docker-6mq-2 [--merge]` once a branch exists.
+  My role from here = host integrator (review subagent + merge), NOT agent steps.
+- 2026-06-03 — Two new requirements from user, folded into the **Team Supervisor**
+  (bd `6mq.7`, expands P3): (1) orchestrator must observe the `message_agent`
+  ping to auto-fire the reviewer and route feedback back to the producer *before*
+  any PR; (2) if a producer just stops, the orchestrator must notice and diagnose
+  stalled vs blocked vs silently-done. Stop-gap: launched a background watchdog
+  (`/tmp/team_watch_6mq2.sh`, task `b0hzksppd`) that polls the live team's panes +
+  git commits and exits with a diagnosis — immediate eyes on the running team
+  while the in-orchestrator supervisor is built. Sequencing: let `6mq-2` finish
+  P2 (clone-per-agent) on the old orchestrator → integrate via P1 loop → build the
+  Supervisor (rebuild orchestrator) → next teams run autonomously under it.
 </content>

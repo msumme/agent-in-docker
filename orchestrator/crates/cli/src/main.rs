@@ -87,6 +87,13 @@ enum TeamAction {
     List,
     /// Show one team's manifest details
     Status { team_id: String },
+    /// Show the team's work-branch diff vs base (review), or merge it with --merge
+    Integrate {
+        team_id: String,
+        /// Merge the work branch into base (default: just show the diff)
+        #[arg(long)]
+        merge: bool,
+    },
     /// Force-teardown a team (containers gone, worktree removed, manifest archived/deleted)
     Kill {
         team_id: String,
@@ -114,6 +121,9 @@ fn main() -> Result<()> {
             TeamAction::Resume { team_id, role } => team_cmd::cmd_resume(&cfg, &team_id, role),
             TeamAction::List => team_cmd::cmd_list(&cfg),
             TeamAction::Status { team_id } => team_cmd::cmd_status(&cfg, &team_id),
+            TeamAction::Integrate { team_id, merge } => {
+                team_cmd::cmd_integrate(&cfg, &team_id, merge)
+            }
             TeamAction::Kill { team_id, no_archive } => {
                 team_cmd::cmd_kill(&cfg, &team_id, !no_archive)
             }

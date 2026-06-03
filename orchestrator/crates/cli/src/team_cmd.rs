@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
+use orchestrator_core::integration::{self, IntegrateMode, IntegrateSpec, RealMergeOps};
 use orchestrator_core::project_config;
 use orchestrator_core::team_manager::{
     RealGitOps, SpawnSpec, Team, TeamManager, TeamState,
@@ -457,6 +458,46 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
         .map_err(|e| anyhow::anyhow!("set state: {}", e))?;
 
     println!("    State: active.");
+    Ok(())
+}
+
+/// `agent team integrate <id> [--merge]`. Host-mediated, PR-free integration:
+/// show the work branch's diff vs base for review (default), or merge it into
+/// base with `--merge`. The merge runs in the canonical repo (project root),
+/// the only place with write access — agents never push here.
+pub fn cmd_integrate(cfg: &Config, team_id: &str, merge: bool) -> Result<()> {
+    let mgr = open_manager(cfg)?;
+    let team = mgr
+        .get(team_id)
+        .ok_or_else(|| anyhow::anyhow!("team '{}' not found", team_id))?;
+
+    let spec = IntegrateSpec {
+        team_id: team.id.clone(),
+        ticket_id: team.ticket_id.clone(),
+        base_branch: team.base_branch.clone(),
+        work_branch: team.work_branch.clone(),
+    };
+    let mode = if merge {
+        IntegrateMode::Merge
+    } else {
+        IntegrateMode::Check
+    };
+
+    let report = integration::integrate(&RealMergeOps, &cfg.project_root, &spec, mode)
+        .map_err(|e| anyhow::anyhow!("integrate: {}", e))?;
+
+    println!("==> {} ({}): {} → {}", team.id, team.ticket_id, report.branch, report.base);
+    println!("--- diffstat ---");
+    println!("{}", report.diff_stat.trim_end());
+    if let Some(diff) = &report.diff {
+        println!("--- diff ---");
+        println!("{}", diff);
+        println!();
+        println!("Review the diff above. To integrate: agent team integrate {} --merge", team.id);
+    }
+    if report.merged {
+        println!("==> Merged {} into {}.", report.branch, report.base);
+    }
     Ok(())
 }
 

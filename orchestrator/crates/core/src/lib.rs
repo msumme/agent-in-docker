@@ -1,6 +1,7 @@
 pub mod agent_manager;
 pub mod gh_client;
 pub mod handlers;
+pub mod integration;
 pub mod mcp;
 pub mod permissions;
 pub mod pr_watcher;

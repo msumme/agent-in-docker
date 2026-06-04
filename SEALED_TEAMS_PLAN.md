@@ -39,10 +39,17 @@ This supersedes the per-action permission/approval machinery (MCP `git_push` /
 6. **Role-split lifecycle.** Producer is **persistent** (suspend/resume with
    Claude session resume, so PR/review feedback lands in the *same context*).
    Reviewer is **ephemeral** (fresh container each round — unbiased eyes).
-7. **Integration gate.** Normally: open a PR; the repo's existing branch
-   protection is the real gate. **For dogfooding here:** skip PRs — the host
-   merges the team's branch into `main` after a **review subagent** reviews the
-   diff and feeds findings back into the team. Loop until clean.
+7. **Integration gate — two modes.**
+   - *Bootstrap (now, temporary):* skip PRs — the host merges the team's branch
+     into `main` after a review subagent reviews the diff and feeds findings back.
+     This is a shortcut to move fast while building the machinery; it is NOT the
+     destination.
+   - *Destination:* the host opens real **PRs** that a human reviews
+     **asynchronously and never blocking** — agents keep working while a PR
+     sits; human comments flow back as feedback. Support **stacked PRs**: a
+     dependent piece branches off the previous branch (not `main`), so several
+     PRs queue on top of each other, mirroring beads dependency links. See the
+     "Async + stacked PRs" phase.
 
 ## Dogfooding loop (how we build this)
 
@@ -112,6 +119,16 @@ teams; fall back to hand-driving only to keep momentum.
   formula; the orchestrator is a thin dispatcher (spawn container-steps, execute
   host-steps, await human/gate-steps). *Test:* `bd mol pour team` drives a full
   ticket through the loop.
+- [ ] **Async + stacked PRs (post-bootstrap integration mode).** Flip the
+  integration gate from merge-to-main to **real PRs reviewed asynchronously**:
+  the host opens a PR when a team parks; the human reviews on their own time and
+  is **never blocking** — agents keep working, PR comments flow back as beads
+  into the producer's context (the inbound bridge from the earlier design).
+  **Stacked PRs:** when a piece depends on another that isn't merged yet, branch
+  it off the previous branch instead of `main` and open the PR against that
+  branch, so a stack of dependent PRs queues up (mirrors beads `blocks`/`needs`
+  links). *Test:* two dependent pieces produce two stacked PRs; commenting on the
+  lower PR routes feedback to its producer without blocking the upper one.
 
 ## Risks / open questions
 
@@ -166,4 +183,11 @@ teams; fall back to hand-driving only to keep momentum.
   killed the team. **P2 done.** Net: a containerized team planned, built (TDD),
   self-reviewed, and shipped a 530-line refactor to main with zero per-action
   human approval. Next: build the Team Supervisor (`6mq.7`).
+- 2026-06-03 — User direction: (a) PRs are wanted *eventually*, just not during
+  bootstrap; the destination is async, **non-blocking** human review + **stacked
+  PRs** — captured as the "Async + stacked PRs" phase. Merge-to-main is now
+  explicitly labeled bootstrap-only. (b) Refer to work by human-readable title,
+  not bead codes. (c) Pairs with the Supervisor: drop `git_push`/`gh_pr_create`
+  from the producer's primer (it kept jamming on them) — "done" = park/ping; the
+  host integrates.
 </content>

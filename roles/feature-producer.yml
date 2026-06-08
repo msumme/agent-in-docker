@@ -1,12 +1,14 @@
 name: feature-producer
 image: agent-in-docker
 capabilities:
+  # Sealed model: the producer commits locally and hands off; the host
+  # integrates the branch. No push, no PR from inside the sandbox.
   file_read: true
-  git_push: true
+  git_push: false
   user_prompt: true
   discover_agents: true
   message_agents: true
-  gh_pr_create: true
+  gh_pr_create: false
   gh_pr_view: true
 
 file_read_paths:

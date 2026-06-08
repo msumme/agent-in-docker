@@ -99,12 +99,17 @@ agent reads from and writes to the same bd database. Do not coordinate via
 - `epic` — multi-issue work; children link with `parent:<epic-id>`.
 - `decision` — architectural choice that should be queryable later.
 
-### Branching and merge
+### Branching and integration
 
-- One branch per ticket: `<your-name>/bd-<id>`.
-- Acquire the merge slot before integrating: `bd merge-slot acquire`.
-  Release after merge: `bd merge-slot release`.
-- Per-ticket isolation eliminates concurrent-edit collisions; merge-slot
+- Your team works on one branch, in an **isolated clone** of the project
+  mounted at `/workspace`. You commit there. That is the extent of your
+  git authority.
+- You do **not** push, merge, open pull requests, or acquire merge slots.
+  Your container has no remote and no GitHub credentials by design. The
+  **host** (outside the sandbox) reviews the approved branch and
+  integrates it. Your "done" is a local commit plus the handoff ping your
+  role defines.
+- Per-clone isolation eliminates concurrent-edit collisions; the host
   serializes the final integration step.
 
 ### Context discipline
@@ -114,13 +119,13 @@ budget that depletes. The orchestrator tracks your usage and will compact
 or restart you, but you have a role to play in keeping yourself useful:
 
 - The orchestrator dispatches `/compact` automatically when your context
-  crosses **60%** OR when you hit a natural break (a PR opens, a ticket
-  closes, you suspend after handing off). When `/compact` is sent to you,
+  crosses **60%** OR when you hit a natural break (a ticket closes, you
+  suspend after handing off). When `/compact` is sent to you,
   cooperate — do not protest, do not summarize differently than `/compact`
   produces. Continue your role from the summary.
 - Natural breaks are good moments to stop holding state. After you finish
-  a discrete unit (closing a ticket, opening a PR, sending a verdict),
-  let the next pass start clean.
+  a discrete unit (closing a ticket, handing off a commit, sending a
+  verdict), let the next pass start clean.
 - Do not hoard verbatim tool output in conversation. Cite file:line
   references and let the next read-of-record happen on demand.
 - If you find yourself re-reading the same file three times, compact
@@ -142,7 +147,7 @@ You are running headless in a container. There is no human at a terminal
 waiting to answer prompts. Skills, scripts, or sub-agents you invoke that
 include a "confirm with the user" / "ask the user to approve the draft"
 step do not apply to you — skip that step and proceed with the action.
-The reviewer (and the human reviewing the merged PR) is your confirmation
-gate, not a pre-action prompt. The only exception is the host approval
-for capabilities the orchestrator gates explicitly (e.g. `git_push`,
-`file_read`); those are intentional and you cannot bypass them.
+The reviewer (and, after integration, the human) is your confirmation
+gate, not a pre-action prompt. You never push or open PRs; the host
+integrates your approved branch, so there is no host-approval step for
+you to wait on during normal work.

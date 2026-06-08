@@ -89,6 +89,11 @@ teams; fall back to hand-driving only to keep momentum.
   canonical.
   → DONE (c1b5849), **built autonomously by team `t-agent-in-docker-6mq-2`** and
   integrated via the P1 loop. Closed `6mq.2`, spec `loc`, and bug `crf`.
+- [x] **Supervisor inert-fix** — DONE, dogfooded by team `6mq-9`: `message_agent`
+  now passes the real sender (`x-agent-name`), `route_message` resolves it via
+  `resolve_agent_ref`, so `classify_handoff` fires and `supervisor.log` writes;
+  4 regression tests. Orchestrator rebuilt + restarted. **Live proof pending the
+  next team spawn** (watch `.teams/<id>/supervisor.log` appear).
 - [x] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** DONE (35890ae),
   built autonomously by a team. Handoff classifier + supervisor.log + stall
   watchdog + MaybeDone auto-fire, wired into server routing/startup. Paired

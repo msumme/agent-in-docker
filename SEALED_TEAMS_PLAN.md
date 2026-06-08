@@ -89,7 +89,10 @@ teams; fall back to hand-driving only to keep momentum.
   canonical.
   → DONE (c1b5849), **built autonomously by team `t-agent-in-docker-6mq-2`** and
   integrated via the P1 loop. Closed `6mq.2`, spec `loc`, and bug `crf`.
-- [ ] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** The orchestrator
+- [x] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** DONE (35890ae),
+  built autonomously by a team. Handoff classifier + supervisor.log + stall
+  watchdog + MaybeDone auto-fire, wired into server routing/startup. Paired
+  fix (below): role files updated so producers actually obey the sealed contract. The orchestrator
   actively drives the internal (pre-PR) loop instead of hoping agents coordinate:
   - **Observe the `message_agent` handoff** (design choice: intercept the ping,
     not a separate signal). Hook point: `route_agent_message` (server.rs:281) /
@@ -201,4 +204,20 @@ teams; fall back to hand-driving only to keep momentum.
   archived 5 dead old-schema teams; filed a bug to make `load_from_disk`
   skip+log unparseable manifests instead of failing. Generic watchdog now at
   `/tmp/team_watch.sh <team-id>`.
+- 2026-06-08 — Team Supervisor built by team `t-agent-in-docker-6mq-7`
+  (supervisor.rs + stall_watchdog.rs + server routing hook + supervisor.log,
+  +1055 lines, 16 new tests). Host gate: independent review subagent APPROVE
+  (verified no lock-across-await, auto-fire-once, Clock injected, primer
+  stripped) → 166 core tests → merged 35890ae → killed team → stopped the old
+  orchestrator (next spawn starts the new binary with the Supervisor live).
+  **Root-cause fix the user caught:** the producer kept jamming on git_push/PR
+  because the *role files* (not just the primer) still ordered it to push + open
+  a PR. Rewrote `feature-producer.md`, `maintenance-producer.md`,
+  `review-agent.md`, and the `_meta.md` branching/non-interactive sections to the
+  sealed contract (commit + ping; host integrates; no push/PR), and flipped the
+  producer `.yml` capabilities `git_push:false`/`gh_pr_create:false` as
+  enforcement. Now all three behavior layers (primer + role .md + capability
+  flags) agree. Two more dogfood gaps filed/fixed along the way: `.teams-clones/`
+  wasn't gitignored (fixed); `load_from_disk` hard-fails on stale manifests (bug
+  filed). Next: Persistent producer / ephemeral reviewer.
 </content>

@@ -261,8 +261,17 @@ impl TeamManager {
             if !manifest_path.is_file() {
                 continue;
             }
-            let team = parse_manifest_file(&manifest_path)
-                .map_err(|e| format!("load manifest {}: {}", manifest_path.display(), e))?;
+            let team = match parse_manifest_file(&manifest_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!(
+                        "warn: skipping unparseable team manifest {}: {}",
+                        manifest_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
             self.teams.insert(team.id.clone(), team);
         }
         Ok(())
@@ -1206,5 +1215,58 @@ mod tests {
         let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
         mgr2.load_from_disk().unwrap();
         assert!(mgr2.get(&id).is_none(), "team must be gone after teardown");
+    }
+
+    #[test]
+    fn load_from_disk_skips_unparseable_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good_id = {
+            let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+            mgr.create_team(SpawnSpec {
+                ticket_id: "good".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .id
+            .clone()
+        };
+        // Write a syntactically invalid JSON manifest in a sibling directory.
+        let bad_dir = tmp.path().join(".teams").join("bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("manifest.json"), b"not json").unwrap();
+
+        let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        assert!(mgr2.load_from_disk().is_ok(), "should tolerate bad manifest");
+        assert!(mgr2.get(&good_id).is_some(), "good team must be present");
+        assert!(mgr2.get("bad").is_none(), "bad team must be absent");
+    }
+
+    #[test]
+    fn load_from_disk_skips_manifest_missing_required_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good_id = {
+            let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+            mgr.create_team(SpawnSpec {
+                ticket_id: "good2".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .id
+            .clone()
+        };
+        // Write a valid JSON object that fails typed deserialization (missing required fields).
+        let bad_dir = tmp.path().join(".teams").join("incomplete");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("manifest.json"), b"{}").unwrap();
+
+        let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        assert!(
+            mgr2.load_from_disk().is_ok(),
+            "should tolerate missing-fields manifest"
+        );
+        assert!(mgr2.get(&good_id).is_some(), "good team must be present");
+        assert!(mgr2.get("incomplete").is_none(), "incomplete team must be absent");
     }
 }

@@ -25,6 +25,7 @@ dist/
 # Teams
 .teams/
 .teams-worktrees/
+.teams-clones/
 
 # Stale per-agent state from earlier prefix
 .claude-agents/

@@ -75,16 +75,12 @@ pub struct ToolDef {
 
 /// Injectable permission checker for MCP tool calls.
 pub trait PermissionCheck: Send + Sync {
-    fn check_file_read(&self, role: &str, path: &str) -> PermissionResult;
-    fn check_git_push(&self, role: &str, remote: &str) -> PermissionResult;
     fn check_gh_pr_create(&self, role: &str, base: &str) -> PermissionResult;
 }
 
 /// No-op permission checker that allows everything (needs TUI approval anyway).
 pub struct AllowAllPermissions;
 impl PermissionCheck for AllowAllPermissions {
-    fn check_file_read(&self, _role: &str, _path: &str) -> PermissionResult { PermissionResult::NeedsApproval }
-    fn check_git_push(&self, _role: &str, _remote: &str) -> PermissionResult { PermissionResult::NeedsApproval }
     fn check_gh_pr_create(&self, _role: &str, _base: &str) -> PermissionResult { PermissionResult::NeedsApproval }
 }
 
@@ -236,28 +232,6 @@ impl McpState {
 
 fn default_tools() -> Vec<ToolDef> {
     vec![
-        ToolDef {
-            name: "read_host_file".into(),
-            description: "Read a file from the host machine. Only allowed paths are accessible.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Absolute path to the file on the host"}
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDef {
-            name: "git_push".into(),
-            description: "Push the current branch to a remote using the host's git credentials.".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "remote": {"type": "string", "description": "Git remote name (default: origin)"},
-                    "branch": {"type": "string", "description": "Branch to push (default: current branch)"}
-                }
-            }),
-        },
         ToolDef {
             name: "list_agents".into(),
             description: "List all currently connected agents and their roles.".into(),
@@ -442,7 +416,7 @@ fn handle_tools_list(state: &McpState, id: Value) -> JsonRpcResponse {
     JsonRpcResponse::success(id, json!({ "tools": state.tools }))
 }
 
-/// Streaming handler for tools that need TUI approval (file_read, git_push).
+/// Streaming handler for tools that need TUI approval (gh_pr_create).
 /// Sends SSE keepalive comments every 15s while waiting for approval.
 fn handle_tools_call_streaming(
     state: Arc<McpState>,
@@ -459,20 +433,6 @@ fn handle_tools_call_streaming(
         let agent_role = &agent_role;
         let perms = state.permissions.lock().unwrap();
         match tool_name.as_str() {
-            "read_host_file" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                match perms.check_file_read(agent_role, path) {
-                    PermissionResult::Deny(reason) => Some(reason),
-                    _ => None,
-                }
-            }
-            "git_push" => {
-                let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
-                match perms.check_git_push(agent_role, remote) {
-                    PermissionResult::Deny(reason) => Some(reason),
-                    _ => None,
-                }
-            }
             "gh_pr_create" => {
                 let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("main");
                 match perms.check_gh_pr_create(agent_role, base) {
@@ -582,15 +542,6 @@ fn handle_tools_call_streaming(
     // Set up approval-gated request (before stream)
     let rx = if denied.is_none() && immediate_response.is_none() {
         let (request_type, payload) = match tool_name.as_str() {
-            "read_host_file" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                ("file_read".to_string(), json!({"path": path}))
-            }
-            "git_push" => {
-                let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin").to_string();
-                let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                ("git_push".to_string(), json!({"remote": remote, "branch": branch}))
-            }
             "gh_pr_create" => {
                 let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("main").to_string();
                 let head = args.get("head").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -680,8 +631,6 @@ fn handle_tools_call_streaming(
                                     yield Ok(Event::default().event("message").data(serde_json::to_string(&resp).unwrap()));
                                 } else {
                                     let text = match tool.as_str() {
-                                        "read_host_file" => response_payload.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                        "git_push" => response_payload.get("output").and_then(|v| v.as_str()).unwrap_or("Push completed").to_string(),
                                         "gh_pr_create" => response_payload.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         _ => serde_json::to_string(&response_payload).unwrap_or_default(),
                                     };
@@ -728,15 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_tools_call_request() {
-        let json = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_host_file","arguments":{"path":"/etc/hosts"}}}"#;
-        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.method, "tools/call");
-        assert_eq!(req.params["name"], "read_host_file");
-        assert_eq!(req.params["arguments"]["path"], "/etc/hosts");
-    }
-
-    #[test]
     fn format_success_response() {
         let resp = JsonRpcResponse::success(json!(1), json!({"tools": []}));
         let serialized = serde_json::to_string(&resp).unwrap();
@@ -767,10 +707,10 @@ mod tests {
         let resp = handle_tools_list(&state, json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"read_host_file"));
-        assert!(names.contains(&"git_push"));
+        assert!(!names.contains(&"read_host_file"), "read_host_file must be removed");
+        assert!(!names.contains(&"git_push"), "git_push must be removed");
         assert!(names.contains(&"list_agents"));
         assert!(names.contains(&"message_agent"));
         assert!(names.contains(&"gh_pr_create"));
@@ -788,9 +728,6 @@ mod tests {
 
         struct FakeExec;
         impl crate::server::RequestExecutor for FakeExec {
-            fn execute_file_read(&self, _: &str) -> Result<String, String> { Ok("".into()) }
-            fn execute_git_push(&self, _: &str, _: &str, _: &str) -> Result<String, String> { Ok("".into()) }
-            fn current_branch(&self, _: &str) -> Result<String, String> { Ok("main".into()) }
             fn execute_gh_pr_create(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: bool) -> Result<Value, String> {
                 Ok(json!({"url": "https://github.com/o/r/pull/1", "number": 1}))
             }
@@ -900,49 +837,6 @@ mod tests {
         assert!(body.contains("event: message"));
         assert!(body.contains("agent-bridge"));
         assert!(body.contains("2024-11-05"));
-    }
-
-    #[tokio::test]
-    async fn integration_tools_call_with_resolution() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
-        let app = mcp_router(state.clone());
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-
-        // Send read_host_file tool call in background
-        let url = format!("http://{}/mcp", addr);
-        let resp_future = tokio::spawn(async move {
-            client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("X-Agent-Name", "test-agent")
-                .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_host_file","arguments":{"path":"/tmp/test"}}}"#)
-                .send()
-                .await
-                .unwrap()
-        });
-
-        // Wait for the event
-        let event = event_rx.recv().await.unwrap();
-        let request_id = match event {
-            OrchestratorEvent::RequestReceived { request_id, .. } => request_id,
-            _ => panic!("Expected RequestReceived"),
-        };
-
-        // Resolve it with file content
-        state.resolve(&request_id, json!({"content": "file data here"}));
-
-        // Check response
-        let resp = resp_future.await.unwrap();
-        let body = resp.text().await.unwrap();
-        assert!(body.contains("file data here"));
     }
 
     struct FakeTeamOps {

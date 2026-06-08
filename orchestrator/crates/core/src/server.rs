@@ -15,11 +15,8 @@ use crate::types::*;
 
 type TeamManagerArc = std::sync::Arc<std::sync::Mutex<crate::team_manager::TeamManager>>;
 
-/// Executes approved requests (file reads, git pushes, PR creation). Injectable for testing.
+/// Executes approved requests (PR creation). Injectable for testing.
 pub trait RequestExecutor: Send + Sync {
-    fn execute_file_read(&self, path: &str) -> Result<String, String>;
-    fn execute_git_push(&self, workspace: &str, remote: &str, branch: &str) -> Result<String, String>;
-    fn current_branch(&self, workspace: &str) -> Result<String, String>;
     fn execute_gh_pr_create(
         &self,
         workspace: &str,
@@ -32,19 +29,10 @@ pub trait RequestExecutor: Send + Sync {
     fn execute_gh_pr_view(&self, workspace: &str, ref_: &str) -> Result<serde_json::Value, String>;
 }
 
-/// Real executor using file I/O and git commands.
+/// Real executor using git/gh commands.
 pub struct RealRequestExecutor;
 
 impl RequestExecutor for RealRequestExecutor {
-    fn execute_file_read(&self, path: &str) -> Result<String, String> {
-        crate::handlers::file_read::read_file(path)
-    }
-    fn execute_git_push(&self, workspace: &str, remote: &str, branch: &str) -> Result<String, String> {
-        crate::handlers::git_push::git_push(workspace, remote, branch)
-    }
-    fn current_branch(&self, workspace: &str) -> Result<String, String> {
-        crate::handlers::git_push::current_branch(workspace)
-    }
     fn execute_gh_pr_create(
         &self,
         workspace: &str,
@@ -115,20 +103,10 @@ fn execution_summary(request_type: &str, payload: &Value, success: bool) -> Stri
         return format!("FAILED: {}", msg);
     }
     match request_type {
-        "git_push" => {
-            let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
-            let first_useful = output
-                .lines()
-                .find(|l| !l.trim().is_empty() && !l.contains("remote:"))
-                .unwrap_or("ok");
-            format!("OK ({})", first_useful.trim())
-        }
         "gh_pr_create" => {
             let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("OK ({})", url)
         }
-        "gh_pr_view" => "OK".into(),
-        "file_read" => "OK".into(),
         _ => "OK".into(),
     }
 }
@@ -405,11 +383,7 @@ impl ServerState {
             .collect()
     }
 
-    /// Handle an incoming request. For git_push from a team agent pushing to
-    /// its own work branch, auto-approves inline and returns
-    /// `Some((request_id, response_payload))` so the caller can resolve any
-    /// pending MCP oneshot. All other requests insert into `pending_requests`
-    /// and return `None`.
+    /// Handle an incoming request. Inserts into `pending_requests` and returns `None`.
     pub fn handle_request(
         &mut self,
         agent_id: &str,
@@ -422,54 +396,6 @@ impl ServerState {
         let now = self.clock.now();
         if !agent_name.is_empty() {
             self.last_activity.insert(agent_name.clone(), now);
-        }
-
-        if request_type == "git_push" {
-            let team_lookup = self.team_lookup.clone();
-            if let Some(hit) = team_lookup.team_for_agent(&agent_name) {
-                let workspace = self.agent_workspace(agent_id).unwrap_or_default();
-                let branch = payload.get("branch").and_then(|v| v.as_str()).unwrap_or("");
-                let effective_branch = if branch.is_empty() {
-                    self.executor.current_branch(&workspace).unwrap_or_else(|_| "main".into())
-                } else {
-                    branch.to_string()
-                };
-
-                if effective_branch == hit.work_branch {
-                    let pending = PendingRequest {
-                        agent_id: agent_id.to_string(),
-                        request_type: request_type.to_string(),
-                        payload,
-                    };
-                    let (msg_type, response_payload) = self.execute_request(&pending);
-                    let response = Message {
-                        id: request_id.clone(),
-                        msg_type: msg_type.to_string(),
-                        from: "orchestrator".into(),
-                        to: Some(agent_id.to_string()),
-                        payload: response_payload.clone(),
-                    };
-                    self.send_to_agent(agent_id, &response);
-                    let success = msg_type != "error";
-                    let summary = execution_summary(request_type, &response_payload, success);
-                    let _ = self.event_tx.send(OrchestratorEvent::RequestAutoApproved {
-                        agent_id: agent_id.to_string(),
-                        agent_name: agent_name.clone(),
-                        request_id: request_id.clone(),
-                        request_type: request_type.to_string(),
-                        branch: effective_branch,
-                        team_id: hit.team_id,
-                    });
-                    let _ = self.event_tx.send(OrchestratorEvent::RequestExecuted {
-                        agent_id: agent_id.to_string(),
-                        agent_name,
-                        request_type: request_type.to_string(),
-                        success,
-                        summary,
-                    });
-                    return Some((request_id, response_payload));
-                }
-            }
         }
 
         let _ = self.event_tx.send(OrchestratorEvent::RequestReceived {
@@ -566,25 +492,6 @@ impl ServerState {
 
     fn execute_request(&self, pending: &PendingRequest) -> (&'static str, serde_json::Value) {
         match pending.request_type.as_str() {
-            "file_read" => {
-                let path = pending.payload.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                match self.executor.execute_file_read(path) {
-                    Ok(content) => ("file_read_response", serde_json::json!({"content": content})),
-                    Err(e) => ("error", serde_json::json!({"code": "READ_FAILED", "message": e})),
-                }
-            }
-            "git_push" => {
-                let remote = pending.payload.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
-                let branch = pending.payload.get("branch").and_then(|v| v.as_str()).unwrap_or("");
-                let workspace = self.agent_workspace(&pending.agent_id).unwrap_or_default();
-                let branch = if branch.is_empty() {
-                    self.executor.current_branch(&workspace).unwrap_or_else(|_| "main".into())
-                } else { branch.to_string() };
-                match self.executor.execute_git_push(&workspace, remote, &branch) {
-                    Ok(output) => ("git_push_response", serde_json::json!({"success": true, "output": output})),
-                    Err(e) => ("error", serde_json::json!({"code": "PUSH_FAILED", "message": e})),
-                }
-            }
             "gh_pr_create" => {
                 let base = pending.payload.get("base").and_then(|v| v.as_str()).unwrap_or("main");
                 let head = pending.payload.get("head").and_then(|v| v.as_str()).unwrap_or("");
@@ -1141,7 +1048,7 @@ async fn handle_connection(
                 info!("Agent registered: {} ({})", payload.name, id);
             }
 
-            "user_prompt" | "file_read" | "git_push" | "gh_pr_create" | "gh_pr_view" => {
+            "user_prompt" | "gh_pr_create" | "gh_pr_view" => {
                 if let Some(ref aid) = agent_id {
                     let mut s = state.lock().await;
                     if let Some((req_id, payload)) = s.handle_request(aid, message.id.clone(), &message.msg_type, message.payload) {
@@ -1418,62 +1325,6 @@ mod tests {
         assert_eq!(state.pending_count(), 0);
     }
 
-    #[test]
-    fn file_read_request_emits_event() {
-        let (mut state, mut event_rx) = setup();
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
-        let _ = event_rx.try_recv();
-
-        state.handle_request(&id, "fr-1".into(), "file_read", json!({"path": "/etc/hosts"}));
-
-        match event_rx.try_recv().unwrap() {
-            OrchestratorEvent::RequestReceived {
-                request_type,
-                payload,
-                ..
-            } => {
-                assert_eq!(request_type, "file_read");
-                assert_eq!(payload["path"], "/etc/hosts");
-            }
-            _ => panic!("Expected RequestReceived"),
-        }
-    }
-
-    #[test]
-    fn git_push_request_emits_event() {
-        let (mut state, mut event_rx) = setup();
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent(
-            "test".into(),
-            "code-agent".into(),
-            Some("/workspace".into()),
-            sender,
-        );
-        let _ = event_rx.try_recv();
-
-        state.handle_request(
-            &id,
-            "gp-1".into(),
-            "git_push",
-            json!({"remote": "origin", "branch": "main"}),
-        );
-
-        match event_rx.try_recv().unwrap() {
-            OrchestratorEvent::RequestReceived {
-                request_type,
-                payload,
-                ..
-            } => {
-                assert_eq!(request_type, "git_push");
-                assert_eq!(payload["remote"], "origin");
-            }
-            _ => panic!("Expected RequestReceived"),
-        }
-    }
-
     #[tokio::test]
     async fn integration_ws_register_and_prompt() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -1548,69 +1399,6 @@ mod tests {
         let resp: Message = serde_json::from_str(&resp_text).unwrap();
         assert_eq!(resp.msg_type, "user_prompt_response");
         assert_eq!(resp.payload["answer"], "red");
-
-        // Test file_read request + deny
-        let fr_msg = json!({
-            "id": "fr-1",
-            "type": "file_read",
-            "from": "agent-1",
-            "payload": { "path": "/etc/secret" }
-        });
-        sender
-            .send(WsMessage::Text(serde_json::to_string(&fr_msg).unwrap().into()))
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = event_rx.recv().await.unwrap();
-
-        cmd_tx
-            .send(TuiCommand::DenyRequest {
-                request_id: "fr-1".into(),
-                reason: "Not allowed".into(),
-            })
-            .unwrap();
-
-        let deny_text = match receiver.next().await.unwrap().unwrap() {
-            WsMessage::Text(t) => t.to_string(),
-            other => panic!("Expected text, got {:?}", other),
-        };
-        let deny: Message = serde_json::from_str(&deny_text).unwrap();
-        assert_eq!(deny.msg_type, "error");
-        assert_eq!(deny.payload["code"], "PERMISSION_DENIED");
-
-        // Test file_read request + approve (reads a real file)
-        let test_file = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut test_file.as_file(), b"test content here").unwrap();
-        let test_path = test_file.path().to_str().unwrap().to_string();
-
-        let fr_msg2 = json!({
-            "id": "fr-2",
-            "type": "file_read",
-            "from": "agent-1",
-            "payload": { "path": test_path }
-        });
-        sender
-            .send(WsMessage::Text(serde_json::to_string(&fr_msg2).unwrap().into()))
-            .await
-            .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = event_rx.recv().await.unwrap();
-
-        cmd_tx
-            .send(TuiCommand::ApproveRequest {
-                request_id: "fr-2".into(),
-            })
-            .unwrap();
-
-        let approve_text = match receiver.next().await.unwrap().unwrap() {
-            WsMessage::Text(t) => t.to_string(),
-            other => panic!("Expected text, got {:?}", other),
-        };
-        let approve: Message = serde_json::from_str(&approve_text).unwrap();
-        assert_eq!(approve.msg_type, "file_read_response");
-        assert_eq!(approve.payload["content"], "test content here");
     }
 
     #[test]
@@ -1726,15 +1514,6 @@ mod tests {
 
     struct FakeExecutor;
     impl RequestExecutor for FakeExecutor {
-        fn execute_file_read(&self, path: &str) -> Result<String, String> {
-            Ok(format!("fake content of {}", path))
-        }
-        fn execute_git_push(&self, _ws: &str, _remote: &str, _branch: &str) -> Result<String, String> {
-            Ok("fake push ok".into())
-        }
-        fn current_branch(&self, _ws: &str) -> Result<String, String> {
-            Ok("main".into())
-        }
         fn execute_gh_pr_create(
             &self,
             _ws: &str,
@@ -1749,49 +1528,6 @@ mod tests {
         fn execute_gh_pr_view(&self, _ws: &str, _ref_: &str) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!({"number": 99, "url": "https://github.com/owner/repo/pull/99", "title": "Fake PR"}))
         }
-    }
-
-    #[test]
-    fn execute_approved_file_read_with_fake_executor() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let id_gen = Arc::new(SequentialIdGenerator::new());
-        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), None, sender);
-        let _ = event_rx.try_recv();
-
-        state.handle_request(&id, "fr-1".into(), "file_read", json!({"path": "/etc/hosts"}));
-        let _ = event_rx.try_recv();
-
-        state.execute_approved_request("fr-1");
-
-        let sent = receiver.try_recv().unwrap();
-        let msg: Message = serde_json::from_str(&sent).unwrap();
-        assert_eq!(msg.msg_type, "file_read_response");
-        assert_eq!(msg.payload["content"], "fake content of /etc/hosts");
-    }
-
-    #[test]
-    fn execute_approved_git_push_with_fake_executor() {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let id_gen = Arc::new(SequentialIdGenerator::new());
-        let mut state = ServerState::with_executor(event_tx, id_gen, Arc::new(FakeExecutor));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("test".into(), "code-agent".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        state.handle_request(&id, "gp-1".into(), "git_push", json!({"remote": "origin", "branch": "main"}));
-        let _ = event_rx.try_recv();
-
-        state.execute_approved_request("gp-1");
-
-        let sent = receiver.try_recv().unwrap();
-        let msg: Message = serde_json::from_str(&sent).unwrap();
-        assert_eq!(msg.msg_type, "git_push_response");
-        assert!(msg.payload["success"].as_bool().unwrap());
-        assert_eq!(msg.payload["output"], "fake push ok");
     }
 
     #[test]
@@ -1830,9 +1566,6 @@ mod tests {
     fn execute_gh_pr_create_err_produces_error_code() {
         struct FailExecutor;
         impl RequestExecutor for FailExecutor {
-            fn execute_file_read(&self, _: &str) -> Result<String, String> { Ok("".into()) }
-            fn execute_git_push(&self, _: &str, _: &str, _: &str) -> Result<String, String> { Ok("".into()) }
-            fn current_branch(&self, _: &str) -> Result<String, String> { Ok("main".into()) }
             fn execute_gh_pr_create(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: bool) -> Result<serde_json::Value, String> {
                 Err("gh auth failed".into())
             }
@@ -1885,7 +1618,7 @@ mod tests {
         assert_eq!(msg.payload["title"], "Fake PR");
     }
 
-    // --- Auto-approve tests ---
+    // --- gh_pr_create sets pr_number on team ---
 
     use crate::team_manager::{TeamLookup as TL, TeamLookupHit};
     use std::collections::HashMap as TMap;
@@ -1910,210 +1643,6 @@ mod tests {
             self.known.get(agent_name).cloned()
         }
     }
-
-    /// Executor whose current_branch is configurable and records push calls.
-    struct TrackingExecutor {
-        branch: String,
-        push_calls: Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl TrackingExecutor {
-        fn new(branch: &str) -> Self {
-            Self { branch: branch.to_string(), push_calls: Arc::new(std::sync::Mutex::new(vec![])) }
-        }
-        fn push_calls(&self) -> Vec<String> {
-            self.push_calls.lock().unwrap().clone()
-        }
-    }
-
-    impl RequestExecutor for TrackingExecutor {
-        fn execute_file_read(&self, _: &str) -> Result<String, String> { Ok("".into()) }
-        fn execute_git_push(&self, _ws: &str, _remote: &str, branch: &str) -> Result<String, String> {
-            self.push_calls.lock().unwrap().push(branch.to_string());
-            Ok("pushed ok".into())
-        }
-        fn current_branch(&self, _ws: &str) -> Result<String, String> { Ok(self.branch.clone()) }
-        fn execute_gh_pr_create(&self, _: &str, _: &str, _: &str, _: &str, _: &str, _: bool) -> Result<serde_json::Value, String> {
-            Ok(json!({}))
-        }
-        fn execute_gh_pr_view(&self, _: &str, _: &str) -> Result<serde_json::Value, String> { Ok(json!({})) }
-    }
-
-    fn setup_with_team_lookup(
-        lookup: FakeTeamLookup,
-        branch: &str,
-    ) -> (ServerState, mpsc::UnboundedReceiver<OrchestratorEvent>, Arc<TrackingExecutor>) {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let id_gen = Arc::new(SequentialIdGenerator::new());
-        let executor = Arc::new(TrackingExecutor::new(branch));
-        let mut state = ServerState::with_executor(event_tx, id_gen, executor.clone());
-        state.set_team_lookup(Arc::new(lookup));
-        (state, event_rx, executor)
-    }
-
-    #[test]
-    fn git_push_to_team_branch_auto_approves() {
-        let lookup = FakeTeamLookup::new().with_agent("X", "team-1", "feat/x");
-        let (mut state, mut event_rx, executor) = setup_with_team_lookup(lookup, "feat/x");
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("X".into(), "feature-producer".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv(); // AgentConnected
-
-        let result = state.handle_request(
-            &id,
-            "gp-auto".into(),
-            "git_push",
-            json!({"remote": "origin", "branch": "feat/x"}),
-        );
-
-        // Must NOT insert into pending
-        assert_eq!(state.pending_count(), 0, "auto-approve must not add to pending");
-
-        // Must return Some
-        let (req_id, payload) = result.expect("auto-approve must return Some");
-        assert_eq!(req_id, "gp-auto");
-        assert!(payload["success"].as_bool().unwrap_or(false));
-
-        // Executor must have recorded the push
-        assert!(!executor.push_calls().is_empty(), "executor must have been called");
-
-        // Agent must have received git_push_response
-        let sent = receiver.try_recv().unwrap();
-        let msg: Message = serde_json::from_str(&sent).unwrap();
-        assert_eq!(msg.msg_type, "git_push_response");
-        assert!(msg.payload["success"].as_bool().unwrap_or(false));
-
-        // Must emit RequestAutoApproved (not RequestReceived)
-        let event = event_rx.try_recv().unwrap();
-        assert!(
-            matches!(event, OrchestratorEvent::RequestAutoApproved { .. }),
-            "expected RequestAutoApproved, got {:?}",
-            event
-        );
-        if let OrchestratorEvent::RequestAutoApproved { team_id, branch, .. } = event {
-            assert_eq!(team_id, "team-1");
-            assert_eq!(branch, "feat/x");
-        }
-    }
-
-    #[test]
-    fn git_push_to_non_team_branch_falls_through() {
-        let lookup = FakeTeamLookup::new().with_agent("X", "team-1", "feat/x");
-        let (mut state, mut event_rx, _) = setup_with_team_lookup(lookup, "feat/x");
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("X".into(), "feature-producer".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        let result = state.handle_request(
-            &id,
-            "gp-fall".into(),
-            "git_push",
-            json!({"remote": "origin", "branch": "main"}), // wrong branch
-        );
-
-        assert!(result.is_none(), "non-team-branch must return None");
-        assert_eq!(state.pending_count(), 1, "must insert into pending");
-
-        let event = event_rx.try_recv().unwrap();
-        assert!(
-            matches!(event, OrchestratorEvent::RequestReceived { .. }),
-            "must emit RequestReceived, got {:?}",
-            event
-        );
-        assert!(event_rx.try_recv().is_err(), "must NOT emit RequestAutoApproved");
-    }
-
-    #[test]
-    fn git_push_from_unknown_agent_falls_through() {
-        // NoTeamLookup (default) — agent not in any team
-        let (mut state, mut event_rx) = setup();
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("unknown".into(), "code-agent".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        let result = state.handle_request(
-            &id,
-            "gp-unk".into(),
-            "git_push",
-            json!({"remote": "origin", "branch": "feat/x"}),
-        );
-
-        assert!(result.is_none(), "unknown agent must return None");
-        assert_eq!(state.pending_count(), 1, "must insert into pending");
-        let event = event_rx.try_recv().unwrap();
-        assert!(matches!(event, OrchestratorEvent::RequestReceived { .. }));
-    }
-
-    #[test]
-    fn git_push_empty_branch_resolves_via_current_branch() {
-        // executor.current_branch returns "feat/x", which matches work_branch
-        let lookup = FakeTeamLookup::new().with_agent("X", "team-1", "feat/x");
-        let (mut state, mut event_rx, executor) = setup_with_team_lookup(lookup, "feat/x");
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("X".into(), "feature-producer".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        // Empty branch field — must resolve via current_branch before comparing
-        let result = state.handle_request(
-            &id,
-            "gp-empty".into(),
-            "git_push",
-            json!({"remote": "origin", "branch": ""}),
-        );
-
-        assert!(result.is_some(), "must auto-approve when resolved branch matches");
-        assert_eq!(state.pending_count(), 0);
-        assert!(!executor.push_calls().is_empty());
-        let sent = receiver.try_recv().unwrap();
-        let msg: Message = serde_json::from_str(&sent).unwrap();
-        assert_eq!(msg.msg_type, "git_push_response");
-    }
-
-    #[test]
-    fn file_read_not_auto_approved_even_for_team_agent() {
-        let lookup = FakeTeamLookup::new().with_agent("X", "team-1", "feat/x");
-        let (mut state, mut event_rx, _) = setup_with_team_lookup(lookup, "feat/x");
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("X".into(), "feature-producer".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        let result = state.handle_request(
-            &id,
-            "fr-team".into(),
-            "file_read",
-            json!({"path": "/etc/hosts"}),
-        );
-
-        // file_read is never auto-approved
-        assert!(result.is_none(), "file_read must not be auto-approved");
-        assert_eq!(state.pending_count(), 1, "file_read must stay in pending");
-        let event = event_rx.try_recv().unwrap();
-        assert!(matches!(event, OrchestratorEvent::RequestReceived { .. }));
-    }
-
-    #[test]
-    fn handle_request_return_value_contract() {
-        // Some when auto-approving, None otherwise
-        let lookup = FakeTeamLookup::new().with_agent("X", "team-1", "feat/x");
-        let (mut state, mut event_rx, _) = setup_with_team_lookup(lookup, "feat/x");
-        let (sender, _receiver) = mpsc::unbounded_channel();
-
-        let (id, _) = state.register_agent("X".into(), "feature-producer".into(), Some("/ws".into()), sender);
-        let _ = event_rx.try_recv();
-
-        let auto = state.handle_request(&id, "r1".into(), "git_push", json!({"branch": "feat/x"}));
-        assert!(auto.is_some(), "auto-approve returns Some");
-
-        let non_auto = state.handle_request(&id, "r2".into(), "git_push", json!({"branch": "main"}));
-        assert!(non_auto.is_none(), "non-matching branch returns None");
-    }
-
-    // --- gh_pr_create sets pr_number on team ---
 
     struct FakeGitForServer;
     impl crate::team_manager::GitOps for FakeGitForServer {

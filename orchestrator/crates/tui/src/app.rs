@@ -132,7 +132,6 @@ impl App {
                     self.managed_agents.push(agent);
                 }
             }
-            OrchestratorEvent::RequestAutoApproved { .. } => {}
             OrchestratorEvent::TeamPrMerged {
                 team_id,
                 ticket_id,
@@ -252,7 +251,7 @@ impl App {
                 self.input_text.clear();
             }
             _ => {
-                // For file_read, git_push etc: Enter approves
+                // For gh_pr_create etc: Enter approves
                 self.approve_request();
                 return;
             }

@@ -124,7 +124,7 @@ async fn connect_mock_agent(
 
 #[tokio::test]
 async fn full_round_trip_ws_register_and_mcp_tool_call() {
-    let (ws_addr, http_addr, mut event_rx, cmd_tx, mcp_state) = start_orchestrator().await;
+    let (ws_addr, http_addr, mut event_rx, _cmd_tx, mcp_state) = start_orchestrator().await;
 
     // --- Step 1: Mock agent registers via WS ---
     let (_sender, mut receiver, agent_id) = connect_mock_agent(&ws_addr, "TestBot", "code-agent").await;
@@ -140,7 +140,7 @@ async fn full_round_trip_ws_register_and_mcp_tool_call() {
         _ => panic!("Expected AgentConnected, got {:?}", event),
     }
 
-    // --- Step 2: Mock agent makes MCP HTTP tool call (read_host_file) ---
+    // --- Step 2: Mock agent makes MCP HTTP tool call (gh_pr_create, approval-gated) ---
     let client = reqwest::Client::new();
     let mcp_url = format!("http://{}/mcp", http_addr);
 
@@ -149,13 +149,15 @@ async fn full_round_trip_ws_register_and_mcp_tool_call() {
         "id": 42,
         "method": "tools/call",
         "params": {
-            "name": "read_host_file",
-            "arguments": { "path": "/tmp/test-integration" }
+            "name": "gh_pr_create",
+            "arguments": {
+                "base": "main",
+                "head": "feat/integration-test",
+                "title": "Integration test PR",
+                "body": "test body"
+            }
         }
     });
-
-    // Write a test file so the read succeeds
-    std::fs::write("/tmp/test-integration", "integration test content").unwrap();
 
     // Send tool call in background (it blocks waiting for TUI approval)
     let mcp_url_clone = mcp_url.clone();
@@ -182,17 +184,16 @@ async fn full_round_trip_ws_register_and_mcp_tool_call() {
             ..
         } => {
             assert_eq!(agent_name, "TestBot");
-            assert_eq!(request_type, "file_read");
-            assert_eq!(payload["path"], "/tmp/test-integration");
+            assert_eq!(request_type, "gh_pr_create");
+            assert_eq!(payload["head"], "feat/integration-test");
             request_id.clone()
         }
         _ => panic!("Expected RequestReceived, got {:?}", event),
     };
 
     // --- Step 4: Resolve via MCP state (simulating TUI approval) ---
-    // Read the file and resolve, like the TUI's approve_request does
-    let content = std::fs::read_to_string("/tmp/test-integration").unwrap();
-    let resolved = mcp_state.resolve(&request_id, json!({"content": content}));
+    let pr_url = "https://github.com/owner/repo/pull/1";
+    let resolved = mcp_state.resolve(&request_id, json!({"url": pr_url, "number": 1}));
     assert!(resolved, "Should have found the pending MCP request");
 
     // --- Step 5: Verify MCP HTTP response ---
@@ -203,7 +204,7 @@ async fn full_round_trip_ws_register_and_mcp_tool_call() {
     assert_eq!(result["jsonrpc"], "2.0");
     assert_eq!(result["id"], 42);
     let text = result["result"]["content"][0]["text"].as_str().unwrap();
-    assert_eq!(text, "integration test content");
+    assert_eq!(text, pr_url);
 
     // --- Step 6: Verify list_agents MCP tool sees the registered agent ---
     let list_call = json!({
@@ -236,57 +237,6 @@ async fn full_round_trip_ws_register_and_mcp_tool_call() {
         }
         _ => panic!("Expected AgentDisconnected, got {:?}", event),
     }
-
-    // Cleanup
-    let _ = std::fs::remove_file("/tmp/test-integration");
-}
-
-#[tokio::test]
-async fn mcp_permission_denied_returns_error() {
-    let (_ws_addr, http_addr, mut _event_rx, _cmd_tx, _mcp_state) = start_orchestrator().await;
-
-    // The default AllowAllPermissions won't deny anything.
-    // To test denial, we need to inject a real PermissionChecker.
-    // For now, verify the tool call goes through the permission check path
-    // by calling with a path and checking we get a response (not a timeout).
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "read_host_file",
-            "arguments": { "path": "/nonexistent/file" }
-        }
-    });
-
-    // This will create a pending request since AllowAllPermissions returns NeedsApproval.
-    // Resolve it immediately to avoid timeout.
-    let mcp_clone = _mcp_state.clone();
-    let resp_handle = tokio::spawn(async move {
-        reqwest::Client::new()
-            .post(format!("http://{}/mcp", http_addr))
-            .header("Content-Type", "application/json")
-            .header("X-Agent-Name", "TestAgent")
-            .body(serde_json::to_string(&tool_call).unwrap())
-            .send()
-            .await
-            .unwrap()
-    });
-
-    // Wait for the pending request, then resolve with an error
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let event = _event_rx.recv().await.unwrap();
-    let req_id = match &event {
-        OrchestratorEvent::RequestReceived { request_id, .. } => request_id.clone(),
-        _ => panic!("Expected RequestReceived, got {:?}", event),
-    };
-    mcp_clone.resolve(&req_id, json!({"code": "READ_FAILED", "message": "File not found"}));
-
-    let resp = resp_handle.await.unwrap();
-    let body = resp.text().await.unwrap();
-    let result = parse_sse_data(&body);
-    let text = result["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Error:"), "Should contain error, got: {}", text);
 }
 
 #[tokio::test]
@@ -385,13 +335,12 @@ async fn mcp_initialize_returns_tool_list() {
     let result = parse_sse_data(&body);
     let tools = result["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"read_host_file"));
-    assert!(names.contains(&"git_push"));
+    assert!(!names.contains(&"read_host_file"), "read_host_file must be removed");
+    assert!(!names.contains(&"git_push"), "git_push must be removed");
     assert!(names.contains(&"list_agents"));
     assert!(names.contains(&"message_agent"));
     assert!(names.contains(&"gh_pr_create"));
     assert!(names.contains(&"gh_pr_view"));
-    assert!(!names.contains(&"ask_user"), "ask_user should have been removed");
 }
 
 #[tokio::test]

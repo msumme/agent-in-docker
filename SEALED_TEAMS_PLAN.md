@@ -115,9 +115,14 @@ teams; fall back to hand-driving only to keep momentum.
   resumes via Claude session resume; review feedback injected into the same
   session. Reviewer spawns fresh each round. *Test:* feedback round-trips into a
   resumed producer context; reviewer is a new container each time.
-- [ ] **P5 — Cut the cruft.** Remove the now-unused `git_push`/`read_host_file`
-  MCP bridge, `NeedsApproval` TUI path, `message_agent`, and the WS registry.
-  *Test:* suite still green; teams still run; LOC drops materially.
+- [x] **P5 — Cut the cruft (git_push + read_host_file only).** DONE (d28f36e),
+  built autonomously by a team: removed the `git_push`/`read_host_file` MCP tools,
+  handlers, permission checks, hardcoded denials, the team git_push auto-approve +
+  `RequestAutoApproved`, TUI approval arms, and dead Role/yml fields. **−1186
+  lines.** Scope corrected from the original ticket: `message_agent`, the WS
+  registry, `gh_pr_*`, and `NeedsApproval` were KEPT (load-bearing for the
+  Supervisor / future PRs). *Note:* the EnvResolver path went too (only file_read
+  used it).
 - [ ] **P6 — Formula-driven dispatcher (Epic G).** Team shape becomes a bd
   formula; the orchestrator is a thin dispatcher (spawn container-steps, execute
   host-steps, await human/gate-steps). *Test:* `bd mol pour team` drives a full
@@ -220,4 +225,14 @@ teams; fall back to hand-driving only to keep momentum.
   flags) agree. Two more dogfood gaps filed/fixed along the way: `.teams-clones/`
   wasn't gitignored (fixed); `load_from_disk` hard-fails on stale manifests (bug
   filed). Next: Persistent producer / ephemeral reviewer.
+- 2026-06-08 — **Cut the cruft DONE (d28f36e)**, dogfooded by team
+  `t-agent-in-docker-6mq-5` — first team under the new orchestrator + sealed
+  roles. Two results: (1) **roles validated live** — producer committed + pinged,
+  reviewer approved, *no git_push/PR jam* (role fix works end-to-end). (2)
+  **Supervisor found INERT** — no `supervisor.log` written. Root cause (bug
+  filed): `message_agent` passes the literal `"mcp-client"` as sender to
+  `route_message`, so `from_role` can't resolve and `classify_handoff` is
+  skipped. The Supervisor is merged but does nothing until that ~one-line fix
+  lands. Deletion review APPROVE (all load-bearing kept); −1186 lines.
+  **Recommended next: fix the inert Supervisor** before the next big phase.
 </content>

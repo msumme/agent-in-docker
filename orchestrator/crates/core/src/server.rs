@@ -888,6 +888,7 @@ pub async fn run_with_id_gen(
                             extra_mounts: vec![],
                             model: None,
                             effort: None,
+                            resume_session: false,
                         };
                         let mut m = mgr.lock().unwrap();
                         match m.start_agent(&payload) {

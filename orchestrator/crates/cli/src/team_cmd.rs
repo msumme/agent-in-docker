@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use orchestrator_core::integration::{self, IntegrateMode, IntegrateSpec, RealMergeOps};
 use orchestrator_core::project_config;
 use orchestrator_core::team_manager::{
-    RealGitOps, SpawnSpec, TeamManager, TeamState,
+    role_resume_policy, RealGitOps, ResumePolicy, SpawnSpec, TeamManager, TeamState,
 };
 use orchestrator_core::types::StartAgentPayload;
 
@@ -192,6 +192,33 @@ pub fn cmd_status(cfg: &Config, team_id: &str) -> Result<()> {
 ///
 /// Each agent gets its own isolated clone as project_path; no mirror-mount of
 /// the canonical repo is needed because the clone is a self-contained git repo.
+/// Compute whether `resume_session` should be set. Producers get ResumeContext
+/// on resume; everything else always gets false (fresh start or spawn).
+fn compute_resume_session(role: &str, is_resume: bool) -> bool {
+    is_resume && role_resume_policy(role) == ResumePolicy::ResumeContext
+}
+
+/// Resume primer — role-aware. Producers keep their prior conversation;
+/// planners and reviewers restart from scratch reading the current bd/git state.
+fn build_resume_prompt(team_id: &str, ticket_id: &str, role: &str) -> String {
+    match role_resume_policy(role) {
+        ResumePolicy::ResumeContext => format!(
+            "You are resumed with your prior context intact. Check `bd show {ticket}` \
+             for any new feedback and continue.",
+            ticket = ticket_id,
+        ),
+        ResumePolicy::FreshContext => format!(
+            "You are the {role} on team {team} resuming for bd ticket {ticket}. Your \
+             prior conversation is not retained. Read `bd show {ticket}` to get current \
+             status, check `git log --oneline -10` for recent commits on the work branch, \
+             and continue from where the team is now.",
+            role = role,
+            team = team_id,
+            ticket = ticket_id,
+        ),
+    }
+}
+
 fn build_payload_for_team_agent(
     cfg: &Config,
     clone_path: &Path,
@@ -201,6 +228,7 @@ fn build_payload_for_team_agent(
     role_memory_dir: PathBuf,
     dolt_port: Option<u16>,
     initial_prompt: String,
+    resume_session: bool,
 ) -> Result<StartAgentPayload> {
     let (model_override, effort_override) = role_model_effort(agent_role);
     let resolved = image_resolver::resolve(cfg, agent_role);
@@ -248,6 +276,7 @@ fn build_payload_for_team_agent(
         extra_mounts: vec![],
         model: model_override,
         effort: effort_override,
+        resume_session,
     })
 }
 
@@ -343,6 +372,7 @@ pub fn cmd_spawn(
             role_memory_dir,
             dolt_port,
             initial_prompt,
+            false,
         )?;
 
         println!("==> Launching {} ({})", agent.name, agent.role);
@@ -441,14 +471,8 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
 
         let role_memory_dir = project_config::setup_role_memory_dir(&pcfg, &agent.role)?;
 
-        let primer = format!(
-            "[resume primer] You are resuming team {team} on bd ticket {ticket} as the \
-             {role}. Your prior conversation state is loaded. Read `bd show {ticket}` \
-             for current status and continue.",
-            team = team.id,
-            ticket = team.ticket_id,
-            role = agent.role,
-        );
+        let primer = build_resume_prompt(&team.id, &team.ticket_id, &agent.role);
+        let resume_session = compute_resume_session(&agent.role, true);
 
         let clone_path = mgr
             .clone_path(&team.id, &agent.role)
@@ -464,6 +488,7 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
             role_memory_dir,
             dolt_port,
             primer,
+            resume_session,
         )?;
 
         println!("==> Resuming {} ({})", agent.name, agent.role);
@@ -554,6 +579,55 @@ pub fn cmd_kill(cfg: &Config, team_id: &str, archive: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_prompt_producer_gets_prior_context_message() {
+        for role in &["feature-producer", "maintenance-producer"] {
+            let prompt = build_resume_prompt("t-team", "bd-42", role);
+            assert!(
+                prompt.contains("prior context intact"),
+                "{role} resume prompt must mention 'prior context intact'; got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("not retained"),
+                "{role} resume prompt must not say 'not retained'; got: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_prompt_non_producer_gets_fresh_context_message() {
+        for role in &["review-agent", "planner"] {
+            let prompt = build_resume_prompt("t-team", "bd-42", role);
+            assert!(
+                prompt.contains("not retained"),
+                "{role} resume prompt must say 'not retained'; got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("prior context intact"),
+                "{role} resume prompt must not say 'prior context intact'; got: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_resume_session_spawn_always_false() {
+        for role in &["planner", "feature-producer", "maintenance-producer", "review-agent", "unknown"] {
+            assert!(
+                !compute_resume_session(role, false),
+                "spawn (is_resume=false) must yield false for {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_resume_session_resume_per_role_policy() {
+        assert!(compute_resume_session("feature-producer", true), "feature-producer must get resume_session=true on resume");
+        assert!(compute_resume_session("maintenance-producer", true), "maintenance-producer must get resume_session=true on resume");
+        assert!(!compute_resume_session("review-agent", true), "review-agent must get resume_session=false on resume");
+        assert!(!compute_resume_session("planner", true), "planner must get resume_session=false on resume");
+        assert!(!compute_resume_session("unknown-role", true), "unknown role must get resume_session=false on resume");
+    }
 
     #[test]
     fn producer_primer_has_no_git_push_or_gh_pr_create() {

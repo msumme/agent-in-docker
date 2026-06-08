@@ -129,6 +129,10 @@ pub struct StartAgentPayload {
     /// Empty = inherit project settings. Team agents set this per role.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Whether to pass `--continue` to Claude Code on resume (long-running only).
+    /// Serde default = false so manifests that predate this field still parse.
+    #[serde(default)]
+    pub resume_session: bool,
 }
 
 impl StartAgentPayload {
@@ -209,6 +213,10 @@ impl StartAgentPayload {
         }
         if let Some(effort) = self.effort.as_ref().filter(|s| !s.is_empty()) {
             args.extend_from_slice(&["-e".to_string(), format!("AGENT_EFFORT={}", effort)]);
+        }
+
+        if self.resume_session {
+            args.extend_from_slice(&["-e".to_string(), "AGENT_RESUME=1".to_string()]);
         }
 
         args.push(self.image_name.clone());
@@ -413,6 +421,7 @@ mod tests {
             extra_mounts: vec![],
             model: None,
             effort: None,
+            resume_session: false,
         };
         let json = serde_json::to_string(&p).unwrap();
         let parsed: StartAgentPayload = serde_json::from_str(&json).unwrap();
@@ -439,6 +448,7 @@ mod tests {
             extra_mounts: vec![],
             model: None,
             effort: None,
+            resume_session: false,
         };
         let args = p.container_run_args();
         assert!(args.iter().any(|a| a == "AGENT_NAME=test"));
@@ -472,11 +482,68 @@ mod tests {
             extra_mounts: vec![],
             model: None,
             effort: None,
+            resume_session: false,
         };
         let args = p.container_run_args();
         assert!(args.iter().any(|a| a == "AGENT_ROLE_PROMPT=hello"));
         assert!(args.iter().any(|a| a == "DOLT_PORT=3307"));
         assert!(args.iter().any(|a| a == "DOLT_HOST=host.containers.internal"));
+    }
+
+    fn minimal_payload(resume_session: bool) -> StartAgentPayload {
+        StartAgentPayload {
+            name: "test".into(),
+            role: "feature-producer".into(),
+            mode: "long-running".into(),
+            project_path: "/tmp".into(),
+            prompt: String::new(),
+            agent_dir: "/tmp/a".into(),
+            role_memory_dir: "/tmp/m".into(),
+            role_prompt: String::new(),
+            seed_credentials: "/tmp/c.json".into(),
+            image_name: "img".into(),
+            network_name: "net".into(),
+            orchestrator_port: 9800,
+            mcp_port: 9801,
+            dolt_port: None,
+            extra_mounts: vec![],
+            model: None,
+            effort: None,
+            resume_session,
+        }
+    }
+
+    #[test]
+    fn start_agent_payload_resume_session_defaults_to_false() {
+        let json = r#"{
+            "name":"t","role":"feature-producer","mode":"long-running",
+            "project_path":"/p","prompt":"hi","agent_dir":"/a",
+            "role_memory_dir":"/m","seed_credentials":"/c",
+            "image_name":"img","network_name":"net",
+            "orchestrator_port":9800,"mcp_port":9801
+        }"#;
+        let p: StartAgentPayload = serde_json::from_str(json).unwrap();
+        assert!(!p.resume_session, "resume_session must default to false when absent from JSON");
+    }
+
+    #[test]
+    fn container_run_args_agent_resume_present_when_true() {
+        let args = minimal_payload(true).container_run_args();
+        assert!(
+            args.iter().any(|a| a == "AGENT_RESUME=1"),
+            "AGENT_RESUME=1 must be present when resume_session=true; got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn container_run_args_agent_resume_absent_when_false() {
+        let args = minimal_payload(false).container_run_args();
+        assert!(
+            !args.iter().any(|a| a.contains("AGENT_RESUME")),
+            "AGENT_RESUME must be absent when resume_session=false; got: {:?}",
+            args
+        );
     }
 
 }

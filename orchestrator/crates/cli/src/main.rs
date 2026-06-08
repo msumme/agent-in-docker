@@ -282,6 +282,7 @@ fn main() -> Result<()> {
                 extra_mounts: vec![],
                 model: None,
                 effort: None,
+                resume_session: false,
             };
 
             if mode == "long-running" {

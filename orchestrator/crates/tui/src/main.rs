@@ -37,9 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<TuiCommand>();
 
     let permissions: Box<dyn orchestrator_core::mcp::PermissionCheck> = {
-        let mut checker = orchestrator_core::permissions::PermissionChecker::new(
-            Box::new(orchestrator_core::permissions::RealEnvResolver),
-        );
+        let mut checker = orchestrator_core::permissions::PermissionChecker::new();
         let roles_dir = project_config.project_root.join("roles");
         let _ = checker.load_roles_from_dir(&roles_dir);
         Box::new(checker)

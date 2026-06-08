@@ -455,6 +455,30 @@ impl TeamManager {
         result
     }
 
+    /// Return `(team_id, ticket_id, producer_name, clone_path, reviewer_name)` for
+    /// every Active team that has a producer role. Used by the stall watchdog.
+    pub fn active_producer_agents(&self) -> Vec<(String, String, String, PathBuf, String)> {
+        let mut result = Vec::new();
+        for team in self.teams.values().filter(|t| t.state == TeamState::Active) {
+            let producer = team.agents.iter().find(|a| {
+                a.role == "feature-producer" || a.role == "maintenance-producer"
+            });
+            let reviewer = team.agents.iter().find(|a| a.role == "review-agent");
+            if let (Some(prod), Some(rev)) = (producer, reviewer) {
+                if let Some(clone_path) = team.clones.get(&prod.role) {
+                    result.push((
+                        team.id.clone(),
+                        team.ticket_id.clone(),
+                        prod.name.clone(),
+                        clone_path.clone(),
+                        rev.name.clone(),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
     /// Per-role agent state directory; the CLI mounts this into the agent's
     /// container at /root/.claude during spawn/resume.
     pub fn agent_state_dir(&self, team_id: &str, role: &str) -> PathBuf {

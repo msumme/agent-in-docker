@@ -168,6 +168,27 @@ impl App {
                     pr_number,
                 });
             }
+            OrchestratorEvent::HandoffObserved {
+                team_id,
+                kind,
+                from,
+                to,
+            } => {
+                self.completed_log.push(format!(
+                    "[team:{}] handoff {} → {} ({})",
+                    team_id, from, to, kind
+                ));
+            }
+            OrchestratorEvent::StallVerdict {
+                team_id,
+                agent,
+                verdict,
+            } => {
+                self.completed_log.push(format!(
+                    "[team:{}] stall-watchdog: {} → {}",
+                    team_id, agent, verdict
+                ));
+            }
         }
     }
 

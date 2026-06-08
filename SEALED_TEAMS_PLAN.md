@@ -190,4 +190,15 @@ teams; fall back to hand-driving only to keep momentum.
   not bead codes. (c) Pairs with the Supervisor: drop `git_push`/`gh_pr_create`
   from the producer's primer (it kept jamming on them) — "done" = park/ping; the
   host integrates.
+- 2026-06-08 — Dogfooding the **Team Supervisor**. Specced it (observe ping →
+  auto-fire review + feedback; stall watchdog diagnoses stalled/blocked/done;
+  persist transitions to a host-readable log; drop git_push/PR from the producer
+  primer). Spawned a fresh team on the **clone-per-agent build** — validated P2
+  in anger: three isolated per-role clones under `.teams-clones/<team>/`, each on
+  the work branch. **First dogfood bug found & filed:** clone-per-agent's hard
+  schema cut + `load_from_disk` hard-failing on any unparseable manifest blocked
+  all team ops because old-schema manifests lingered in `.teams/`. Workaround:
+  archived 5 dead old-schema teams; filed a bug to make `load_from_disk`
+  skip+log unparseable manifests instead of failing. Generic watchdog now at
+  `/tmp/team_watch.sh <team-id>`.
 </content>

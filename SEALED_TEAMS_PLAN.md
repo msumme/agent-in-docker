@@ -92,8 +92,10 @@ teams; fall back to hand-driving only to keep momentum.
 - [x] **Supervisor inert-fix** — DONE, dogfooded by team `6mq-9`: `message_agent`
   now passes the real sender (`x-agent-name`), `route_message` resolves it via
   `resolve_agent_ref`, so `classify_handoff` fires and `supervisor.log` writes;
-  4 regression tests. Orchestrator rebuilt + restarted. **Live proof pending the
-  next team spawn** (watch `.teams/<id>/supervisor.log` appear).
+  4 regression tests. Orchestrator rebuilt + restarted. **LIVE PROOF CONFIRMED**
+  (team `6mq-8`): `.teams/t-agent-in-docker-6mq-8/supervisor.log` recorded both
+  handoffs — `ReviewRequested` (prod→rev) and `Feedback` (rev→prod). The
+  orchestrator now sees handoffs in the background; the bash watchdog can retire.
 - [x] **P3 — Team Supervisor (bd `6mq.7`, expands old P3).** DONE (35890ae),
   built autonomously by a team. Handoff classifier + supervisor.log + stall
   watchdog + MaybeDone auto-fire, wired into server routing/startup. Paired
@@ -241,3 +243,12 @@ teams; fall back to hand-driving only to keep momentum.
   lands. Deletion review APPROVE (all load-bearing kept); −1186 lines.
   **Recommended next: fix the inert Supervisor** before the next big phase.
 </content>
+
+- 2026-06-08 — **Supervisor LIVE (proven), load_from_disk robustness DONE.**
+  Dogfooded the Supervisor inert-fix (team `6mq-9`) and the load_from_disk
+  skip-bad-manifest fix (team `6mq-8`), each via review-subagent→merge. The
+  load_from_disk team's run was the live proof: its `supervisor.log` captured a
+  `ReviewRequested` then a `Feedback` handoff. The Supervisor is now genuinely
+  functioning — handoffs recorded, stall-detection running, no hand-watching
+  needed. Remaining phases: Persistent producer / ephemeral reviewer; Async +
+  stacked PRs; Formula dispatcher.

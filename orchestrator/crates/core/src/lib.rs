@@ -7,5 +7,7 @@ pub mod permissions;
 pub mod pr_watcher;
 pub mod project_config;
 pub mod server;
+pub mod stall_watchdog;
+pub mod supervisor;
 pub mod team_manager;
 pub mod types;

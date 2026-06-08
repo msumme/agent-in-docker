@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -96,6 +97,16 @@ pub struct ServerState {
     registry_snapshot: Option<Arc<std::sync::Mutex<Vec<PeerInfo>>>>,
     team_lookup: Arc<dyn TeamLookup>,
     team_manager: Option<TeamManagerArc>,
+    /// Injectable wall clock; default is SystemClock.
+    pub(crate) clock: Arc<dyn crate::supervisor::Clock>,
+    /// Last-seen activity time per agent (keyed by agent container name).
+    pub(crate) last_activity: BTreeMap<String, SystemTime>,
+    /// Teams for which an auto-fire review-request has been sent (idempotency).
+    pub(crate) auto_fired: BTreeSet<String>,
+    /// Teams for which a manual producer→reviewer HandoffObserved was recorded.
+    pub(crate) handoff_observed: BTreeSet<String>,
+    /// Project root path — used to locate `.teams/<id>/supervisor.log`.
+    project_root: Option<std::path::PathBuf>,
 }
 
 fn execution_summary(request_type: &str, payload: &Value, success: bool) -> String {
@@ -144,7 +155,20 @@ impl ServerState {
             registry_snapshot: None,
             team_lookup: Arc::new(NoTeamLookup),
             team_manager: None,
+            clock: Arc::new(crate::supervisor::SystemClock),
+            last_activity: BTreeMap::new(),
+            auto_fired: BTreeSet::new(),
+            handoff_observed: BTreeSet::new(),
+            project_root: None,
         }
+    }
+
+    pub fn set_clock(&mut self, clock: Arc<dyn crate::supervisor::Clock>) {
+        self.clock = clock;
+    }
+
+    pub fn set_project_root(&mut self, root: std::path::PathBuf) {
+        self.project_root = Some(root);
     }
 
     pub fn set_registry_snapshot(&mut self, snapshot: Arc<std::sync::Mutex<Vec<PeerInfo>>>) {
@@ -279,12 +303,19 @@ impl ServerState {
 
     /// Route a message from one agent to another.
     pub fn route_agent_message(
-        &self,
+        &mut self,
         from_id: &str,
         request_id: &str,
         to_id: &str,
         content: &str,
     ) -> bool {
+        // Update last-activity for the sender (keyed by container name).
+        let from_name = self.agent_name(from_id);
+        if !from_name.is_empty() {
+            let now = self.clock.now();
+            self.last_activity.insert(from_name.clone(), now);
+        }
+
         if !self.agents.contains_key(to_id) {
             let err = Message {
                 id: request_id.to_string(),
@@ -297,7 +328,51 @@ impl ServerState {
             return false;
         }
 
-        let from_name = self.agent_name(from_id);
+        // Classify handoff and emit supervisor signals.
+        let from_role = self.agent_role(from_id);
+        let to_role = self.agent_role(to_id);
+        let to_name = self.agent_name(to_id);
+        if let (Some(ref fr), Some(ref tr)) = (from_role, to_role) {
+            let handoff = crate::supervisor::classify_handoff(fr, tr, content);
+            if !matches!(handoff, crate::supervisor::Handoff::Other) {
+                let kind = match handoff {
+                    crate::supervisor::Handoff::ReviewRequested => "ReviewRequested",
+                    crate::supervisor::Handoff::Feedback => "Feedback",
+                    crate::supervisor::Handoff::Other => unreachable!(),
+                };
+                // Resolve team_id via team_lookup.
+                let team_id = self
+                    .team_lookup
+                    .team_for_agent(&from_name)
+                    .map(|h| h.team_id);
+
+                if let Some(ref tid) = team_id {
+                    if matches!(handoff, crate::supervisor::Handoff::ReviewRequested) {
+                        self.handoff_observed.insert(tid.clone());
+                    }
+                    let _ = self.event_tx.send(OrchestratorEvent::HandoffObserved {
+                        team_id: tid.clone(),
+                        kind: kind.to_string(),
+                        from: from_name.clone(),
+                        to: to_name.clone(),
+                    });
+                    // Append to supervisor.log.
+                    if let Some(ref root) = self.project_root.clone() {
+                        let log_path = root.join(".teams").join(tid).join("supervisor.log");
+                        let ts = crate::supervisor::unix_secs_str(self.clock.now());
+                        let entry = serde_json::json!({
+                            "ts": ts,
+                            "team_id": tid,
+                            "kind": kind,
+                            "from": from_name,
+                            "to": to_name,
+                        });
+                        crate::supervisor::append_supervisor_log(&log_path, &entry);
+                    }
+                }
+            }
+        }
+
         let delivery = Message {
             id: uuid::Uuid::new_v4().to_string(),
             msg_type: "agent_message_delivery".into(),
@@ -343,6 +418,11 @@ impl ServerState {
         payload: Value,
     ) -> Option<(String, serde_json::Value)> {
         let agent_name = self.agent_name(agent_id);
+        // Track last activity for the requesting agent.
+        let now = self.clock.now();
+        if !agent_name.is_empty() {
+            self.last_activity.insert(agent_name.clone(), now);
+        }
 
         if request_type == "git_push" {
             let team_lookup = self.team_lookup.clone();
@@ -590,6 +670,72 @@ impl ServerState {
     pub fn pending_count(&self) -> usize {
         self.pending_requests.len()
     }
+
+    pub fn clock_now(&self) -> SystemTime {
+        self.clock.now()
+    }
+
+    pub fn last_activity_for(&self, agent_name: &str) -> Option<SystemTime> {
+        self.last_activity.get(agent_name).copied()
+    }
+
+    pub fn is_auto_fired(&self, team_id: &str) -> bool {
+        self.auto_fired.contains(team_id)
+    }
+
+    pub fn is_handoff_observed(&self, team_id: &str) -> bool {
+        self.handoff_observed.contains(team_id)
+    }
+
+    /// Return `(team_id, ticket_id, producer_name, clone_path, reviewer_name)` for
+    /// every Active team that has a producer agent. Delegates to TeamManager.
+    pub fn active_producer_agents(&self) -> Vec<(String, String, String, std::path::PathBuf, String)> {
+        if let Some(ref tm) = self.team_manager {
+            tm.lock().unwrap().active_producer_agents()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Inject a synthetic review-request from "orchestrator" to the reviewer of `team_id`.
+    /// Idempotent: does nothing if already fired for this team.
+    pub fn inject_review_request(&mut self, team_id: &str, sha: &str) {
+        if self.auto_fired.contains(team_id) {
+            return;
+        }
+
+        // Find the reviewer agent name for this team.
+        let reviewer_name = self.team_manager.as_ref().and_then(|tm| {
+            tm.lock()
+                .unwrap()
+                .get(team_id)
+                .and_then(|t| t.agents.iter().find(|a| a.role == "review-agent"))
+                .map(|a| a.name.clone())
+        });
+
+        if let Some(ref name) = reviewer_name {
+            if let Some(rev_id) = self.resolve_agent_ref(name) {
+                let content = format!(
+                    "auto-fire: review-request — producer appears done (sha {})",
+                    sha
+                );
+                let delivery = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    msg_type: "agent_message_delivery".into(),
+                    from: "orchestrator".into(),
+                    to: Some(rev_id.clone()),
+                    payload: serde_json::json!({
+                        "from": "orchestrator",
+                        "fromName": "orchestrator",
+                        "content": content,
+                    }),
+                };
+                self.send_to_agent(&rev_id, &delivery);
+            }
+        }
+        // Mark fired regardless of whether the reviewer was reachable.
+        self.auto_fired.insert(team_id.to_string());
+    }
 }
 
 /// Snapshot-based registry that avoids blocking_lock on the tokio Mutex.
@@ -624,7 +770,7 @@ impl AgentRegistry for ServerStateRegistry {
         // route_message needs the full state to send WS messages.
         // Use try_lock to avoid blocking; if contended, return error.
         match self.state.try_lock() {
-            Ok(s) => {
+            Ok(mut s) => {
                 // The MCP tool passes the recipient by name; route_agent_message
                 // expects a WS id. Resolve here so either form works.
                 let to_id = s
@@ -681,11 +827,24 @@ pub async fn run_with_id_gen(
         if let Some(tm) = team_manager {
             s.set_team_manager(tm);
         }
+        if let Some(ref cfg) = project_cfg {
+            s.set_project_root(cfg.project_root.clone());
+        }
     }
 
     // Spawn PR watcher if requested
     if let Some((gh, interval)) = watcher {
         crate::pr_watcher::spawn(state.clone(), gh, interval);
+    }
+
+    // Spawn stall watchdog if a project root is known.
+    if let Some(ref cfg) = project_cfg {
+        crate::stall_watchdog::spawn(
+            state.clone(),
+            cfg.project_root.clone(),
+            crate::stall_watchdog::WATCHDOG_INTERVAL,
+            crate::stall_watchdog::STALL_THRESHOLD,
+        );
     }
 
     // Wire the agent registry into the MCP state
@@ -1004,7 +1163,7 @@ async fn handle_connection(
                 if let Some(ref aid) = agent_id {
                     let to_id = message.payload.get("to").and_then(|v| v.as_str()).unwrap_or("");
                     let content = message.payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    let s = state.lock().await;
+                    let mut s = state.lock().await;
                     s.route_agent_message(aid, &message.id, to_id, content);
                 }
             }
@@ -2139,5 +2298,143 @@ mod tests {
         let msg: Message = serde_json::from_str(&sent).unwrap();
         assert_eq!(msg.msg_type, "gh_pr_create_response");
         // Just verifying no panic; no team_manager mutation to assert.
+    }
+
+    // --- supervisor integration tests ---
+
+    struct FakeClock {
+        now: std::sync::Mutex<std::time::SystemTime>,
+    }
+
+    impl FakeClock {
+        fn fixed(t: std::time::SystemTime) -> Arc<Self> {
+            Arc::new(Self { now: std::sync::Mutex::new(t) })
+        }
+    }
+
+    impl crate::supervisor::Clock for FakeClock {
+        fn now(&self) -> std::time::SystemTime {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn route_agent_message_updates_last_activity_and_emits_handoff_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let clock = FakeClock::fixed(base_time);
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut state = ServerState::with_executor(
+            event_tx,
+            Arc::new(SequentialIdGenerator::new()),
+            Arc::new(FakeExecutor),
+        );
+        state.set_clock(clock);
+        state.set_project_root(tmp.path().to_path_buf());
+
+        // Register producer and reviewer
+        let (prod_tx, _) = mpsc::unbounded_channel();
+        let (rev_tx, _) = mpsc::unbounded_channel();
+        let (prod_id, _) = state.register_agent(
+            "t-team-prod".into(),
+            "feature-producer".into(),
+            None,
+            prod_tx,
+        );
+        let (rev_id, _) = state.register_agent(
+            "t-team-rev".into(),
+            "review-agent".into(),
+            None,
+            rev_tx,
+        );
+        // Drain setup events
+        while event_rx.try_recv().is_ok() {}
+
+        // Create the teams dir for supervisor.log
+        let team_id = "t-team";
+        std::fs::create_dir_all(tmp.path().join(".teams").join(team_id)).unwrap();
+
+        // Wire up a team_lookup so the team_id resolves.
+        // ManifestDirTeamLookup reads manifests; instead use a simple inline lookup.
+        struct FixedLookup { team_id: String, work_branch: String }
+        impl crate::team_manager::TeamLookup for FixedLookup {
+            fn team_for_agent(&self, _: &str) -> Option<crate::team_manager::TeamLookupHit> {
+                Some(crate::team_manager::TeamLookupHit {
+                    team_id: self.team_id.clone(),
+                    work_branch: self.work_branch.clone(),
+                })
+            }
+        }
+        state.set_team_lookup(Arc::new(FixedLookup {
+            team_id: team_id.into(),
+            work_branch: "t-team/code".into(),
+        }));
+
+        // Route a message from producer to reviewer — triggers supervisor logic.
+        let delivered = state.route_agent_message(&prod_id, "req-x", &rev_id, "done!");
+        assert!(delivered);
+
+        // last_activity should be set for the producer's container name.
+        let prod_name = "t-team-prod";
+        assert_eq!(
+            state.last_activity_for(prod_name),
+            Some(base_time),
+            "last_activity must record the fake clock's now"
+        );
+
+        // HandoffObserved event must be emitted.
+        let ev = event_rx.try_recv().expect("HandoffObserved must be emitted");
+        assert!(
+            matches!(
+                &ev,
+                OrchestratorEvent::HandoffObserved { kind, .. } if kind == "ReviewRequested"
+            ),
+            "expected HandoffObserved(ReviewRequested), got {:?}", ev
+        );
+
+        // supervisor.log must exist and contain valid JSON with required fields.
+        let log_path = tmp.path().join(".teams").join(team_id).join("supervisor.log");
+        assert!(log_path.exists(), "supervisor.log must be created");
+        let log_content = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(log_content.trim()).unwrap();
+        assert!(parsed.get("ts").is_some(), "log must have ts field");
+        assert!(parsed.get("kind").is_some(), "log must have kind field");
+        assert!(parsed.get("from").is_some(), "log must have from field");
+        assert!(parsed.get("to").is_some(), "log must have to field");
+        assert_eq!(parsed["kind"], "ReviewRequested");
+    }
+
+    #[test]
+    fn handle_request_updates_last_activity_via_clock() {
+        let base_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let clock = FakeClock::fixed(base_time);
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut state = ServerState::with_executor(
+            event_tx,
+            Arc::new(SequentialIdGenerator::new()),
+            Arc::new(FakeExecutor),
+        );
+        state.set_clock(clock);
+
+        let (sender, _) = mpsc::unbounded_channel();
+        let (agent_id, _) = state.register_agent(
+            "my-agent".into(),
+            "feature-producer".into(),
+            None,
+            sender,
+        );
+        // Drain setup events
+        while event_rx.try_recv().is_ok() {}
+
+        // Any request type updates last_activity
+        state.handle_request(&agent_id, "req-1".into(), "user_prompt", json!({"question": "?"}));
+
+        assert_eq!(
+            state.last_activity_for("my-agent"),
+            Some(base_time),
+            "handle_request must update last_activity via injected clock"
+        );
     }
 }

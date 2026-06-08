@@ -284,6 +284,21 @@ pub enum OrchestratorEvent {
         ticket_id: String,
         pr_number: u64,
     },
+    /// A `message_agent` call crossed a producer↔reviewer boundary.
+    HandoffObserved {
+        team_id: String,
+        /// "ReviewRequested" | "Feedback"
+        kind: String,
+        from: String,
+        to: String,
+    },
+    /// Stall-watchdog verdict for a producer agent.
+    StallVerdict {
+        team_id: String,
+        agent: String,
+        /// "Working" | "Stalled" | "Blocked" | "MaybeDone"
+        verdict: String,
+    },
 }
 
 /// Commands sent from the frontend (TUI) to the core server.

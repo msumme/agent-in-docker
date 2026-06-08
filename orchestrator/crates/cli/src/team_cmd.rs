@@ -52,21 +52,26 @@ fn build_initial_prompt(team_id: &str, ticket_id: &str, role: &str) -> String {
              Do NOT start work yet. The spec is not ready. Acknowledge with \
              one short line (e.g. \"producer ready, waiting on spec\") and stop. \
              You will be pinged via message_agent when the spec is filed.\n\n\
+             When you finish your work: commit your changes in your sandbox clone, \
+             then `message_agent {team}-rev \"ready for review: <sha>\"` and stop. \
+             The host integrates — do not push or open a PR.\n\n\
              Available host-bridge MCP tools (call them by name): \
-             `git_push`, `gh_pr_create` (open a PR — required when spec is \
-             complete and reviewer approves), `gh_pr_view`, `read_host_file`, \
-             `list_agents`, `message_agent`. If a tool errors, report the \
-             verbatim error — do NOT conclude the tool is unavailable.",
+             `read_host_file`, `list_agents`, `message_agent`. \
+             If a tool errors, report the verbatim error — do NOT conclude the \
+             tool is unavailable.",
             team = team_id,
             ticket = ticket_id,
         ),
         "review-agent" => format!(
             "You are the REVIEWER on team {team} for bd ticket {ticket}. The team \
-             has just spawned. The pipeline is planner → producer → you. There is \
-             no PR yet.\n\n\
+             has just spawned. The pipeline is planner → producer → you.\n\n\
              Do NOT start reviewing yet. Acknowledge with one short line (e.g. \
-             \"reviewer ready, waiting on PR\") and stop. You will be pinged via \
-             message_agent when the producer opens a PR.",
+             \"reviewer ready, waiting on producer\") and stop. You will be pinged \
+             via message_agent when the producer is ready.\n\n\
+             When you review: read the producer's commits, file findings as beads \
+             tickets, and on approval respond with \
+             `message_agent {team}-prod \"approved: <sha>\"`. \
+             There is no PR step for the agent — the host integrates.",
             team = team_id,
             ticket = ticket_id,
         ),
@@ -544,4 +549,56 @@ pub fn cmd_kill(cfg: &Config, team_id: &str, archive: bool) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("teardown: {}", e))?;
     println!("    Team gone.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn producer_primer_has_no_git_push_or_gh_pr_create() {
+        for role in &["feature-producer", "maintenance-producer"] {
+            let prompt = build_initial_prompt("t-team", "bd-42", role);
+            assert!(
+                !prompt.contains("git_push"),
+                "{role} primer must not mention git_push"
+            );
+            assert!(
+                !prompt.contains("gh_pr_create"),
+                "{role} primer must not mention gh_pr_create"
+            );
+            assert!(
+                prompt.contains("message_agent"),
+                "{role} primer must mention message_agent"
+            );
+            assert!(
+                prompt.contains("ready for review"),
+                "{role} primer must contain 'ready for review'"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_primer_has_no_gh_pr_create_and_has_approved() {
+        let prompt = build_initial_prompt("t-team", "bd-42", "review-agent");
+        assert!(
+            !prompt.contains("gh_pr_create"),
+            "reviewer primer must not mention gh_pr_create"
+        );
+        assert!(
+            prompt.contains("approved"),
+            "reviewer primer must contain 'approved'"
+        );
+        assert!(
+            prompt.contains("findings as beads"),
+            "reviewer primer must mention 'findings as beads'"
+        );
+    }
+
+    #[test]
+    fn planner_primer_still_works() {
+        let prompt = build_initial_prompt("t-team", "bd-42", "planner");
+        assert!(prompt.contains("PLANNER"));
+        assert!(prompt.contains("bd-42"));
+    }
 }

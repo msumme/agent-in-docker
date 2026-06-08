@@ -455,7 +455,7 @@ fn handle_tools_call_streaming(
         "message_agent" => {
             let agent_id = args.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
             let message = args.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let ws_result = state.registry.lock().unwrap().route_message("mcp-client", agent_id, message);
+            let ws_result = state.registry.lock().unwrap().route_message(&agent_name, agent_id, message);
             // Also push the message into the target agent's interactive session
             // (queued if target is Working). The sender's agent_name comes from
             // the x-agent-name header.
@@ -1062,5 +1062,46 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("isError"), "body: {body}");
         assert!(body.contains("team manager not wired"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn message_agent_passes_real_sender_not_mcp_client() {
+        struct CapturingRegistry {
+            calls: Arc<Mutex<Vec<(String, String, String)>>>,
+        }
+        impl AgentRegistry for CapturingRegistry {
+            fn list_agents(&self) -> Vec<PeerInfo> { vec![] }
+            fn route_message(&self, from: &str, to: &str, content: &str) -> Result<(), String> {
+                self.calls.lock().unwrap().push((from.to_string(), to.to_string(), content.to_string()));
+                Ok(())
+            }
+        }
+
+        let calls: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(vec![]));
+        let (event_tx, _) = mpsc::unbounded_channel();
+        let state = Arc::new(McpState::new(event_tx, Box::new(AllowAllPermissions)));
+        state.set_registry(Box::new(CapturingRegistry { calls: calls.clone() }));
+        let app = mcp_router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        reqwest::Client::new()
+            .post(format!("http://{}/mcp", addr))
+            .header("Content-Type", "application/json")
+            .header("x-agent-name", "prod-1")
+            .body(serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": "message_agent", "arguments": {"agentId": "rev-1", "message": "done!"}}
+            })).unwrap())
+            .send().await.unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "route_message must be called once");
+        let (from, to, _) = &recorded[0];
+        assert_eq!(from, "prod-1", "from must be the real sender header, not 'mcp-client'");
+        assert_eq!(to, "rev-1");
     }
 }

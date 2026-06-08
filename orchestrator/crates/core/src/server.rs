@@ -683,7 +683,8 @@ impl AgentRegistry for ServerStateRegistry {
                 let to_id = s
                     .resolve_agent_ref(to)
                     .ok_or_else(|| format!("Agent {} not found", to))?;
-                if s.route_agent_message(from, "", &to_id, content) {
+                let from_id = s.resolve_agent_ref(from).unwrap_or_default();
+                if s.route_agent_message(&from_id, "", &to_id, content) {
                     Ok(())
                 } else {
                     Err(format!("Agent {} not found", to))
@@ -1964,6 +1965,114 @@ mod tests {
             state.last_activity_for("my-agent"),
             Some(base_time),
             "handle_request must update last_activity via injected clock"
+        );
+    }
+
+    fn make_registry_with_team(
+        tmp: &tempfile::TempDir,
+        team_id: &str,
+    ) -> (
+        ServerStateRegistry,
+        mpsc::UnboundedReceiver<OrchestratorEvent>,
+        String, // prod_name
+        String, // rev_name
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut state = ServerState::with_executor(
+            event_tx,
+            Arc::new(SequentialIdGenerator::new()),
+            Arc::new(FakeExecutor),
+        );
+        state.set_project_root(tmp.path().to_path_buf());
+
+        let (prod_tx, _) = mpsc::unbounded_channel();
+        let (rev_tx, _) = mpsc::unbounded_channel();
+        state.register_agent("t-prod".into(), "feature-producer".into(), None, prod_tx);
+        state.register_agent("t-rev".into(), "review-agent".into(), None, rev_tx);
+
+        std::fs::create_dir_all(tmp.path().join(".teams").join(team_id)).unwrap();
+
+        struct FixedLookup { team_id: String }
+        impl crate::team_manager::TeamLookup for FixedLookup {
+            fn team_for_agent(&self, _: &str) -> Option<crate::team_manager::TeamLookupHit> {
+                Some(crate::team_manager::TeamLookupHit {
+                    team_id: self.team_id.clone(),
+                    work_branch: "t-team/code".into(),
+                })
+            }
+        }
+        state.set_team_lookup(Arc::new(FixedLookup { team_id: team_id.into() }));
+
+        let state_arc = Arc::new(Mutex::new(state));
+        let registry = ServerStateRegistry {
+            agents: Arc::new(std::sync::Mutex::new(vec![])),
+            state: state_arc,
+        };
+        (registry, event_rx, "t-prod".into(), "t-rev".into())
+    }
+
+    #[test]
+    fn registry_route_message_emits_handoff_review_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_id = "t-team";
+        let (registry, mut event_rx, prod_name, rev_name) =
+            make_registry_with_team(&tmp, team_id);
+
+        // Drain connection events
+        while event_rx.try_recv().is_ok() {}
+
+        registry.route_message(&prod_name, &rev_name, "done!").unwrap();
+
+        let ev = event_rx.try_recv().expect("HandoffObserved must be emitted");
+        assert!(
+            matches!(&ev, OrchestratorEvent::HandoffObserved { kind, .. } if kind == "ReviewRequested"),
+            "expected ReviewRequested, got {:?}", ev
+        );
+
+        let log_path = tmp.path().join(".teams").join(team_id).join("supervisor.log");
+        assert!(log_path.exists(), "supervisor.log must be written");
+        let line = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(parsed["kind"], "ReviewRequested");
+        assert_eq!(parsed["from"], prod_name);
+        assert_eq!(parsed["to"], rev_name);
+    }
+
+    #[test]
+    fn registry_route_message_emits_handoff_feedback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_id = "t-team";
+        let (registry, mut event_rx, prod_name, rev_name) =
+            make_registry_with_team(&tmp, team_id);
+
+        // Drain connection events
+        while event_rx.try_recv().is_ok() {}
+
+        registry.route_message(&rev_name, &prod_name, "here is my feedback").unwrap();
+
+        let ev = event_rx.try_recv().expect("HandoffObserved must be emitted");
+        assert!(
+            matches!(&ev, OrchestratorEvent::HandoffObserved { kind, .. } if kind == "Feedback"),
+            "expected Feedback, got {:?}", ev
+        );
+    }
+
+    #[test]
+    fn registry_route_message_unknown_sender_no_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_id = "t-team";
+        let (registry, mut event_rx, _prod_name, rev_name) =
+            make_registry_with_team(&tmp, team_id);
+
+        // Drain connection events
+        while event_rx.try_recv().is_ok() {}
+
+        // "mcp-client" is not a registered agent — delivery still succeeds, no HandoffObserved
+        registry.route_message("mcp-client", &rev_name, "hello").unwrap();
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "unknown sender must not emit HandoffObserved"
         );
     }
 }

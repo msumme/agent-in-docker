@@ -282,3 +282,17 @@ teams; fall back to hand-driving only to keep momentum.
   producer's commits — so the new reviewer prompt never actually ran. Host had
   to be the review gate (subagent → build/test → merge). Next: build the
   producer→reviewer clone bridge so peer review works end-to-end.
+
+- 2026-06-08 — **`b4j` shipped: in-team review loop unblocked.** Collapsed the
+  per-ROLE clones into one shared clone per TEAM (`clones` map → single
+  `clone_path`); all roles now mount the same `/workspace`, so the reviewer
+  sees the producer's commits with no bridge/sync. Dogfooded by team `b4j`
+  (maintenance), host-reviewed APPROVE, merged `7b5d41e` (−32 net lines, 151
+  core tests), orchestrator restarted on the new schema. Root cause was P2
+  over-isolating at role granularity; isolation that matters is between teams,
+  preserved. Gotcha noted: a schema-changing merge orphans its own in-flight
+  team (old-schema manifest no longer parses, so `team kill` can't find it) —
+  clean up containers/dirs by hand that one time. **NOT YET PROVEN LIVE:** next
+  team should show the reviewer actually reviewing (real verdict, not "can't
+  see sha") — that's the proof the loop closes end-to-end under the new
+  reviewer prompt.

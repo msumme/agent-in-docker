@@ -118,10 +118,26 @@ teams; fall back to hand-driving only to keep momentum.
   producer as beads; a stalled producer is detected and diagnosed.
   *Prototype:* host-side watchdog `/tmp/team_watch_6mq2.sh` (running now) detects
   done/stalled/review for the live team — informs the productized version.
-- [ ] **P4 — Persistent producer + ephemeral reviewer.** Producer suspends/
-  resumes via Claude session resume; review feedback injected into the same
-  session. Reviewer spawns fresh each round. *Test:* feedback round-trips into a
-  resumed producer context; reviewer is a new container each time.
+- [x] **P4 — Persistent producer + ephemeral reviewer (resume foundation).**
+  DONE, dogfooded by team `6mq-4`. `claude --continue` plumbing
+  (`StartAgentPayload.resume_session` → `AGENT_RESUME=1` → pure
+  `build_claude_args` adds `--continue` iff resume && long-running) + pure
+  `role_resume_policy` (producers → ResumeContext, all else → FreshContext),
+  wired into `team resume`; the misleading "prior state loaded" primer fixed.
+  16 new unit tests; host review APPROVE; merged + rebuilt. *Scoped out (folded
+  into Async+stacked-PRs):* orchestrator auto-respawning a fresh reviewer
+  CONTAINER per round mid-run (needs payload-building in the orchestrator
+  process). *Open:* real-container `--continue` fidelity is a manual smoke test
+  to run when suspend/resume is first exercised in anger (fallback: compacted
+  re-prime). **Dogfood find → `b4j` (below).**
+- [ ] **Bridge producer→reviewer clone (`b4j`, P1, FOUNDATIONAL).** Dogfooding
+  P4 exposed that the in-team review loop can't close under clone-per-agent:
+  the reviewer's isolated clone can't see the producer's commits ("can't reach
+  <sha>"). Host must sync producer→reviewer on a ReviewRequested handoff (fetch
+  producer clone → reviewer clone, hard-reset reviewer work_branch to producer
+  HEAD; reviewer never commits). Until this lands, every team needs host review;
+  after it, in-team peer review (with the new bug-focused reviewer prompt)
+  finally runs end-to-end. *Next.*
 - [x] **P5 — Cut the cruft (git_push + read_host_file only).** DONE (d28f36e),
   built autonomously by a team: removed the `git_push`/`read_host_file` MCP tools,
   handlers, permission checks, hardcoded denials, the team git_push auto-approve +
@@ -252,3 +268,17 @@ teams; fall back to hand-driving only to keep momentum.
   functioning — handoffs recorded, stall-detection running, no hand-watching
   needed. Remaining phases: Persistent producer / ephemeral reviewer; Async +
   stacked PRs; Formula dispatcher.
+
+- 2026-06-08 — **P4 shipped + reviewer prompt rewritten + bridge bug found.**
+  (1) Rewrote `roles/review-agent.md`: understanding-first (reconstruct intent→
+  mechanism→restate before judging), bug-hunt as the centerpiece (edge/boundary,
+  error/partial-failure, invariants, concurrency, lifecycle, contract drift,
+  test-actually-fails), principles summarized INLINE (no longer assumes `_meta`
+  is loaded — per user). (2) P4 dogfooded by team `6mq-4` (first team reviewed
+  under the new prompt — though see below): `--continue` resume plumbing + pure
+  `role_resume_policy`; host review APPROVE; merged, rebuilt, 148+ tests green;
+  ticket closed. (3) **Dogfood caught a foundational bug (`b4j`):** the in-team
+  review loop can't close because the reviewer's isolated clone can't see the
+  producer's commits — so the new reviewer prompt never actually ran. Host had
+  to be the review gate (subagent → build/test → merge). Next: build the
+  producer→reviewer clone bridge so peer review works end-to-end.

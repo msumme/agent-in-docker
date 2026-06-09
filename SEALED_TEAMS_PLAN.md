@@ -296,3 +296,20 @@ teams; fall back to hand-driving only to keep momentum.
   team should show the reviewer actually reviewing (real verdict, not "can't
   see sha") — that's the proof the loop closes end-to-end under the new
   reviewer prompt.
+
+- 2026-06-09 — **★ IN-TEAM REVIEW LOOP PROVEN LIVE.** Dogfooded the startup
+  reaper (`0fw.10`) as the proof run on the shared-clone binary. The loop
+  closed end-to-end for the first time: producer committed → **reviewer read
+  the producer's code in the shared /workspace** → filed a real, specific
+  blocker (`bem`: RealTicketStore mapped in_progress/blocked to Err instead of
+  Open) → producer fixed it (`636719e`) → reviewer re-reviewed → `verify=
+  approved`. Two real review rounds in supervisor.log (not the old "can't see
+  sha" churn). The new bug-focused reviewer prompt ran for the first time and
+  caught a genuine bug. **Independent host review AGREED with the in-team
+  reviewer's verdict** (safety-critical "never reap on uncertainty" invariant
+  holds on every path; 212 tests). Merged the reaper (TicketStore trait +
+  TeamManager::reap_orphaned + startup wiring, +280 lines), rebuilt, orchestrator
+  restarted — reaper now sweeps closed/missing-ticket orphans on startup. Also
+  cleaned 4 stale pre-P2 `.teams-worktrees/` (0fw-10/0fw-9/43t/805) that were
+  squatting on branch names and blocking the fetch. Net: the dogfooding loop is
+  now self-sustaining — the host shifts from re-reviewer toward integrator.

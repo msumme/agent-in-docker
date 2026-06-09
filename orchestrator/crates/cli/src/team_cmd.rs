@@ -1,12 +1,12 @@
 //! `agent team {spawn,suspend,resume,list,status,kill}` subcommand.
 //!
-//! Teams are provisioned via TeamManager (per-role git clones, manifest, state
-//! dirs) and then 3 containers are launched — each pointed at its own clone —
-//! with team-scoped state directories. Suspend and resume are container
-//! lifecycle operations over the same mounts — the per-agent state is already
-//! persisted on disk by virtue of being mounted from the host, so suspend =
-//! `podman rm -f` + manifest state update, and resume = relaunch with the
-//! same mounts.
+//! Teams are provisioned via TeamManager (one shared git clone per team,
+//! manifest, state dirs) and then 3 containers are launched — all pointed at
+//! the same clone (so the reviewer sees the producer's commits) with per-role
+//! state directories. Suspend and resume are container lifecycle operations
+//! over the same mounts — the per-agent state is already persisted on disk by
+//! virtue of being mounted from the host, so suspend = `podman rm -f` +
+//! manifest state update, and resume = relaunch with the same mounts.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};

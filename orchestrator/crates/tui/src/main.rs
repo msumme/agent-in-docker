@@ -64,6 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::new(orchestrator_core::team_manager::RealGitOps),
         );
         let _ = tm.load_from_disk();
+        let ticket_store = orchestrator_core::ticket_store::RealTicketStore;
+        let reaped = tm.reap_orphaned(&ticket_store);
+        if !reaped.is_empty() {
+            tracing::info!("startup reaper: reaped {} orphaned team(s): {:?}", reaped.len(), reaped);
+        }
         std::sync::Arc::new(std::sync::Mutex::new(tm))
     };
 

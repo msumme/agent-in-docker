@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ticket_store::{TicketStatus, TicketStore};
+
 /// Whether a resumed agent should reuse prior Claude conversation context or start fresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumePolicy {
@@ -435,6 +437,36 @@ impl TeamManager {
             let _ = std::fs::remove_dir_all(&team_dir);
         }
         Ok(())
+    }
+
+    /// Check every loaded team's ticket against the store; tear down teams whose
+    /// ticket is Closed or NotFound (archive=true). Teams with an Open ticket or
+    /// where the store returns Err are left untouched. Returns the reaped team ids.
+    pub fn reap_orphaned(&mut self, store: &dyn TicketStore) -> Vec<String> {
+        let snapshot: Vec<(String, String)> = self
+            .teams
+            .values()
+            .map(|t| (t.id.clone(), t.ticket_id.clone()))
+            .collect();
+
+        let mut reaped = Vec::new();
+        for (team_id, ticket_id) in snapshot {
+            match store.status(&ticket_id) {
+                Ok(TicketStatus::Closed) | Ok(TicketStatus::NotFound) => {
+                    if self.teardown(&team_id, true).is_ok() {
+                        reaped.push(team_id);
+                    }
+                }
+                Ok(TicketStatus::Open) => {}
+                Err(e) => {
+                    eprintln!(
+                        "warn: reap_orphaned skipping team {} (ticket {}): {}",
+                        team_id, ticket_id, e
+                    );
+                }
+            }
+        }
+        reaped
     }
 
     /// Record the open PR on the team manifest (called after gh_pr_create succeeds).
@@ -1283,5 +1315,140 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lookup = ManifestDirTeamLookup::new(tmp.path());
         assert!(lookup.team_for_agent("X").is_none());
+    }
+
+    // ── reap_orphaned tests ───────────────────────────────────────────────────
+
+    use crate::ticket_store::{TicketStatus, TicketStore};
+    use std::collections::HashMap as StoreMap;
+
+    struct FakeTicketStore {
+        /// ticket_id → result to return
+        responses: StoreMap<String, Result<TicketStatus, String>>,
+        default: Result<TicketStatus, String>,
+    }
+
+    impl FakeTicketStore {
+        fn new(default: Result<TicketStatus, String>) -> Self {
+            Self {
+                responses: StoreMap::new(),
+                default,
+            }
+        }
+
+        fn set(&mut self, ticket_id: &str, result: Result<TicketStatus, String>) {
+            self.responses.insert(ticket_id.to_string(), result);
+        }
+    }
+
+    impl TicketStore for FakeTicketStore {
+        fn status(&self, ticket_id: &str) -> Result<TicketStatus, String> {
+            match self.responses.get(ticket_id) {
+                Some(Ok(s)) => Ok(s.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => match &self.default {
+                    Ok(s) => Ok(s.clone()),
+                    Err(e) => Err(e.clone()),
+                },
+            }
+        }
+    }
+
+    fn seed_team(mgr: &mut TeamManager, ticket_id: &str) -> Team {
+        mgr.create_team(SpawnSpec {
+            ticket_id: ticket_id.to_string(),
+            base_branch: "main".into(),
+            roles: mvt_roles(),
+        })
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn reap_orphaned_reaps_closed_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        let closed_team = seed_team(&mut mgr, "closed-ticket");
+        let open_team = seed_team(&mut mgr, "open-ticket");
+
+        let mut store = FakeTicketStore::new(Ok(TicketStatus::Open));
+        store.set("closed-ticket", Ok(TicketStatus::Closed));
+
+        let reaped = mgr.reap_orphaned(&store);
+
+        assert_eq!(reaped, vec![closed_team.id.clone()]);
+        assert!(mgr.get(&closed_team.id).is_none(), "closed team must be gone");
+        assert!(mgr.get(&open_team.id).is_some(), "open team must remain");
+    }
+
+    #[test]
+    fn reap_orphaned_reaps_missing_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        let team = seed_team(&mut mgr, "missing-ticket");
+
+        let store = FakeTicketStore::new(Ok(TicketStatus::NotFound));
+        let reaped = mgr.reap_orphaned(&store);
+
+        assert_eq!(reaped, vec![team.id.clone()]);
+        assert!(mgr.get(&team.id).is_none(), "not-found team must be reaped");
+    }
+
+    #[test]
+    fn reap_orphaned_keeps_open_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        let team = seed_team(&mut mgr, "open-ticket");
+        let manifest_path = tmp
+            .path()
+            .join(".teams")
+            .join(&team.id)
+            .join("manifest.json");
+
+        let store = FakeTicketStore::new(Ok(TicketStatus::Open));
+        let reaped = mgr.reap_orphaned(&store);
+
+        assert!(reaped.is_empty(), "no teams should be reaped");
+        assert!(mgr.get(&team.id).is_some(), "open team must remain in memory");
+        assert!(manifest_path.exists(), "manifest must remain on disk");
+    }
+
+    #[test]
+    fn reap_orphaned_skips_on_store_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        let team = seed_team(&mut mgr, "error-ticket");
+
+        let store = FakeTicketStore::new(Err("bd unavailable".into()));
+        let reaped = mgr.reap_orphaned(&store);
+
+        assert!(reaped.is_empty(), "error must not cause reaping");
+        assert!(mgr.get(&team.id).is_some(), "team must survive store error");
+    }
+
+    #[test]
+    fn reap_orphaned_archives_not_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+
+        let team = seed_team(&mut mgr, "closed-archive-ticket");
+
+        let store = FakeTicketStore::new(Ok(TicketStatus::Closed));
+        mgr.reap_orphaned(&store);
+
+        let archive_path = tmp
+            .path()
+            .join(".teams")
+            .join("archive")
+            .join(&team.id);
+        assert!(
+            archive_path.exists(),
+            "reaped team must be under teams/archive/<id>; expected: {}",
+            archive_path.display()
+        );
     }
 }

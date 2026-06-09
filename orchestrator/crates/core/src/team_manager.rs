@@ -14,6 +14,24 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Whether a resumed agent should reuse prior Claude conversation context or start fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumePolicy {
+    /// Pass `--continue` so the agent resumes with its prior conversation intact.
+    ResumeContext,
+    /// Start without `--continue`; the agent reads fresh context from bd/git.
+    FreshContext,
+}
+
+/// Producers resume mid-implementation and benefit from prior context.
+/// Planners and reviewers are stateless by design and restart clean.
+pub fn role_resume_policy(role: &str) -> ResumePolicy {
+    match role {
+        "feature-producer" | "maintenance-producer" => ResumePolicy::ResumeContext,
+        _ => ResumePolicy::FreshContext,
+    }
+}
+
 /// Lifecycle state for a team. The state machine is:
 /// `Spawning → Active → Suspending → Suspended ⇄ Active → Completed | Failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1240,6 +1258,19 @@ mod tests {
         assert!(mgr2.load_from_disk().is_ok(), "should tolerate bad manifest");
         assert!(mgr2.get(&good_id).is_some(), "good team must be present");
         assert!(mgr2.get("bad").is_none(), "bad team must be absent");
+    }
+
+    #[test]
+    fn role_resume_policy_producers_get_resume_context() {
+        assert_eq!(role_resume_policy("feature-producer"), ResumePolicy::ResumeContext);
+        assert_eq!(role_resume_policy("maintenance-producer"), ResumePolicy::ResumeContext);
+    }
+
+    #[test]
+    fn role_resume_policy_non_producers_get_fresh_context() {
+        assert_eq!(role_resume_policy("review-agent"), ResumePolicy::FreshContext);
+        assert_eq!(role_resume_policy("planner"), ResumePolicy::FreshContext);
+        assert_eq!(role_resume_policy("unknown-role"), ResumePolicy::FreshContext);
     }
 
     #[test]

@@ -540,6 +540,7 @@ mod tests {
             extra_mounts: vec![],
             model: None,
             effort: None,
+            resume_session: false,
         }
     }
 

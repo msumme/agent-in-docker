@@ -1,15 +1,15 @@
 //! Team manager: groups agents into PR-scoped teams that own one bd ticket
-//! from spec to merge. Each team gets its own git clone per role, its own state
-//! directory, and three agents (planner / producer / reviewer). When the PR
-//! merges the team is destroyed; when the PR is awaiting humans the team
-//! self-suspends and can wake later.
+//! from spec to merge. Each team gets its own git clone (shared by all roles),
+//! its own state directory, and three agents (planner / producer / reviewer).
+//! When the PR merges the team is destroyed; when the PR is awaiting humans
+//! the team self-suspends and can wake later.
 //!
 //! This module is the lifecycle authority. Spawning/suspending/resuming a
 //! team is a single TeamManager call that drives clones, manifest, and
 //! container operations together. The injected traits (GitOps, ContainerOps,
 //! ShellOps) make every step testable without touching git or podman.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -61,8 +61,8 @@ pub struct Team {
     pub ticket_id: String,
     pub base_branch: String,
     pub work_branch: String,
-    /// Per-role clone paths on the host, under `.teams-clones/<team-id>/<role>/`.
-    pub clones: BTreeMap<String, PathBuf>,
+    /// Single shared clone path for all roles, under `.teams-clones/<team-id>/`.
+    pub clone_path: PathBuf,
     pub state: TeamState,
     pub agents: Vec<TeamAgent>,
     pub pr_url: Option<String>,
@@ -303,27 +303,23 @@ impl TeamManager {
         self.teams.get(id)
     }
 
-    /// Return the clone path on host for a given team's role, if known.
-    pub fn clone_path(&self, team_id: &str, role: &str) -> Option<&Path> {
-        self.teams.get(team_id)?.clones.get(role).map(|p| p.as_path())
+    /// Return the single shared clone path for a team, if known.
+    pub fn clone_path(&self, team_id: &str) -> Option<&Path> {
+        self.teams.get(team_id).map(|t| t.clone_path.as_path())
     }
 
-    /// Fetch the role's work branch from its clone into the canonical repo.
-    /// Returns Err for unknown team or role.
-    pub fn fetch_role_branch(&self, team_id: &str, role: &str) -> Result<(), String> {
+    /// Fetch the team's work branch from its shared clone into the canonical repo.
+    /// Returns Err for unknown team.
+    pub fn fetch_team_branch(&self, team_id: &str) -> Result<(), String> {
         let team = self
             .teams
             .get(team_id)
             .ok_or_else(|| format!("team '{}' not found", team_id))?;
-        let clone = team
-            .clones
-            .get(role)
-            .ok_or_else(|| format!("no clone for role '{}' in team '{}'", role, team_id))?;
         self.git
-            .fetch_branch(&self.project_root, clone, &team.work_branch)
+            .fetch_branch(&self.project_root, &team.clone_path, &team.work_branch)
     }
 
-    /// Provision one clone per role, set up state directories, write the manifest.
+    /// Provision one shared clone for the team, set up state directories, write the manifest.
     /// Does not start containers — the caller (CLI) does that, because spawning
     /// containers is wired through the existing run-agent flow.
     pub fn create_team(&mut self, spec: SpawnSpec) -> Result<&Team, String> {
@@ -337,19 +333,14 @@ impl TeamManager {
         std::fs::create_dir_all(&self.clones_dir)
             .map_err(|e| format!("create clones dir: {}", e))?;
 
-        let mut clones: BTreeMap<String, PathBuf> = BTreeMap::new();
-
-        for (role, _short) in &spec.roles {
-            let clone_path = self.clones_dir.join(&id).join(role);
-            if clone_path.exists() {
-                std::fs::remove_dir_all(&clone_path)
-                    .map_err(|e| format!("remove stale clone {}: {}", clone_path.display(), e))?;
-            }
-            self.git.clone_local(&self.project_root, &clone_path)?;
-            self.git
-                .checkout_new_branch(&clone_path, &work_branch, &spec.base_branch)?;
-            clones.insert(role.clone(), clone_path);
+        let clone_path = self.clones_dir.join(&id);
+        if clone_path.exists() {
+            std::fs::remove_dir_all(&clone_path)
+                .map_err(|e| format!("remove stale clone {}: {}", clone_path.display(), e))?;
         }
+        self.git.clone_local(&self.project_root, &clone_path)?;
+        self.git
+            .checkout_new_branch(&clone_path, &work_branch, &spec.base_branch)?;
 
         let agents: Vec<TeamAgent> = spec
             .roles
@@ -373,7 +364,7 @@ impl TeamManager {
             ticket_id: spec.ticket_id,
             base_branch: spec.base_branch,
             work_branch,
-            clones,
+            clone_path,
             state: TeamState::Spawning,
             agents,
             pr_url: None,
@@ -421,7 +412,7 @@ impl TeamManager {
         self.write_manifest(&snapshot)
     }
 
-    /// Tear down all per-role clone directories and archive the manifest. Used
+    /// Tear down the shared clone directory and archive the manifest. Used
     /// by both Completed (PR merged) and Failed (operator killed) transitions.
     pub fn teardown(&mut self, id: &str, archive: bool) -> Result<(), String> {
         let team = self
@@ -429,9 +420,7 @@ impl TeamManager {
             .remove(id)
             .ok_or_else(|| format!("team '{}' not found", id))?;
 
-        for (_role, clone_path) in &team.clones {
-            let _ = std::fs::remove_dir_all(clone_path);
-        }
+        let _ = std::fs::remove_dir_all(&team.clone_path);
 
         self.git
             .branch_delete(&self.project_root, &team.work_branch);
@@ -492,15 +481,13 @@ impl TeamManager {
             });
             let reviewer = team.agents.iter().find(|a| a.role == "review-agent");
             if let (Some(prod), Some(rev)) = (producer, reviewer) {
-                if let Some(clone_path) = team.clones.get(&prod.role) {
-                    result.push((
-                        team.id.clone(),
-                        team.ticket_id.clone(),
-                        prod.name.clone(),
-                        clone_path.clone(),
-                        rev.name.clone(),
-                    ));
-                }
+                result.push((
+                    team.id.clone(),
+                    team.ticket_id.clone(),
+                    prod.name.clone(),
+                    team.clone_path.clone(),
+                    rev.name.clone(),
+                ));
             }
         }
         result
@@ -656,7 +643,7 @@ mod tests {
             "ticket_id": "ticket-1",
             "base_branch": "main",
             "work_branch": work_branch,
-            "clones": {"feature-producer": "/tmp/fake-clone"},
+            "clone_path": "/tmp/fake-clone",
             "state": "active",
             "agents": [{"role": "feature-producer", "name": agent_name}],
             "pr_url": null,
@@ -672,10 +659,10 @@ mod tests {
         .unwrap();
     }
 
-    // ── new spec tests ────────────────────────────────────────────────────────
+    // ── spec tests ────────────────────────────────────────────────────────────
 
     #[test]
-    fn create_team_provisions_one_clone_per_role() {
+    fn create_team_makes_exactly_one_clone_regardless_of_role_count() {
         let tmp = tempfile::tempdir().unwrap();
         let git = FakeGit::new();
         let calls = git.calls_arc();
@@ -700,117 +687,134 @@ mod tests {
             .filter(|c| c.starts_with("checkout_new_branch"))
             .collect();
 
-        // Exactly 3 clone_local + 3 checkout_new_branch, one per role
-        assert_eq!(clone_calls.len(), 3, "must have 3 clone_local calls, got: {:?}", all_calls);
-        assert_eq!(
-            checkout_calls.len(),
-            3,
-            "must have 3 checkout_new_branch calls, got: {:?}",
-            all_calls
-        );
+        assert_eq!(clone_calls.len(), 1, "must have exactly 1 clone_local call; got: {:?}", all_calls);
+        assert_eq!(checkout_calls.len(), 1, "must have exactly 1 checkout_new_branch call; got: {:?}", all_calls);
 
-        // Each clone_local dest is under .teams-clones/<id>/<role>
-        let base = tmp.path().join(".teams-clones").join(&team.id);
-        for role in &["planner", "feature-producer", "review-agent"] {
-            let expected = base.join(role).display().to_string();
-            assert!(
-                clone_calls.iter().any(|c| c.contains(&expected)),
-                "missing clone_local for role {} (expected dest {})",
-                role,
-                expected
-            );
-        }
-
-        // No worktree_add calls
+        let expected_dest = tmp.path().join(".teams-clones").join(&team.id).display().to_string();
         assert!(
-            !all_calls.iter().any(|c| c.starts_with("add ")),
-            "no worktree_add expected; got: {:?}",
-            all_calls
+            clone_calls[0].contains(&expected_dest),
+            "clone_local dest must be .teams-clones/<team-id>/; got: {}",
+            clone_calls[0]
+        );
+        assert!(
+            checkout_calls[0].contains(&expected_dest),
+            "checkout_new_branch repo must be .teams-clones/<team-id>/; got: {}",
+            checkout_calls[0]
         );
 
-        // All checkout_new_branch calls use the work branch off main
-        for c in &checkout_calls {
-            assert!(
-                c.contains(&format!("branch={}", team.work_branch)),
-                "checkout must use work_branch; got: {}",
-                c
-            );
-            assert!(c.contains("base=main"), "checkout must use base=main; got: {}", c);
-        }
+        assert!(
+            checkout_calls[0].contains(&format!("branch={}", team.work_branch)),
+            "checkout must use work_branch; got: {}",
+            checkout_calls[0]
+        );
+        assert!(
+            checkout_calls[0].contains("base=main"),
+            "checkout must use base=main; got: {}",
+            checkout_calls[0]
+        );
     }
 
     #[test]
-    fn create_team_writes_clone_paths_into_manifest() {
+    fn clone_path_returns_team_clone_path() {
         let tmp = tempfile::tempdir().unwrap();
         let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
         let team = mgr
             .create_team(SpawnSpec {
-                ticket_id: "manifest-test".into(),
+                ticket_id: "cp-test".into(),
                 base_branch: "main".into(),
                 roles: mvt_roles(),
             })
             .unwrap()
             .clone();
 
-        // Reload from disk to verify manifest persisted the clones map
-        let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
-        mgr2.load_from_disk().unwrap();
-        let reloaded = mgr2.get(&team.id).unwrap();
+        let expected = tmp.path().join(".teams-clones").join(&team.id);
+        let via_accessor = mgr.clone_path(&team.id).expect("clone_path must return Some");
+        assert_eq!(via_accessor, expected.as_path());
+    }
 
-        assert_eq!(reloaded.clones.len(), 3, "clones map must have one entry per role");
-        for role in &["planner", "feature-producer", "review-agent"] {
-            assert!(
-                reloaded.clones.contains_key(*role),
-                "clones map must contain role {}",
-                role
-            );
-        }
+    #[test]
+    fn all_agents_resolve_to_one_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        let team = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "agents-path-test".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
 
-        // clone_path accessor returns each entry
-        for role in &["planner", "feature-producer", "review-agent"] {
-            let via_accessor = mgr2.clone_path(&team.id, role);
-            assert!(via_accessor.is_some(), "clone_path must return Some for {}", role);
+        let path = mgr.clone_path(&team.id).expect("clone_path must return Some");
+        for agent in &team.agents {
+            let agent_path = mgr.clone_path(&team.id).expect("clone_path must return Some for any agent");
             assert_eq!(
-                via_accessor.unwrap(),
-                reloaded.clones[*role].as_path(),
-                "clone_path must match clones map for {}",
-                role
+                agent_path, path,
+                "all agents must resolve to the same clone path (agent: {})",
+                agent.role
             );
         }
     }
 
     #[test]
-    fn create_team_cleans_stale_clone_dir() {
+    fn fetch_team_branch_uses_single_team_clone() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        let git = FakeGit::new();
+        let calls = git.calls_arc();
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(git));
 
-        // Pre-create the planner clone dir with a sentinel file
-        let id_str = team_id("stale-test");
-        let stale_dir = tmp
-            .path()
-            .join(".teams-clones")
-            .join(&id_str)
-            .join("planner");
-        std::fs::create_dir_all(&stale_dir).unwrap();
-        let sentinel = stale_dir.join("SENTINEL");
-        std::fs::write(&sentinel, "stale").unwrap();
-        assert!(sentinel.exists(), "sentinel must exist before create_team");
+        let team = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "fetch-test".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
 
-        mgr.create_team(SpawnSpec {
-            ticket_id: "stale-test".into(),
-            base_branch: "main".into(),
-            roles: mvt_roles(),
-        })
-        .unwrap();
+        calls.lock().unwrap().clear();
+
+        mgr.fetch_team_branch(&team.id).unwrap();
+
+        let all_calls = recorded(&calls);
+        let fetch_calls: Vec<_> = all_calls
+            .iter()
+            .filter(|c| c.starts_with("fetch_branch"))
+            .collect();
+        assert_eq!(fetch_calls.len(), 1, "must record exactly one fetch_branch call");
+
+        let expected_canonical = tmp.path().display().to_string();
+        let expected_src = team.clone_path.display().to_string();
 
         assert!(
-            !sentinel.exists(),
-            "sentinel must be removed before re-cloning"
+            fetch_calls[0].contains(&format!("canonical={}", expected_canonical)),
+            "fetch_branch must use project_root as canonical; got: {}",
+            fetch_calls[0]
+        );
+        assert!(
+            fetch_calls[0].contains(&format!("src={}", expected_src)),
+            "fetch_branch must use team clone as src; got: {}",
+            fetch_calls[0]
+        );
+        assert!(
+            fetch_calls[0].contains(&format!("branch={}", team.work_branch)),
+            "fetch_branch must use work_branch; got: {}",
+            fetch_calls[0]
         );
     }
 
     #[test]
-    fn teardown_removes_every_clone_dir_and_branch() {
+    fn fetch_team_branch_unknown_team_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        assert!(
+            mgr.fetch_team_branch("no-such-team").is_err(),
+            "unknown team must return Err"
+        );
+    }
+
+    #[test]
+    fn teardown_removes_single_clone_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let git = FakeGit::new();
         let calls = git.calls_arc();
@@ -825,29 +829,24 @@ mod tests {
             .unwrap()
             .clone();
 
-        // Verify clone dirs exist after creation (FakeGit::clone_local creates them)
-        for (_role, path) in &team.clones {
-            assert!(path.exists(), "clone dir must exist before teardown: {}", path.display());
-        }
+        assert!(
+            team.clone_path.exists(),
+            "clone dir must exist before teardown: {}",
+            team.clone_path.display()
+        );
 
-        let clone_paths: Vec<PathBuf> = team.clones.values().cloned().collect();
+        let clone_path = team.clone_path.clone();
         let work_branch = team.work_branch.clone();
 
-        // Reset call log before teardown so we isolate teardown calls
         calls.lock().unwrap().clear();
-
         mgr.teardown(&team.id, false).unwrap();
 
-        // Every clone dir is gone
-        for path in &clone_paths {
-            assert!(
-                !path.exists(),
-                "clone dir must be removed after teardown: {}",
-                path.display()
-            );
-        }
+        assert!(
+            !clone_path.exists(),
+            "clone dir must be removed after teardown: {}",
+            clone_path.display()
+        );
 
-        // Exactly one branch_delete for the work branch
         let all_calls = recorded(&calls);
         let branch_deletes: Vec<_> = all_calls
             .iter()
@@ -868,68 +867,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_role_branch_uses_fixed_refspec() {
+    fn manifest_round_trips_single_clone_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let git = FakeGit::new();
-        let calls = git.calls_arc();
-        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(git));
-
-        let team = mgr
-            .create_team(SpawnSpec {
-                ticket_id: "fetch-test".into(),
-                base_branch: "main".into(),
-                roles: mvt_roles(),
-            })
-            .unwrap()
-            .clone();
-
-        // Clear create_team calls
-        calls.lock().unwrap().clear();
-
-        mgr.fetch_role_branch(&team.id, "planner").unwrap();
-
-        let all_calls = recorded(&calls);
-        let fetch_calls: Vec<_> = all_calls
-            .iter()
-            .filter(|c| c.starts_with("fetch_branch"))
-            .collect();
-        assert_eq!(fetch_calls.len(), 1, "must record exactly one fetch_branch call");
-
-        let expected_canonical = tmp.path().display().to_string();
-        let expected_src = team.clones["planner"].display().to_string();
-
-        assert!(
-            fetch_calls[0].contains(&format!("canonical={}", expected_canonical)),
-            "fetch_branch must use project_root as canonical; got: {}",
-            fetch_calls[0]
-        );
-        assert!(
-            fetch_calls[0].contains(&format!("src={}", expected_src)),
-            "fetch_branch must use planner clone as src; got: {}",
-            fetch_calls[0]
-        );
-        assert!(
-            fetch_calls[0].contains(&format!("branch={}", team.work_branch)),
-            "fetch_branch must use work_branch; got: {}",
-            fetch_calls[0]
-        );
-
-        // Unknown team returns Err
-        assert!(
-            mgr.fetch_role_branch("no-such-team", "planner").is_err(),
-            "unknown team must return Err"
-        );
-        // Unknown role returns Err
-        assert!(
-            mgr.fetch_role_branch(&team.id, "no-such-role").is_err(),
-            "unknown role must return Err"
-        );
-    }
-
-    #[test]
-    fn load_from_disk_round_trips_clones_map() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (team_id_str, clones_snapshot) = {
+        let (team_id_str, original_clone_path) = {
             let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
             let team = mgr
                 .create_team(SpawnSpec {
@@ -939,56 +879,65 @@ mod tests {
                 })
                 .unwrap()
                 .clone();
-            (team.id.clone(), team.clones.clone())
+            (team.id.clone(), team.clone_path.clone())
         };
         let mut mgr2 = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
         mgr2.load_from_disk().unwrap();
         let reloaded = mgr2.get(&team_id_str).unwrap();
         assert_eq!(
-            reloaded.clones, clones_snapshot,
-            "clones map must survive disk round-trip"
+            reloaded.clone_path, original_clone_path,
+            "clone_path must survive disk round-trip"
         );
     }
 
-    // ── existing tests (updated for new manifest schema) ─────────────────────
-
     #[test]
-    fn manifest_dir_lookup_finds_agent() {
+    fn active_producer_agents_returns_team_clone_path() {
         let tmp = tempfile::tempdir().unwrap();
-        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
-        let lookup = ManifestDirTeamLookup::new(tmp.path());
-        let hit = lookup.team_for_agent("X").expect("X must be found");
-        assert_eq!(hit.team_id, "foo");
-        assert_eq!(hit.work_branch, "feat/x");
-        assert!(lookup.team_for_agent("Y").is_none());
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
+        let team = mgr
+            .create_team(SpawnSpec {
+                ticket_id: "watchdog-test".into(),
+                base_branch: "main".into(),
+                roles: mvt_roles(),
+            })
+            .unwrap()
+            .clone();
+        mgr.mark_active(&team.id).unwrap();
+
+        let entries = mgr.active_producer_agents();
+        assert_eq!(entries.len(), 1, "must have one entry for the producer");
+        let (_, _, _, path, _) = &entries[0];
+        assert_eq!(
+            path, &team.clone_path,
+            "active_producer_agents must report the single team clone path"
+        );
     }
 
-    #[test]
-    fn manifest_dir_lookup_fresh_read_across_calls() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
-        let lookup = ManifestDirTeamLookup::new(tmp.path());
-        assert!(lookup.team_for_agent("Y").is_none());
-        // Add a second manifest and confirm it's visible on the next call.
-        write_minimal_manifest(tmp.path(), "bar", "feat/y", "Y");
-        let hit = lookup
-            .team_for_agent("Y")
-            .expect("Y must be found after second manifest");
-        assert_eq!(hit.team_id, "bar");
-        assert_eq!(hit.work_branch, "feat/y");
-    }
+    // ── existing tests (updated for single-clone shape) ───────────────────────
 
     #[test]
-    fn manifest_dir_lookup_missing_dir_returns_none() {
+    fn create_team_cleans_stale_clone_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let lookup = ManifestDirTeamLookup::new(tmp.path());
-        assert!(lookup.team_for_agent("X").is_none());
-    }
+        let mut mgr = TeamManager::new(tmp.path().into(), Box::new(FakeGit::new()));
 
-    #[test]
-    fn team_id_sanitizes_dots() {
-        assert_eq!(team_id("agent-in-docker-0fw.2"), "t-agent-in-docker-0fw-2");
-        assert_eq!(team_id("simple-1"), "t-simple-1");
+        let id_str = team_id("stale-test");
+        let stale_dir = tmp.path().join(".teams-clones").join(&id_str);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        let sentinel = stale_dir.join("SENTINEL");
+        std::fs::write(&sentinel, "stale").unwrap();
+        assert!(sentinel.exists(), "sentinel must exist before create_team");
+
+        mgr.create_team(SpawnSpec {
+            ticket_id: "stale-test".into(),
+            base_branch: "main".into(),
+            roles: mvt_roles(),
+        })
+        .unwrap();
+
+        assert!(
+            !sentinel.exists(),
+            "sentinel must be removed before re-cloning"
+        );
     }
 
     #[test]
@@ -1009,9 +958,14 @@ mod tests {
         assert_eq!(team.state, TeamState::Spawning);
         assert_eq!(team.work_branch, "t-agent-in-docker-0fw-2/code");
         assert_eq!(team.agents.len(), 3);
-        assert_eq!(team.clones.len(), 3, "must have one clone per role");
 
-        // Manifest written.
+        let expected_clone = tmp
+            .path()
+            .join(".teams-clones")
+            .join(&team.id);
+        assert_eq!(team.clone_path, expected_clone, "clone_path must be .teams-clones/<id>/");
+        assert!(team.clone_path.is_dir(), "clone dir must exist");
+
         let manifest_path = tmp
             .path()
             .join(".teams")
@@ -1019,7 +973,6 @@ mod tests {
             .join("manifest.json");
         assert!(manifest_path.is_file(), "manifest must be written");
 
-        // Per-role state dirs exist.
         for agent in &team.agents {
             assert!(tmp
                 .path()
@@ -1027,11 +980,6 @@ mod tests {
                 .join(&team.id)
                 .join(&agent.role)
                 .is_dir());
-        }
-
-        // Clone dirs were provisioned (FakeGit creates them).
-        for (_role, clone_path) in &team.clones {
-            assert!(clone_path.is_dir(), "clone dir must exist: {}", clone_path.display());
         }
     }
 
@@ -1249,7 +1197,6 @@ mod tests {
             .id
             .clone()
         };
-        // Write a syntactically invalid JSON manifest in a sibling directory.
         let bad_dir = tmp.path().join(".teams").join("bad");
         std::fs::create_dir_all(&bad_dir).unwrap();
         std::fs::write(bad_dir.join("manifest.json"), b"not json").unwrap();
@@ -1287,7 +1234,6 @@ mod tests {
             .id
             .clone()
         };
-        // Write a valid JSON object that fails typed deserialization (missing required fields).
         let bad_dir = tmp.path().join(".teams").join("incomplete");
         std::fs::create_dir_all(&bad_dir).unwrap();
         std::fs::write(bad_dir.join("manifest.json"), b"{}").unwrap();
@@ -1299,5 +1245,43 @@ mod tests {
         );
         assert!(mgr2.get(&good_id).is_some(), "good team must be present");
         assert!(mgr2.get("incomplete").is_none(), "incomplete team must be absent");
+    }
+
+    #[test]
+    fn team_id_sanitizes_dots() {
+        assert_eq!(team_id("agent-in-docker-0fw.2"), "t-agent-in-docker-0fw-2");
+        assert_eq!(team_id("simple-1"), "t-simple-1");
+    }
+
+    #[test]
+    fn manifest_dir_lookup_finds_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        let hit = lookup.team_for_agent("X").expect("X must be found");
+        assert_eq!(hit.team_id, "foo");
+        assert_eq!(hit.work_branch, "feat/x");
+        assert!(lookup.team_for_agent("Y").is_none());
+    }
+
+    #[test]
+    fn manifest_dir_lookup_fresh_read_across_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_minimal_manifest(tmp.path(), "foo", "feat/x", "X");
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        assert!(lookup.team_for_agent("Y").is_none());
+        write_minimal_manifest(tmp.path(), "bar", "feat/y", "Y");
+        let hit = lookup
+            .team_for_agent("Y")
+            .expect("Y must be found after second manifest");
+        assert_eq!(hit.team_id, "bar");
+        assert_eq!(hit.work_branch, "feat/y");
+    }
+
+    #[test]
+    fn manifest_dir_lookup_missing_dir_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lookup = ManifestDirTeamLookup::new(tmp.path());
+        assert!(lookup.team_for_agent("X").is_none());
     }
 }

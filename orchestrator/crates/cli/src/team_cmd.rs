@@ -135,22 +135,15 @@ pub fn cmd_list(cfg: &Config) -> Result<()> {
     }
     println!(
         "{:<32} {:<10} {:<28} {}",
-        "TEAM", "STATE", "TICKET", "CLONES DIR"
+        "TEAM", "STATE", "TICKET", "CLONE"
     );
     for t in teams {
-        let clones_dir = t
-            .clones
-            .values()
-            .next()
-            .and_then(|p| p.parent())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "none".to_string());
         println!(
             "{:<32} {:<10} {:<28} {}",
             t.id,
             format!("{:?}", t.state).to_lowercase(),
             t.ticket_id,
-            clones_dir
+            t.clone_path.display()
         );
     }
     Ok(())
@@ -174,10 +167,7 @@ pub fn cmd_status(cfg: &Config, team_id: &str) -> Result<()> {
     if let Some(url) = &team.pr_url {
         println!("pr:           {}", url);
     }
-    println!("clones:");
-    for (role, path) in &team.clones {
-        println!("  {:<24} {}", role, path.display());
-    }
+    println!("clone:        {}", team.clone_path.display());
     println!("agents:");
     for a in &team.agents {
         println!("  {:<6} {}", a.role, a.name);
@@ -332,9 +322,7 @@ pub fn cmd_spawn(
         .clone();
 
     println!("==> Team {}", team.id);
-    for (role, path) in &team.clones {
-        println!("    clone[{}]: {}", role, path.display());
-    }
+    println!("    clone:     {}", team.clone_path.display());
     println!("    branch:    {} (from {})", team.work_branch, team.base_branch);
 
     // Per-agent state under .teams/<id>/<role>/.claude/. Seed each fresh
@@ -359,8 +347,8 @@ pub fn cmd_spawn(
         let initial_prompt = build_initial_prompt(&team.id, &team.ticket_id, &agent.role);
 
         let clone_path = mgr
-            .clone_path(&team.id, &agent.role)
-            .ok_or_else(|| anyhow::anyhow!("no clone for role {}", agent.role))?
+            .clone_path(&team.id)
+            .ok_or_else(|| anyhow::anyhow!("no clone for team {}", team.id))?
             .to_path_buf();
 
         let payload = build_payload_for_team_agent(
@@ -475,8 +463,8 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
         let resume_session = compute_resume_session(&agent.role, true);
 
         let clone_path = mgr
-            .clone_path(&team.id, &agent.role)
-            .ok_or_else(|| anyhow::anyhow!("no clone for role {}", agent.role))?
+            .clone_path(&team.id)
+            .ok_or_else(|| anyhow::anyhow!("no clone for team {}", team.id))?
             .to_path_buf();
 
         let payload = build_payload_for_team_agent(
@@ -515,13 +503,9 @@ pub fn cmd_integrate(cfg: &Config, team_id: &str, merge: bool) -> Result<()> {
         .get(team_id)
         .ok_or_else(|| anyhow::anyhow!("team '{}' not found", team_id))?;
 
-    // Fetch the producer's branch from their clone into the canonical repo.
-    for producer_role in &["feature-producer", "maintenance-producer"] {
-        if team.agents.iter().any(|a| &a.role == producer_role) {
-            mgr.fetch_role_branch(team_id, producer_role)
-                .map_err(|e| anyhow::anyhow!("fetch {} branch: {}", producer_role, e))?;
-        }
-    }
+    // Fetch the team's work branch from the shared clone into the canonical repo.
+    mgr.fetch_team_branch(team_id)
+        .map_err(|e| anyhow::anyhow!("fetch team branch: {}", e))?;
 
     let spec = IntegrateSpec {
         team_id: team.id.clone(),

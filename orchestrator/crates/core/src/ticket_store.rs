@@ -43,8 +43,65 @@ impl TicketStore for RealTicketStore {
 
         match status {
             "closed" => Ok(TicketStatus::Closed),
-            "open" => Ok(TicketStatus::Open),
+            "open" | "in_progress" | "blocked" => Ok(TicketStatus::Open),
             other => Err(format!("bd show {}: unexpected status {:?}", ticket_id, other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_fake_bd(json_status: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bd");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '[{{\"status\":\"{}\"}}]'\n", json_status),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    fn with_fake_bd<T>(dir: &tempfile::TempDir, f: impl FnOnce() -> T) -> T {
+        let _guard = PATH_MUTEX.lock().unwrap();
+        let original = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: single-threaded via PATH_MUTEX
+        unsafe { std::env::set_var("PATH", format!("{}:{}", dir.path().display(), original)) };
+        let result = f();
+        unsafe { std::env::set_var("PATH", original) };
+        result
+    }
+
+    #[test]
+    fn in_progress_maps_to_open() {
+        let dir = make_fake_bd("in_progress");
+        let store = RealTicketStore;
+        let result = with_fake_bd(&dir, || store.status("some-ticket"));
+        assert_eq!(result.unwrap(), TicketStatus::Open);
+    }
+
+    #[test]
+    fn blocked_maps_to_open() {
+        let dir = make_fake_bd("blocked");
+        let store = RealTicketStore;
+        let result = with_fake_bd(&dir, || store.status("some-ticket"));
+        assert_eq!(result.unwrap(), TicketStatus::Open);
+    }
+
+    #[test]
+    fn closed_maps_to_closed() {
+        let dir = make_fake_bd("closed");
+        let store = RealTicketStore;
+        let result = with_fake_bd(&dir, || store.status("some-ticket"));
+        assert_eq!(result.unwrap(), TicketStatus::Closed);
     }
 }

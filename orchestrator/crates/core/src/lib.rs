@@ -10,4 +10,5 @@ pub mod server;
 pub mod stall_watchdog;
 pub mod supervisor;
 pub mod team_manager;
+pub mod ticket_store;
 pub mod types;

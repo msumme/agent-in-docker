@@ -8,9 +8,3 @@ capabilities:
   message_agents: true
   gh_pr_create: false
   gh_pr_view: true
-
-message_agents_roles:
-  - "planner"
-  - "review-agent"
-  - "feature-producer"
-  - "maintenance-producer"

@@ -58,11 +58,11 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum TeamAction {
-    /// Spawn a team for a bd ticket (provisions worktree + 3 agents)
+    /// Spawn a team for a bd ticket (provisions a shared clone + 3 agents)
     Spawn {
         /// bd ticket id (e.g. agent-in-docker-0fw.2)
         ticket_id: String,
-        /// Base branch the team's worktree branches from
+        /// Base branch for the team's work branch
         #[arg(long, default_value = "main")]
         base: String,
         /// Use maintenance-producer instead of feature-producer
@@ -94,7 +94,7 @@ enum TeamAction {
         #[arg(long)]
         merge: bool,
     },
-    /// Force-teardown a team (containers gone, worktree removed, manifest archived/deleted)
+    /// Force-teardown a team (containers gone, clone dir removed, manifest archived/deleted)
     Kill {
         team_id: String,
         /// Skip archive — delete the team dir entirely

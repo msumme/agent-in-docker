@@ -313,3 +313,18 @@ teams; fall back to hand-driving only to keep momentum.
   cleaned 4 stale pre-P2 `.teams-worktrees/` (0fw-10/0fw-9/43t/805) that were
   squatting on branch names and blocking the fetch. Net: the dogfooding loop is
   now self-sustaining — the host shifts from re-reviewer toward integrator.
+
+- 2026-06-10 — **First PR-based integration (drift/cruft cleanup), dogfooded.**
+  Architecture-audit cleanup shipped as PR #6 (merged): removed inert
+  agent-facing team_* MCP tools + TeamOps/NoOpTeamOps, dropped vestigial
+  Config.entrypoint, repointed Config.containerfile→Containerfile.base, removed
+  unused message_agents_roles, fixed stale shared-clone doc comments (10 files,
+  +33/-435). Two teams built it on a `cleanup/drift-cruft` branch; each
+  host-reviewed; merged into the branch (NOT main); pushed local main (37
+  commits of session work) → origin; opened + merged the PR. 1id's in-team loop
+  closed cleanly (3rd live proof). **New lesson: the podman machine (3.7 GiB)
+  OOMs with two teams in parallel — run teams SEQUENTIALLY.** Also: don't
+  `team kill` before integrate lands (it branch -D's the work). Wrote
+  ARCHITECTURE.md (untracked, repo root) mapping the codebase. Open follow-ups:
+  producer primer still cites removed read_host_file tool; wire-vs-keep-deleted
+  for agent-driven team tools (kept deleted for now).

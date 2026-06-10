@@ -5,8 +5,6 @@ use std::collections::HashMap;
 pub struct Role {
     pub name: String,
     pub capabilities: HashMap<String, bool>,
-    #[serde(default)]
-    pub message_agents_roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,7 +84,6 @@ mod tests {
                 ("user_prompt".into(), true),
             ]
             .into(),
-            message_agents_roles: vec![],
         }
     }
 
@@ -94,7 +91,6 @@ mod tests {
         Role {
             name: "pr-agent".into(),
             capabilities: [("gh_pr_create".into(), true)].into(),
-            message_agents_roles: vec![],
         }
     }
 
@@ -160,17 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn role_construction_without_removed_fields() {
-        let role = Role {
-            name: "test".into(),
-            capabilities: [("user_prompt".into(), true)].into(),
-            message_agents_roles: vec!["review-agent".into()],
-        };
-        let mut checker = PermissionChecker::new();
-        checker.add_role(role);
-        assert_eq!(
-            checker.check_capability("test", "user_prompt"),
-            PermissionResult::NeedsApproval
-        );
+    fn role_yaml_without_message_agents_roles_deserializes() {
+        let yaml = "name: test\ncapabilities:\n  user_prompt: true\n";
+        let role: Role = serde_yaml::from_str(yaml).expect("deserialization failed");
+        assert_eq!(role.name, "test");
+        assert_eq!(role.capabilities.get("user_prompt"), Some(&true));
     }
 }

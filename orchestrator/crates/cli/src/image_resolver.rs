@@ -128,16 +128,9 @@ fn podman_build(containerfile: &Path, tag: &str, context: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The bundled `Containerfile.base` lives next to this CLI's source repo.
-/// `cfg.containerfile` was historically the discovery sentinel and points at
-/// the agent-in-docker repo's `Containerfile`; we resolve `Containerfile.base`
-/// alongside it.
+/// `cfg.containerfile` is the bundled `Containerfile.base`; return it directly.
 fn bundled_base_containerfile(cfg: &Config) -> Result<PathBuf> {
-    let dir = cfg
-        .containerfile
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("cfg.containerfile has no parent"))?;
-    let base = dir.join("Containerfile.base");
+    let base = cfg.containerfile.clone();
     if !base.is_file() {
         bail!(
             "bundled base Containerfile not found at {}",
@@ -181,8 +174,7 @@ mod tests {
             seed_dir: project_root.join(".claude-container"),
             agents_dir: project_root.join(".agents"),
             orchestrator_bin: PathBuf::from("/bogus/orchestrator"),
-            containerfile: project_root.join("Containerfile"),
-            entrypoint: PathBuf::from("/bogus/entrypoint"),
+            containerfile: project_root.join("Containerfile.base"),
             orchestrator_port: 9800,
             mcp_port: 9801,
             image_name: "ignored".into(),
@@ -239,5 +231,15 @@ mod tests {
         assert_eq!(project_slug(Path::new("/foo/My Project_1.0")), "my-project-1-0");
         assert_eq!(project_slug(Path::new("/foo/-leading-hyphen-")), "leading-hyphen");
         assert_eq!(project_slug(Path::new("/")), "project");
+    }
+
+    #[test]
+    fn bundled_base_returns_containerfile_base() {
+        let tmp = TempDir::new().unwrap();
+        let base_path = tmp.path().join("Containerfile.base");
+        fs::write(&base_path, "FROM scratch").unwrap();
+        let cfg = cfg_with(tmp.path().to_path_buf());
+        let result = bundled_base_containerfile(&cfg).unwrap();
+        assert_eq!(result.file_name().unwrap(), "Containerfile.base");
     }
 }

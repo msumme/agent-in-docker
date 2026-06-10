@@ -3,9 +3,3 @@ capabilities:
   user_prompt: true
   discover_agents: true
   message_agents: true
-
-message_agents_roles:
-  - "feature-producer"
-  - "maintenance-producer"
-  - "review-agent"
-  - "planner"

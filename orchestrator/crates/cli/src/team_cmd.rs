@@ -224,7 +224,7 @@ fn build_payload_for_team_agent(
     let (model_override, effort_override) = role_model_effort(agent_role);
     let resolved = image_resolver::resolve(cfg, agent_role);
     image_resolver::ensure_image(cfg, &resolved)?;
-    let bundled_roles = cfg.project_root.join("roles");
+    let bundled_roles = cfg.home_root.join("roles");
     let role_prompt_text = match project_config::resolve_role_prompt(
         agent_role,
         clone_path,
@@ -271,10 +271,41 @@ fn build_payload_for_team_agent(
     })
 }
 
+/// The repo's integration branch to fork work from: `origin/HEAD` if a remote
+/// default is configured, otherwise whichever of `main`/`master` exists locally.
+/// Never the current branch — a team always branches off main/master unless the
+/// caller passes an explicit `--base`.
+fn default_base_branch(root: &Path) -> Option<String> {
+    let remote_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().strip_prefix("origin/").map(str::to_string));
+    if remote_head.is_some() {
+        return remote_head;
+    }
+    ["main", "master"].into_iter().find(|b| local_branch_exists(root, b)).map(str::to_string)
+}
+
+fn local_branch_exists(root: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn cmd_spawn(
     cfg: &Config,
     ticket_id: &str,
-    base_branch: &str,
+    base: Option<&str>,
     maintenance: bool,
 ) -> Result<()> {
     // Project must be bd-enabled (same check as run-agent).
@@ -285,6 +316,17 @@ pub fn cmd_spawn(
             cfg.project_root.display()
         );
     }
+
+    let base_branch = match base {
+        Some(b) => b.to_string(),
+        None => default_base_branch(&cfg.project_root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Could not detect a default branch (main/master) in '{}'; pass --base explicitly.",
+                cfg.project_root.display()
+            )
+        })?,
+    };
+    println!("==> Base branch: {}", base_branch);
 
     // Try to refresh seed credentials from the macOS keychain so we don't
     // ship stale OAuth tokens into the team. Failures here are non-fatal —
@@ -316,7 +358,7 @@ pub fn cmd_spawn(
     let team = mgr
         .create_team(SpawnSpec {
             ticket_id: ticket_id.to_string(),
-            base_branch: base_branch.to_string(),
+            base_branch,
             roles,
         })
         .map_err(|e| anyhow::anyhow!("create team: {}", e))?

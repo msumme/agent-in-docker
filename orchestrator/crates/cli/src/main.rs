@@ -62,9 +62,10 @@ enum TeamAction {
     Spawn {
         /// bd ticket id (e.g. agent-in-docker-0fw.2)
         ticket_id: String,
-        /// Base branch for the team's work branch
-        #[arg(long, default_value = "main")]
-        base: String,
+        /// Base branch for the team's work branch. Defaults to the target
+        /// repo's integration branch (origin/HEAD, else local main/master).
+        #[arg(long)]
+        base: Option<String>,
         /// Use maintenance-producer instead of feature-producer
         #[arg(long)]
         maintenance: bool,
@@ -114,7 +115,7 @@ fn main() -> Result<()> {
                 ticket_id,
                 base,
                 maintenance,
-            } => team_cmd::cmd_spawn(&cfg, &ticket_id, &base, maintenance),
+            } => team_cmd::cmd_spawn(&cfg, &ticket_id, base.as_deref(), maintenance),
             TeamAction::Suspend { team_id, reason } => {
                 team_cmd::cmd_suspend(&cfg, &team_id, reason)
             }
@@ -193,7 +194,7 @@ fn main() -> Result<()> {
             let resolved_spec = role_prompt_spec
                 .clone()
                 .unwrap_or_else(|| role.clone());
-            let bundled_roles = cfg.project_root.join("roles");
+            let bundled_roles = cfg.home_root.join("roles");
             let role_prompt_text = match project_config::resolve_role_prompt(
                 &resolved_spec,
                 &project_path,

@@ -76,7 +76,7 @@ pub fn ensure_base_image(cfg: &Config) -> Result<()> {
     }
     let bundled = bundled_base_containerfile(cfg)?;
     println!("==> Building base image {} from {}", BASE_IMAGE, bundled.display());
-    let context = bundled.parent().unwrap_or(&cfg.project_root).to_path_buf();
+    let context = bundled.parent().unwrap_or(&cfg.home_root).to_path_buf();
     podman_build(&bundled, BASE_IMAGE, &context)
 }
 
@@ -180,6 +180,7 @@ mod tests {
             image_name: "ignored".into(),
             network_name: "agent-net".into(),
             orchestrator_pid_file: PathBuf::from("/tmp/bogus.pid"),
+            home_root: project_root.clone(),
             project_root,
         }
     }

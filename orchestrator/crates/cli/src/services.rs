@@ -23,7 +23,7 @@ pub fn ensure_orchestrator(cfg: &Config) -> Result<()> {
         println!("==> Building orchestrator...");
         let status = Command::new("cargo")
             .args(["build"])
-            .current_dir(cfg.project_root.join("orchestrator"))
+            .current_dir(cfg.home_root.join("orchestrator"))
             .status()
             .context("Failed to build orchestrator")?;
         if !status.success() {

@@ -38,7 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let permissions: Box<dyn orchestrator_core::mcp::PermissionCheck> = {
         let mut checker = orchestrator_core::permissions::PermissionChecker::new();
-        let roles_dir = project_config.project_root.join("roles");
+        // Bundled roles live in the agent-in-docker home repo, not the target
+        // project the orchestrator manages teams for.
+        let home_root = orchestrator_core::project_config::discover_home_root()
+            .unwrap_or_else(|_| project_config.project_root.clone());
+        let roles_dir = home_root.join("roles");
         let _ = checker.load_roles_from_dir(&roles_dir);
         Box::new(checker)
     };

@@ -27,6 +27,30 @@ pub struct ProjectConfig {
     pub dolt_port: Option<u16>,
 }
 
+/// Discover the agent-in-docker "home" repo -- the tool's own root, where
+/// `Containerfile.base` and the bundled `roles/` live. Walks up from the running
+/// executable, falling back to the current directory. This is distinct from the
+/// target project a team operates on (the cwd's git root).
+pub fn discover_home_root() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("Cannot determine executable path")?;
+    let mut dir = exe
+        .parent()
+        .context("Cannot determine executable parent directory")?
+        .to_path_buf();
+    loop {
+        if dir.join("Containerfile.base").exists() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            let cwd = std::env::current_dir()?;
+            if cwd.join("Containerfile.base").exists() {
+                return Ok(cwd);
+            }
+            bail!("Cannot find agent-in-docker home root (no Containerfile.base found)");
+        }
+    }
+}
+
 impl ProjectConfig {
     /// Build from a known project root.
     pub fn from_root(root: PathBuf) -> Self {

@@ -58,8 +58,11 @@ Notes:
 
 - `App` contains no `SystemTime::now()`, no `thread_rng()`, no file paths,
   no network. It cannot be non-deterministic; the type system won't let it.
-- Generics keep it zero-cost; `Box<dyn Clock>` is equally fine at app
-  scale. Don't debate it in review — either passes.
+- Generics keep it zero-cost; on hosted targets `Box<dyn Clock>` is
+  equally fine at app scale, and review doesn't debate the choice — either
+  passes. On embedded/MCU (no_std) targets the choice is not free:
+  `Box` presumes an allocator and dyn dispatch defeats inlining — use the
+  generic, zero-cost form there.
 - Per-call values may also arrive as arguments (`fn tick_at(&mut self,
   now: Timestamp)`); see `inject-at-construction.md`. Don't do both — a
   unit holding a clock doesn't also take `now` parameters.

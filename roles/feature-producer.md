@@ -88,3 +88,8 @@ Follow every standard in the meta-prompt — DDD, SOLID, DI, TDD,
 determinism. Edit existing files in preference to new ones. No drive-by
 refactors — file them as separate `chore` tickets with
 `discovered-from:<team-ticket>`.
+
+If a build tool fails in-container on a missing native module (e.g.
+vite/rollup wanting a platform-specific binary), don't work around it by
+installing a platform-specific package — that breaks the build for
+everyone else. Report it as a blocker instead.

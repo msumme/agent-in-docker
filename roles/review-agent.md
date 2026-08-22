@@ -142,6 +142,12 @@ the finding in chat — the ticket carries it. The producer fixes that one,
 commits, re-pings; you re-review and either approve or file the next.
 Never batch blockers.
 
+If the blocker reflects a rule or convention the producer had no way to
+know from the instructions they were given, don't just close it as a
+one-off — file the lesson proposal yourself per the Lessons convention
+in `_meta.md`. You see instruction gaps most clearly; don't rely on the
+producer to notice and report its own knowledge gap.
+
 If the branch is sound at the cited sha: set
 `bd set-state <ticket> verify=approved` and send one short message to the
 producer ("verify approved, sha <sha>"). That approval is the signal the

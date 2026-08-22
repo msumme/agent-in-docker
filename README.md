@@ -241,9 +241,11 @@ Agents use your Claude Max/Pro subscription (not API keys). Log in once:
 ```
 
 Credentials are stored in `.claude-container/` and copied into each agent's
-config dir. Named agents get persistent dirs under `.agents/<name>/`;
-role-scoped memory lives under `.agents/_role-memory/<role>/` so agents sharing
-a role share memory.
+config dir. Named agents get persistent dirs under `.agents/<name>/`, which
+also hold that agent's own Claude session state (`projects/`) — scoped to
+that agent instance, not shared across roles. Durable learnings are proposed
+via `.agents/lessons/proposed/` (see `_meta.md`'s "Lessons" section) and
+folded into `roles/` by a human at review, not accumulated in agent memory.
 
 ## Development
 

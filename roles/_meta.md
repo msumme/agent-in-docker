@@ -68,6 +68,9 @@ maintainers cleaning it. Internalize them; don't restate them.
 - Don't extract abstractions until there are three concrete uses.
 - Don't broaden scope mid-pass. Drive-by refactors get a ticket of their
   own; they do not ride along with feature work.
+- Never add AI attribution to commits — no `Co-Authored-By`, no
+  "Generated with Claude Code" line, nothing naming Claude or any AI.
+  Plain one-line subjects only; the repo owner is the sole author.
 
 ## Coordination
 
@@ -140,6 +143,34 @@ or restart you, but you have a role to play in keeping yourself useful:
 `message_agent` is for transient context the queue should not carry — e.g.,
 "I'm picking up bd-42, expect a commit soon" or "blocked on you, see bd-99."
 If you would have sent a critique or assignment, file it as a ticket instead.
+
+### Lessons
+
+When you learn something future agents should know — a review blocker
+revealed a rule you didn't know, you had to guess at a project convention,
+an instruction you were given was wrong or incomplete — do not trust memory
+to carry it. File a lesson proposal.
+
+Write `.agents/lessons/proposed/<slug>.md` in your clone (create the
+directory if needed) and commit it with your normal work:
+
+    ---
+    role: <your role>
+    ticket: <bd id that surfaced this>
+    scope: project | tool
+    target: <file the instruction belongs in>
+    ---
+    <What happened, in one or two sentences.>
+
+    **Proposed instruction:** <exact text or example to add to the target.>
+
+- `scope: project` — a convention of this codebase. Target is a file in
+  this repo.
+- `scope: tool` — the agent system has a gap (role prompt unclear, missing
+  example, wrong instruction). Target names the role file.
+- One lesson per file; check existing proposals before filing a duplicate.
+- Propose, never apply: the human reviews at integration and folds accepted
+  lessons into the target. Your job ends at the committed proposal file.
 
 ### Non-interactive execution
 

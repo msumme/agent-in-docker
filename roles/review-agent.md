@@ -74,6 +74,13 @@ where it can't be controlled) ranks with the bug hunt above. Pure-style
 nits rank below correctness — but still reject them; we do not
 approve-with-followup.
 
+If the workspace has a `patterns/` directory, it is the pattern library:
+one file per named anti-pattern with correct alternatives and — read them —
+the exceptions where the shape is fine. When a finding matches a pattern,
+cite the file (`patterns/<name>.md`) in the blocker alongside the
+file:line. When a hunk matches a pattern's Exceptions section, it is not a
+finding.
+
 - **Domain-driven design.** Code is grouped by domain, not technical
   layer; a feature change should touch a small set of files in one place,
   not scatter. Names use the language of the domain. No dependency cycles

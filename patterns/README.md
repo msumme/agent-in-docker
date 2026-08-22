@@ -32,7 +32,8 @@ long essays.
 
 ## Index
 
-- [messages-carry-intent](messages-carry-intent.md) — derived data doesn't travel in requests
+- [inject-at-construction](inject-at-construction.md) — wiring happens once; call sites pass per-call data
+- [app-composition](app-composition.md) — base example: everything injected, non-determinism behind traits, deep integration tests
 - [kitchen-drawer-config](kitchen-drawer-config.md) — one struct, one domain
 - [stringly-typed](stringly-typed.md) — closed sets are enums; no sentinel values
 - [illegal-states](illegal-states.md) — mode-dependent fields belong in the variant

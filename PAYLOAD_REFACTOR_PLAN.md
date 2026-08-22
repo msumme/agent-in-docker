@@ -9,13 +9,15 @@ next begins, and each phase is one commit.
 
 ## The core principle
 
-**Messages carry intent. Resolution happens once, at the receiver.**
+**Inject at construction, pass at call** (see
+`patterns/inject-at-construction.md`).
 
-A request struct should contain only what the caller *decides* (which role,
-which mode, what prompt). Everything the system can *derive* from its own
-config (paths, ports, images, credentials) is resolved in exactly one
-function, on the side that owns that config. If a field of a message can be
-computed from `ProjectConfig`, it does not belong in the message.
+Wiring — turning startup config into operational values (paths, ports,
+images, credentials) — happens exactly once, at the composition root, not
+at call sites. A request struct therefore contains only what varies per
+call (which role, which mode, what prompt); everything derivable from
+`ProjectConfig` is resolved in one owner-side function instead of being
+recomputed by every caller and shipped along.
 
 ---
 

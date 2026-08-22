@@ -216,7 +216,6 @@ fn build_payload_for_team_agent(
     agent_role: &str,
     agent_name: &str,
     agent_dir: PathBuf,
-    role_memory_dir: PathBuf,
     dolt_port: Option<u16>,
     initial_prompt: String,
     resume_session: bool,
@@ -249,7 +248,6 @@ fn build_payload_for_team_agent(
         name: agent_name.to_string(),
         project_path: clone_path.to_string_lossy().to_string(),
         agent_dir: agent_dir.to_string_lossy().to_string(),
-        role_memory_dir: role_memory_dir.to_string_lossy().to_string(),
         role_prompt,
         seed_credentials: cfg
             .seed_dir
@@ -386,7 +384,6 @@ pub fn cmd_spawn(
             let _ = std::fs::copy(cfg.seed_dir.join(".credentials.json"), &creds_dest);
         }
 
-        let role_memory_dir = project_config::setup_role_memory_dir(&pcfg, &agent.role)?;
         let initial_prompt = build_initial_prompt(&team.id, &team.ticket_id, &agent.role);
 
         let clone_path = mgr
@@ -400,7 +397,6 @@ pub fn cmd_spawn(
             &agent.role,
             &agent.name,
             agent_dir,
-            role_memory_dir,
             dolt_port,
             initial_prompt,
             false,
@@ -500,8 +496,6 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
         let _ = std::fs::remove_file(&creds_dest);
         let _ = std::fs::copy(cfg.seed_dir.join(".credentials.json"), &creds_dest);
 
-        let role_memory_dir = project_config::setup_role_memory_dir(&pcfg, &agent.role)?;
-
         let primer = build_resume_prompt(&team.id, &team.ticket_id, &agent.role);
         let resume_session = compute_resume_session(&agent.role, true);
 
@@ -516,7 +510,6 @@ pub fn cmd_resume(cfg: &Config, team_id: &str, only_role: Option<String>) -> Res
             &agent.role,
             &agent.name,
             agent_dir,
-            role_memory_dir,
             dolt_port,
             primer,
             resume_session,

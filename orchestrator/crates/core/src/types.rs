@@ -104,7 +104,6 @@ pub struct StartAgentPayload {
     pub project_path: String,
     pub prompt: String,
     pub agent_dir: String,
-    pub role_memory_dir: String,
     /// Full text of the role system prompt (appended via `--append-system-prompt`).
     /// Empty string means no role prompt.
     #[serde(default)]
@@ -152,8 +151,6 @@ impl StartAgentPayload {
             format!("{}:/workspace:Z", self.project_path),
             "-v".to_string(),
             format!("{}:/root/.claude:Z", self.agent_dir),
-            "-v".to_string(),
-            format!("{}:/root/.claude/projects:Z", self.role_memory_dir),
             "-v".to_string(),
             format!("{}:/root/.claude/.credentials.json:Z", self.seed_credentials),
             "-e".to_string(),
@@ -410,7 +407,6 @@ mod tests {
             project_path: "/tmp".into(),
             prompt: "hi".into(),
             agent_dir: "/a".into(),
-            role_memory_dir: "/mem".into(),
             role_prompt: String::new(),
             seed_credentials: "/creds".into(),
             image_name: "img".into(),
@@ -437,7 +433,6 @@ mod tests {
             project_path: "/tmp/project".into(),
             prompt: "hi".into(),
             agent_dir: "/tmp/agent".into(),
-            role_memory_dir: "/tmp/role-memory".into(),
             role_prompt: String::new(),
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-img".into(),
@@ -457,9 +452,6 @@ mod tests {
         assert!(args.iter().any(|a| a == "IS_SANDBOX=1"));
         assert!(args.iter().any(|a| a == "agent-img"));
         assert!(args.iter().any(|a| a.contains("/workspace:Z")));
-        assert!(args
-            .iter()
-            .any(|a| a == "/tmp/role-memory:/root/.claude/projects:Z"));
     }
 
     #[test]
@@ -471,7 +463,6 @@ mod tests {
             project_path: "/tmp".into(),
             prompt: String::new(),
             agent_dir: "/tmp/a".into(),
-            role_memory_dir: "/tmp/mem".into(),
             role_prompt: "hello".into(),
             seed_credentials: "/tmp/c.json".into(),
             image_name: "img".into(),
@@ -498,7 +489,6 @@ mod tests {
             project_path: "/tmp".into(),
             prompt: String::new(),
             agent_dir: "/tmp/a".into(),
-            role_memory_dir: "/tmp/m".into(),
             role_prompt: String::new(),
             seed_credentials: "/tmp/c.json".into(),
             image_name: "img".into(),
@@ -518,7 +508,7 @@ mod tests {
         let json = r#"{
             "name":"t","role":"feature-producer","mode":"long-running",
             "project_path":"/p","prompt":"hi","agent_dir":"/a",
-            "role_memory_dir":"/m","seed_credentials":"/c",
+            "seed_credentials":"/c",
             "image_name":"img","network_name":"net",
             "orchestrator_port":9800,"mcp_port":9801
         }"#;

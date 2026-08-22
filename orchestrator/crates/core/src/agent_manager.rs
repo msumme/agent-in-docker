@@ -529,7 +529,6 @@ mod tests {
             project_path: "/tmp/project".into(),
             prompt: "hello".into(),
             agent_dir: "/tmp/agent".into(),
-            role_memory_dir: "/tmp/role-memory".into(),
             role_prompt: String::new(),
             seed_credentials: "/tmp/creds.json".into(),
             image_name: "agent-in-docker".into(),

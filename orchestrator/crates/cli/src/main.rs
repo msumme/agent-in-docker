@@ -188,7 +188,6 @@ fn main() -> Result<()> {
             println!("==> Agent: {} (role: {}, {})", agent_name, role, mode);
 
             let agent_dir = project_config::setup_agent_dir(&pcfg, &agent_name, named)?;
-            let role_memory_dir = project_config::setup_role_memory_dir(&pcfg, &role)?;
 
             // Resolve the role prompt (default to role name if no override).
             let resolved_spec = role_prompt_spec
@@ -269,7 +268,6 @@ fn main() -> Result<()> {
                 name: agent_name.clone(),
                 project_path: project_path.to_string_lossy().to_string(),
                 agent_dir: agent_dir.to_string_lossy().to_string(),
-                role_memory_dir: role_memory_dir.to_string_lossy().to_string(),
                 role_prompt: role_prompt_text,
                 seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
                 role,

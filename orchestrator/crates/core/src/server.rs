@@ -840,13 +840,6 @@ pub async fn run_with_id_gen(
                                 continue;
                             }
                         };
-                        let role_memory_dir = match crate::project_config::setup_role_memory_dir(cfg, &role) {
-                            Ok(dir) => dir.to_string_lossy().to_string(),
-                            Err(e) => {
-                                warn!("Failed to set up role memory dir for '{}': {}", role, e);
-                                continue;
-                            }
-                        };
                         // Load persisted config (may override role) and resolve the role prompt.
                         let prior = crate::project_config::load_persisted_config(cfg, &name)
                             .ok()
@@ -877,7 +870,6 @@ pub async fn run_with_id_gen(
                             project_path: cfg.project_root.to_string_lossy().to_string(),
                             prompt: String::new(),
                             agent_dir,
-                            role_memory_dir,
                             role_prompt,
                             seed_credentials: cfg.seed_dir.join(".credentials.json").to_string_lossy().to_string(),
                             image_name: cfg.image_name.clone(),

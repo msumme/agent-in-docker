@@ -157,20 +157,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Set up a role-scoped memory directory. All agents sharing a role share this
-/// Claude Code `projects/` tree, so memory accumulated by one agent under that
-/// role is available to future agents of the same role — while remaining
-/// isolated from other roles' memory.
-pub fn setup_role_memory_dir(cfg: &ProjectConfig, role: &str) -> Result<PathBuf> {
-    let dir = cfg
-        .agents_dir
-        .join("_role-memory")
-        .join(role)
-        .join("projects");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// Path where a named agent's persisted config lives. Sibling to agent_dir
 /// so it isn't mounted into the container.
 pub fn persisted_config_path(cfg: &ProjectConfig, name: &str) -> PathBuf {

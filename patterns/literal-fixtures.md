@@ -28,17 +28,20 @@ never meant to assert.
 
 ## Correct
 
-One `Default` (or one builder) owns the filler; each test overrides only
-what it's about:
+One *test-scoped* default owns the filler; each test overrides only what
+it's about:
 
 ```rust
-impl Default for ResolvedLaunch { /* benign placeholders, defined once */ }
+#[cfg(test)]
+impl ResolvedLaunch {
+    fn test_default() -> Self { /* benign placeholders, defined once */ }
+}
 
 #[test]
 fn mounts_agent_dir() {
     let launch = ResolvedLaunch {
         agent_dir: "/tmp/agent".into(),
-        ..Default::default()
+        ..ResolvedLaunch::test_default()
     };
     assert!(container_run_args(&launch).iter()
         .any(|a| a == "/tmp/agent:/root/.claude:Z"));
@@ -48,6 +51,13 @@ fn mounts_agent_dir() {
 Now the test reads as its own specification: this test is about
 `agent_dir`, nothing else.
 
+Do NOT reach for `impl Default` as the fixture mechanism. `Default` is
+production API — implementing it with test placeholders invites production
+code to construct half-real values (`port: 0`, empty paths) that compile
+fine and fail at runtime. Test filler stays `#[cfg(test)]`-scoped; for
+fixtures shared across crates, put the helper in a `test-support`
+feature-gated module rather than promoting it to `Default`.
+
 ## Exceptions
 
 - **Small types.** A 3-field struct written out literally is clearer than a
@@ -55,10 +65,10 @@ Now the test reads as its own specification: this test is about
 - **Shape tests.** A test *about* construction or serde format (roundtrip,
   raw-JSON parsing) legitimately spells out every field — every field is the
   point.
-- **When Default would lie.** If no benign placeholder exists (a value that
-  must be semantically valid for any test to make sense), use a named
-  builder with required arguments for exactly those fields instead of a
-  misleading `Default`.
+- **When no benign placeholder exists.** If a field must be semantically
+  valid for any test to make sense, don't invent filler for it — use a named
+  builder with required arguments for exactly those fields
+  (`test_launch(agent_dir: &str)`), defaults for the rest.
 
 ## Review cues
 

@@ -25,28 +25,49 @@ implementation.
 
 ## Correct
 
-Move implementation-specific values behind the seam that owns them — config
-consulted at resolution, or a per-implementation trait:
+Give the implementation-specific values a home that *names* the
+implementation. For config, the usual right answer is an enum with one
+variant per implementation — specific things get specific fields, and the
+generic type carries the enum:
 
 ```rust
-// role config owns tuning; the runtime impl translates it
-// roles/feature-producer.yml:
-//   model: sonnet-tier
-//   effort: high
+pub enum RuntimeTuning {
+    Claude { model: String, effort: Effort },
+    Codex  { model: String, reasoning: ReasoningMode },
+}
 
+pub struct ResolvedLaunch {
+    // ...
+    pub tuning: RuntimeTuning,   // generic type, honest contents
+}
+```
+
+Now the vocabulary is scoped to its variant, cross-implementation nonsense
+(`effort` on a Codex launch) is unrepresentable, and adding a runtime makes
+the compiler point at every site that must handle it.
+
+Reach for a trait instead only when the set is *open* — implementations
+supplied from somewhere else (another crate, plugins, users) that this code
+must accept without being edited:
+
+```rust
 trait AgentRuntime {
     fn launch_args(&self, launch: &ResolvedLaunch) -> Vec<String>;
 }
 ```
 
+Closed set you control → enum. Open set extended by others → trait. A
+trait for a closed in-repo set is indirection with no payoff: you lose
+exhaustive matching and gain nothing.
+
 ## Exceptions
 
 - **Pool of one, honestly labeled.** With exactly one implementation and no
-  concrete second on the horizon, building the trait is speculative
-  generality — worse than the leak. The right minimal move is to *name* the
-  coupling (`// Claude Code-specific; the AgentRuntime seam absorbs this
-  when a second runtime exists`) so it's findable, and keep the field.
-  The anti-pattern is the *unmarked* leak in a type that claims generality.
+  concrete second on the horizon, even the enum can be premature — a
+  one-variant enum is ceremony. The right minimal move is to *name* the
+  coupling (`// Claude Code-specific; becomes a RuntimeTuning variant when
+  a second runtime exists`) so it's findable, and keep the field. The
+  anti-pattern is the *unmarked* leak in a type that claims generality.
 - **Deliberately non-generic types.** A struct named `ClaudeLaunchArgs` can
   say `--effort` all it wants. Leaks are only leaks across a boundary that
   promises abstraction.

@@ -28,35 +28,45 @@ never meant to assert.
 
 ## Correct
 
-One *test-scoped* default owns the filler; each test overrides only what
+The filler is test data, so it lives with the tests: one fixture default
+per test module (a `const` where the fields allow it, a plain fn
+otherwise), named for the suite it serves. Each test overrides only what
 it's about:
 
 ```rust
 #[cfg(test)]
-impl ResolvedLaunch {
-    fn test_default() -> Self { /* benign placeholders, defined once */ }
-}
+mod tests {
+    // the default belongs to these tests, not to the type
+    fn test_launch_default() -> ResolvedLaunch {
+        ResolvedLaunch { /* benign placeholders, defined once, here */ }
+    }
 
-#[test]
-fn mounts_agent_dir() {
-    let launch = ResolvedLaunch {
-        agent_dir: "/tmp/agent".into(),
-        ..ResolvedLaunch::test_default()
-    };
-    assert!(container_run_args(&launch).iter()
-        .any(|a| a == "/tmp/agent:/root/.claude:Z"));
+    #[test]
+    fn mounts_agent_dir() {
+        let launch = ResolvedLaunch {
+            agent_dir: "/tmp/agent".into(),
+            ..test_launch_default()
+        };
+        assert!(container_run_args(&launch).iter()
+            .any(|a| a == "/tmp/agent:/root/.claude:Z"));
+    }
 }
 ```
 
 Now the test reads as its own specification: this test is about
-`agent_dir`, nothing else.
+`agent_dir`, nothing else — and a field change touches one fixture item
+per test module instead of every literal.
 
-Do NOT reach for `impl Default` as the fixture mechanism. `Default` is
-production API — implementing it with test placeholders invites production
-code to construct half-real values (`port: 0`, empty paths) that compile
-fine and fail at runtime. Test filler stays `#[cfg(test)]`-scoped; for
-fixtures shared across crates, put the helper in a `test-support`
-feature-gated module rather than promoting it to `Default`.
+Two things this is deliberately NOT:
+
+- **Not `impl Default`.** `Default` is production API — implementing it
+  with test placeholders lets production code construct half-real values
+  (`port: 0`, empty paths) that compile fine and fail at runtime.
+- **Not a method on the production type at all** — not even
+  `#[cfg(test)] impl`. Test filler hanging off the type's namespace is
+  test concerns leaking into production code's home. The fixture is owned
+  by the tests it serves; different suites may legitimately want different
+  defaults.
 
 ## Exceptions
 

@@ -197,25 +197,25 @@ pub fn container_run_args(launch: &ResolvedLaunch) -> Vec<String> { ... }
 (fixes E; `TmuxOps::build_run_command` and `container.rs` launchers take
 `&ResolvedLaunch`).
 
-### 4. Fixtures: test-scoped default + struct-update syntax
+### 4. Fixtures: a per-test-module default + struct-update syntax
 
 ```rust
 #[cfg(test)]
-impl ResolvedLaunch {
-    fn test_default() -> Self { ... }   // benign placeholders, defined once
-}
+mod tests {
+    fn test_launch_default() -> ResolvedLaunch { ... }  // filler lives WITH the tests
 
-// in tests — only the fields under test:
-let launch = ResolvedLaunch {
-    agent_dir: "/tmp/agent".into(),
-    ..ResolvedLaunch::test_default()
-};
+    // in each test — only the fields under test:
+    let launch = ResolvedLaunch {
+        agent_dir: "/tmp/agent".into(),
+        ..test_launch_default()
+    };
+}
 ```
 
-(fixes G; the test-scoped helper is the one place fixtures get filler. Do
-NOT implement `Default` for this — `Default` is production API, and test
-placeholders must not be constructible from production code. Fixtures
-needed in other crates' tests go in a `test-support` feature-gated module.)
+(fixes G. The fixture default is test data owned by the test module — NOT
+`impl Default` (production API; test placeholders must not be constructible
+from production code) and NOT a `#[cfg(test)] impl` on the type (test
+concerns don't hang off the production type's namespace).)
 
 `model`/`effort` stay on `ResolvedLaunch` for now — they are resolution
 *outputs* (from `role_model_effort`). Moving them into `roles/*.yml` and an
@@ -272,18 +272,18 @@ fails for an unrelated reason, stop and report — do not fix it.
 
 ### Phase 3 — fixture cleanup (kills G)
 
-1. Add `#[cfg(test)] impl ResolvedLaunch { fn test_default() -> Self }` with
+1. In each test module that builds launches (`core/src/types.rs` tests,
+   `core/src/agent_manager.rs` tests, `cli/src/container.rs` tests), add
+   one fixture default — `fn test_launch_default() -> ResolvedLaunch` with
    benign placeholders (empty strings, port 0, `None`, `Mode::Oneshot`
-   inside the spec). `core`'s own tests (`types.rs`, `agent_manager.rs`)
-   see a `#[cfg(test)]` impl directly. `cli/src/container.rs` tests are in
-   a different crate, so expose the helper to them via a `test-support`
-   cargo feature on `orchestrator-core` (cli enables it as a
-   dev-dependency feature) — NOT via `impl Default`, which would make test
-   filler constructible from production code.
-2. Rewrite the literal fixtures in `core/src/types.rs`,
-   `core/src/agent_manager.rs`, `cli/src/container.rs` to
-   `..ResolvedLaunch::test_default()` form, keeping only fields each test
-   asserts on.
+   inside the spec). The fixture lives in the test module it serves; do
+   not add any method or `Default` impl to the production type, and do not
+   build cross-crate sharing machinery for it. One small fn per test
+   module is the correct amount of duplication: a field change then
+   touches three fixture fns, not every literal in every test.
+2. Rewrite the literal fixtures in those test modules to
+   `..test_launch_default()` struct-update form, keeping only fields each
+   test asserts on.
 
 ### Acceptance criteria
 
